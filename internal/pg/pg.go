@@ -14,10 +14,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// DefaultDSN 走 Unix socket 的 peer 认证连本机 PG，**不需要密码** ——
-// 开发环境不因此引入新凭据（TCP 口是 scram-sha-256，得配密码才行）。
-// 生产用 DSN 覆盖。
-const DefaultDSN = "postgres:///iot?host=/var/run/postgresql"
+// DefaultDSN 是开发环境的业务库：项目栈里的 iot-postgres 容器（09 §2.4），
+// 凭据与 deploy/compose/docker-compose.yml 一致。把开发默认值写进 flag 是本仓库
+// 的既有约定（NATS / Redis 的默认地址同样如此）。
+//
+// ⚠️ **不要连 devbox 内的 `postgresql@18`（127.0.0.1:5432）** ——
+// 那是 **Odoo 的库实例**（`odoo20` / `erp_dev` 在里面）。业务库是项目栈里独立的
+// `iot-postgres` 容器；混用会让 IoT 的业务表和 Odoo 的业务表共用一个实例，
+// 备份、扩容与故障域全部纠缠在一起，而且「连对了没」从表名上根本看不出来。
+const DefaultDSN = "postgres://iot:iot_dev_only_change_me@100.64.0.3:28543/odoo20iot"
 
 // Config 是连接池参数。
 type Config struct {

@@ -13,6 +13,7 @@ package alarm
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"time"
 )
 
@@ -107,6 +108,15 @@ type Alarm struct {
 
 	// BatchID 非空表示这条告警已被聚合（04 §2.2）。
 	BatchID string
+
+	// PublishedAt 是「本告警的对外事件已成功发布」的时刻（零值 = 尚未发布）。
+	// 它把发布变成**至少一次**：扫描把状态推到 active 之后若发布失败，
+	// 没写上这个标记的下一轮会补发；重复投递由下游幂等键兜住（07 §6 S3）。
+	PublishedAt time.Time
+
+	// TriggerValue 是**最近一次**触发时的取值快照（02 §3.3 的 trigger_value）。
+	// 本包不解释它 —— 只负责原样存下、原样带上；快照的语义属于规则层与物模型。
+	TriggerValue json.RawMessage
 }
 
 // clone 复制一份，避免对 Store 返回的实例做原地修改 ——
@@ -135,6 +145,8 @@ type Trigger struct {
 	Timing       Timing
 	// At 是触发时刻；零值取 Engine 的时钟（便于测试注入）。
 	At time.Time
+	// Value 是触发时的取值快照；零值按空对象存。
+	Value json.RawMessage
 }
 
 // Action 是本轮推进产生的动作。
@@ -220,4 +232,14 @@ func itoa(v int64) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// normalizeValue 保证快照总是合法 JSON —— 空值写成 {}。
+// 否则 JSONB 列会拒收，而错误信息只是「invalid input syntax for type json」，
+// 离真正的原因（上游没给快照）很远。
+func normalizeValue(v json.RawMessage) json.RawMessage {
+	if len(v) == 0 || !json.Valid(v) {
+		return json.RawMessage(`{}`)
+	}
+	return v
 }

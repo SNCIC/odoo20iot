@@ -40,7 +40,7 @@ func NewPGStore(pool *pgxpool.Pool) (*PGStore, error) {
 const alarmColumns = `dedup_key, id, project_id, device_id, device_type_id,
 	rule_id, rule_name, level, state, parent_id, timing,
 	first_ts, last_ts, state_ts, confirmed_ts, notified_ts, resolved_ts, closed_ts,
-	notify_count, flap_count, suppressed, suppress_reason, batch_id`
+	notify_count, flap_count, suppressed, suppress_reason, batch_id, trigger_value, published_at`
 
 // timingJSON 是 timing 列的线上格式，用 04 §2.4 的字段名与秒为单位 ——
 // 运维会直接 `psql` 看这张表，存成 base64/二进制对排障毫无帮助。
@@ -143,6 +143,8 @@ func scanAlarm(row scanRow) (*Alarm, error) {
 		a           Alarm
 		parentID    *string
 		timingRaw   []byte
+		triggerRaw  []byte
+		publishedTS *time.Time
 		confirmedTS *time.Time
 		notifiedTS  *time.Time
 		resolvedTS  *time.Time
@@ -153,6 +155,7 @@ func scanAlarm(row scanRow) (*Alarm, error) {
 		&a.RuleID, &a.RuleName, &a.Level, &a.State, &parentID, &timingRaw,
 		&a.FirstTS, &a.LastTS, &a.StateTS, &confirmedTS, &notifiedTS, &resolvedTS, &closedTS,
 		&a.NotifyCount, &a.FlapCount, &a.Suppressed, &a.SuppressReason, &a.BatchID,
+		&triggerRaw, &publishedTS,
 	); err != nil {
 		return nil, err
 	}
@@ -164,6 +167,8 @@ func scanAlarm(row scanRow) (*Alarm, error) {
 	a.ResolvedTS = derefTime(resolvedTS)
 	a.ClosedTS = derefTime(closedTS)
 	a.Timing = decodeTiming(timingRaw)
+	a.TriggerValue = normalizeValue(triggerRaw)
+	a.PublishedAt = derefTime(publishedTS)
 	return &a, nil
 }
 
@@ -240,8 +245,8 @@ const insertAlarmSQL = `
 INSERT INTO t_alarm_active (
     dedup_key, project_id, device_id, device_type_id, rule_id, rule_name, level, state,
     parent_id, timing, first_ts, last_ts, state_ts, confirmed_ts, notified_ts, resolved_ts,
-    closed_ts, notify_count, flap_count, suppressed, suppress_reason, batch_id)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+    closed_ts, notify_count, flap_count, suppressed, suppress_reason, batch_id, trigger_value, published_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 RETURNING id`
 
 func (s *PGStore) insert(ctx context.Context, a *Alarm) error {
@@ -257,6 +262,7 @@ func (s *PGStore) insert(ctx context.Context, a *Alarm) error {
 		nullText(a.ParentID), timing, a.FirstTS, a.LastTS, a.StateTS,
 		nullTime(a.ConfirmedTS), nullTime(a.NotifiedTS), nullTime(a.ResolvedTS), nullTime(a.ClosedTS),
 		a.NotifyCount, a.FlapCount, a.Suppressed, a.SuppressReason, a.BatchID,
+		string(normalizeValue(a.TriggerValue)), nullTime(a.PublishedAt),
 	).Scan(&id)
 	if err == nil {
 		a.ID = id
@@ -273,7 +279,8 @@ UPDATE t_alarm_active SET
     state = $3, level = $4, parent_id = $5, rule_name = $6,
     last_ts = $7, state_ts = $8, confirmed_ts = $9, notified_ts = $10,
     resolved_ts = $11, closed_ts = $12, notify_count = $13, flap_count = $14,
-    suppressed = $15, suppress_reason = $16, batch_id = $17, updated_at = now()
+    suppressed = $15, suppress_reason = $16, batch_id = $17, trigger_value = $18,
+    published_at = $19, updated_at = now()
 WHERE dedup_key = $1 AND state = $2`
 
 // casUpdate 只更新**会变**的字段。
@@ -286,7 +293,8 @@ func (s *PGStore) casUpdate(ctx context.Context, a *Alarm, expected State) error
 		a.DedupKey, string(expected), string(a.State), a.Level, nullText(a.ParentID), a.RuleName,
 		a.LastTS, a.StateTS, nullTime(a.ConfirmedTS), nullTime(a.NotifiedTS),
 		nullTime(a.ResolvedTS), nullTime(a.ClosedTS), a.NotifyCount, a.FlapCount,
-		a.Suppressed, a.SuppressReason, a.BatchID,
+		a.Suppressed, a.SuppressReason, a.BatchID, string(normalizeValue(a.TriggerValue)),
+		nullTime(a.PublishedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("alarm: 更新告警 %s: %w", a.DedupKey, err)
@@ -309,4 +317,52 @@ func (s *PGStore) delete(ctx context.Context, a *Alarm, expected State) error {
 			ErrStateConflict, a.DedupKey, expected)
 	}
 	return nil
+}
+
+// MarkPublished 记录「这条告警的对外事件已成功发布」。
+//
+// 它**刻意不走 CAS**：发布是状态机之外的一件事，用 CAS 表达会把
+// 「状态没变、只是发布成功了」变成一次假冲突，让调用方陷入无意义的重试。
+// 这里只做一次幂等更新 —— 重复标记同一个值是安全的。
+//
+// 行已不存在（例如告警在两件事之间被关闭）时**不报错**：这不是故障，
+// 标记一个已经消失的告警没有意义，把它变成错误只会制造噪音。
+func (s *PGStore) MarkPublished(ctx context.Context, dedupKey string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE t_alarm_active SET published_at = $2, updated_at = now()
+		 WHERE dedup_key = $1`, dedupKey, at); err != nil {
+		return fmt.Errorf("alarm: 标记已发布 %s: %w", dedupKey, err)
+	}
+	return nil
+}
+
+// UnpublishedActive 返回「已进入 active 但事件尚未发布成功」的告警，供补发扫描使用。
+//
+// 这是把发布做成**至少一次**的另一半：光有 published_at 标记、却没有这个补发入口，
+// 失败的事件就永远躺在库里，谁也不知道有一张工单没建。
+func (s *PGStore) UnpublishedActive(ctx context.Context) ([]*Alarm, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+alarmColumns+` FROM t_alarm_active
+		 WHERE state = 'active' AND published_at IS NULL
+		 ORDER BY state_ts, dedup_key`)
+	if err != nil {
+		return nil, fmt.Errorf("alarm: 查询未发布的活跃告警: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Alarm
+	for rows.Next() {
+		a, err := scanAlarm(rows)
+		if err != nil {
+			return nil, fmt.Errorf("alarm: 扫描未发布告警: %w", err)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("alarm: 遍历未发布告警: %w", err)
+	}
+	return out, nil
 }

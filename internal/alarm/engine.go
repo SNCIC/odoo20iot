@@ -2,6 +2,7 @@ package alarm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -153,12 +154,18 @@ func (e *Engine) observeTransition(prev *Alarm, key string, tr Trigger, at time.
 			FirstTS:      at,
 			LastTS:       at,
 			StateTS:      at,
+			TriggerValue: normalizeValue(tr.Value),
 		}
 		return a, Decision{Alarm: a, Action: ActionCreated, Reason: "条件首次满足，进入观察期"}
 	}
 
 	a := prev.clone()
 	a.LastTS = at
+	// 快照刷成最近一次的取值，而不是首次的 —— 建工单时（07 §6 S3）要的是
+	// 「现在是什么情况」，几分钟前的第一次取值对现场排障意义不大。
+	if v := tr.Value; len(v) > 0 && json.Valid(v) {
+		a.TriggerValue = v
+	}
 
 	switch prev.State {
 	case StateDetected:
@@ -314,6 +321,9 @@ func (e *Engine) advance(ctx context.Context, prev *Alarm, at time.Time) (*Alarm
 		a.StateTS = at
 		a.NotifiedTS = at
 		a.NotifyCount++
+		// 每次**进入** active 都清空发布标记（含抖动后重新 active）：
+		// 不清的话第二次告警会因为「看着已经发过」而静默丢掉一张工单。
+		a.PublishedAt = time.Time{}
 		a.Suppressed = false
 		a.SuppressReason = ""
 

@@ -127,12 +127,18 @@ func TestMigrateIsSerializedByAdvisoryLock(t *testing.T) {
 		}
 	}
 
+	// 断言「每个迁移恰好记录一行」而不是写死 1 —— 写死的话，
+	// 每加一个迁移这条用例都会失败一次，最后必然被人改成无意义的数字。
+	migs, err := pg.LoadMigrations()
+	if err != nil {
+		t.Fatalf("LoadMigrations: %v", err)
+	}
 	var rows int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("查版本表: %v", err)
 	}
-	if rows != 1 {
-		t.Fatalf("版本表应只有 1 行（迁移被重复记录），得 %d", rows)
+	if rows != len(migs) {
+		t.Fatalf("版本表应有 %d 行（每个迁移一行，不得重复记录），得 %d", len(migs), rows)
 	}
 }
 
