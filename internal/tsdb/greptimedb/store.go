@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -274,17 +275,134 @@ func jsonDoc(r tsdb.Row) (string, error) {
 	return string(b), nil
 }
 
-// SelectRange 执行曲线查询。
-func (s *Store) SelectRange(ctx context.Context, p tsdb.Plan, q tsdb.RangeQuery) ([]tsdb.SeriesPoint, error) {
-	sqlText, err := rangeSQL(p, q)
-	if err != nil {
-		return nil, err
-	}
+// SelectRangeUnprotected 执行**未经保护**的曲线查询。
+//
+// ⚠️ 刻意绕过 02 §4.3.1 的明细限行：仅压测 / 诊断可用，
+// 业务代码必须走 QuerySeries（否则等于把「静默截断」重新放进生产）。
+// limit ≤ 0 时沿用历史默认 100000 —— 压测正是要量「未保护的超线成本」。
+func (s *Store) SelectRangeUnprotected(ctx context.Context, p tsdb.Plan, q tsdb.RangeQuery) ([]tsdb.SeriesPoint, error) {
 	if q.Limit <= 0 {
 		q.Limit = 100000
 	}
+	return s.selectRange(ctx, p, q, q.Limit)
+}
 
-	rows, err := s.pool.Query(ctx, sqlText, q.ProjectID, q.Since.UTC(), q.Limit)
+// SelectBucketsUnprotected 执行**未经保护**的分桶聚合查询（仅压测 / 诊断）。
+func (s *Store) SelectBucketsUnprotected(ctx context.Context, p tsdb.Plan, q tsdb.BucketQuery) ([]tsdb.BucketRow, error) {
+	return s.selectBuckets(ctx, p, q)
+}
+
+// QuerySeries 是受保护的曲线查询入口（02 §4.3.1）。
+//
+// 流程：Normalize 校验 → 廉价探测（只取常量、不解析指标、不排序，超限时尽早终止）
+// → 未超限返回原始明细；超限按自适应桶宽降采样后返回（**绝不静默截断**）。
+//
+// 探测刻意不取指标值：实测（1.12M 行表、10 设备 × 1h）「值+ORDER BY」探测 P95 96ms，
+// 而常量探测 P95 20ms —— 探测的职责只是「超没超」，取数和排序是下一步的事。
+func (s *Store) QuerySeries(ctx context.Context, p tsdb.Plan, q tsdb.SeriesQuery) (tsdb.SeriesResult, error) {
+	nq, err := q.Normalize(time.Now())
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+
+	rq := tsdb.RangeQuery{
+		ProjectID: nq.ProjectID,
+		DeviceIDs: nq.DeviceIDs,
+		Since:     nq.Since,
+		Until:     nq.Until,
+		Metric:    nq.Metric,
+	}
+
+	n, err := s.probeRows(ctx, p, rq, nq.Limit+1)
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+	if n <= nq.Limit {
+		pts, err := s.selectRange(ctx, p, rq, nq.Limit+1)
+		if err != nil {
+			return tsdb.SeriesResult{}, err
+		}
+		// 探测与取数之间可能有并发写入（append_mode 允许），取数仍超限就落到降采样，
+		// 保证返回行数上限不被突破。
+		if len(pts) <= nq.Limit {
+			return tsdb.SeriesResult{Granularity: tsdb.GranularityRaw, Points: pts}, nil
+		}
+	}
+
+	bucket, err := tsdb.AdaptiveBucket(nq.Until.Sub(nq.Since), len(nq.DeviceIDs), nq.Limit)
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+	rows, err := s.selectBuckets(ctx, p, tsdb.BucketQuery{
+		ProjectID: nq.ProjectID,
+		DeviceIDs: nq.DeviceIDs,
+		Since:     nq.Since,
+		Until:     nq.Until,
+		Bucket:    bucket,
+		Metric:    nq.Metric,
+	})
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+	// 安全网：桶数学若被破坏，宁可报错也不能把超限结果当成「正常」返回。
+	if len(rows) > nq.Limit {
+		return tsdb.SeriesResult{}, fmt.Errorf(
+			"降采样返回 %d 行超过上限 %d（桶宽 %s，设备 %d 台）：桶宽计算有缺陷",
+			len(rows), nq.Limit, bucket, len(nq.DeviceIDs))
+	}
+	return tsdb.SeriesResult{
+		Granularity: tsdb.GranularityDownsampled,
+		Bucket:      bucket,
+		CapHit:      true,
+		Buckets:     rows,
+	}, nil
+}
+
+// probeRows 以 LIMIT limit 探测匹配行数（最多 limit）：只取常量、不解析指标、不排序。
+// 超限时可在第 limit+1 行处尽早终止，而不必物化整窗数据。
+func (s *Store) probeRows(ctx context.Context, p tsdb.Plan, q tsdb.RangeQuery, limit int) (int, error) {
+	sqlText, err := probeSQL(p, q, limit)
+	if err != nil {
+		return 0, err
+	}
+
+	args := []any{q.ProjectID, q.Since.UTC()}
+	if !q.Until.IsZero() {
+		args = append(args, q.Until.UTC())
+	}
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, sqlText, args...)
+	if err != nil {
+		return 0, fmt.Errorf("探测查询: %w", err)
+	}
+	defer rows.Close()
+
+	n := 0
+	for rows.Next() {
+		var one int
+		if err := rows.Scan(&one); err != nil {
+			return 0, fmt.Errorf("扫描探测行: %w", err)
+		}
+		n++
+	}
+	return n, rows.Err()
+}
+
+// selectRange 是曲线查询的非导出核心：limit 必须由调用方显式给出。
+func (s *Store) selectRange(ctx context.Context, p tsdb.Plan, q tsdb.RangeQuery, limit int) ([]tsdb.SeriesPoint, error) {
+	sqlText, err := rangeSQL(p, q, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	args := []any{q.ProjectID, q.Since.UTC()}
+	if !q.Until.IsZero() {
+		args = append(args, q.Until.UTC())
+	}
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("曲线查询: %w", err)
 	}
@@ -309,14 +427,19 @@ func (s *Store) SelectRange(ctx context.Context, p tsdb.Plan, q tsdb.RangeQuery)
 	return out, rows.Err()
 }
 
-// SelectBuckets 执行分桶聚合查询。
-func (s *Store) SelectBuckets(ctx context.Context, p tsdb.Plan, q tsdb.BucketQuery) ([]tsdb.BucketRow, error) {
+// selectBuckets 是分桶聚合查询的非导出核心。
+func (s *Store) selectBuckets(ctx context.Context, p tsdb.Plan, q tsdb.BucketQuery) ([]tsdb.BucketRow, error) {
 	sqlText, err := bucketSQL(p, q)
 	if err != nil {
 		return nil, err
 	}
 
-	rows, err := s.pool.Query(ctx, sqlText, q.ProjectID, q.Since.UTC())
+	args := []any{q.ProjectID, q.Since.UTC()}
+	if !q.Until.IsZero() {
+		args = append(args, q.Until.UTC())
+	}
+
+	rows, err := s.pool.Query(ctx, sqlText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("分桶聚合: %w", err)
 	}

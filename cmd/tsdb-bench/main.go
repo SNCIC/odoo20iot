@@ -537,11 +537,11 @@ func verifyConsistency(ctx context.Context, store *greptimedb.Store, ds dataset,
 		Limit:     100000,
 	}
 
-	jsonPts, err := store.SelectRange(ctx, tsdb.PlanJSON, q)
+	jsonPts, err := store.SelectRangeUnprotected(ctx, tsdb.PlanJSON, q)
 	if err != nil {
 		return fmt.Errorf("一致性校验（JSON）: %w", err)
 	}
-	widePts, err := store.SelectRange(ctx, tsdb.PlanWide, q)
+	widePts, err := store.SelectRangeUnprotected(ctx, tsdb.PlanWide, q)
 	if err != nil {
 		return fmt.Errorf("一致性校验（宽表）: %w", err)
 	}
@@ -574,12 +574,16 @@ type queryCase struct {
 	Devices int
 	Window  time.Duration
 	Bucket  time.Duration
+	// Protected 为 true 时走 02 §4.3.1 的受保护入口 QuerySeries（限行 + 自适应降采样），
+	// 而不是裸 SelectRangeUnprotected —— 用于量「限行落地后」的成本。
+	Protected bool
 }
 
 var queryCases = []queryCase{
 	{Name: "Q1 单设备近 1h 曲线", Desc: "单设备 + 1h 明细，逐点返回", Devices: 1, Window: time.Hour},
 	{Name: "Q2 单设备 6h 分桶聚合", Desc: "单设备 + 5min 分桶 AVG/MAX", Devices: 1, Window: 6 * time.Hour, Bucket: 5 * time.Minute},
-	{Name: "Q3 多设备近 1h 曲线", Desc: "10 设备 + 1h 明细（§4.3 上限 50）", Devices: 10, Window: time.Hour},
+	{Name: "Q3 多设备近 1h 曲线", Desc: "10 设备 + 1h 明细（未保护，暴露超线成本）", Devices: 10, Window: time.Hour},
+	{Name: "Q3P 多设备近 1h 曲线（受保护）", Desc: "10 设备 + 1h 明细，命中 5000 行上限自动降采样", Devices: 10, Window: time.Hour, Protected: true},
 	{Name: "Q4 多设备 24h 分桶聚合", Desc: "10 设备 + 5min 分桶 AVG/MAX", Devices: 10, Window: 24 * time.Hour, Bucket: 5 * time.Minute},
 }
 
@@ -593,14 +597,35 @@ func queryPlans(ctx context.Context, store *greptimedb.Store, cfg config, ds dat
 
 		for _, plan := range plans(cfg.variants) {
 			lats := make([]time.Duration, 0, cfg.queryIters)
-			var rowCount int
+			var (
+				rowCount int
+				gran     tsdb.Granularity
+				bucket   time.Duration
+				capHit   bool
+			)
 
 			for i := 0; i < cfg.queryIters; i++ {
 				t0 := time.Now()
 				var err error
-				if c.Bucket > 0 {
+				switch {
+				case c.Protected:
+					var r tsdb.SeriesResult
+					r, err = store.QuerySeries(ctx, plan, tsdb.SeriesQuery{
+						ProjectID: ds.ProjectID,
+						DeviceIDs: devices,
+						Since:     ds.End.Add(-c.Window),
+						Until:     ds.End,
+						Metric:    "temperature",
+					})
+					if err == nil {
+						gran = r.Granularity
+						bucket = r.Bucket
+						capHit = r.CapHit
+						rowCount = len(r.Points) + len(r.Buckets)
+					}
+				case c.Bucket > 0:
 					var rows []tsdb.BucketRow
-					rows, err = store.SelectBuckets(ctx, plan, tsdb.BucketQuery{
+					rows, err = store.SelectBucketsUnprotected(ctx, plan, tsdb.BucketQuery{
 						ProjectID: ds.ProjectID,
 						DeviceIDs: devices,
 						Since:     ds.End.Add(-c.Window),
@@ -608,9 +633,9 @@ func queryPlans(ctx context.Context, store *greptimedb.Store, cfg config, ds dat
 						Metric:    "temperature",
 					})
 					rowCount = len(rows)
-				} else {
+				default:
 					var pts []tsdb.SeriesPoint
-					pts, err = store.SelectRange(ctx, plan, tsdb.RangeQuery{
+					pts, err = store.SelectRangeUnprotected(ctx, plan, tsdb.RangeQuery{
 						ProjectID: ds.ProjectID,
 						DeviceIDs: devices,
 						Since:     ds.End.Add(-c.Window),
@@ -627,13 +652,17 @@ func queryPlans(ctx context.Context, store *greptimedb.Store, cfg config, ds dat
 
 			sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
 			rep.Queries = append(rep.Queries, queryResult{
-				Case: c,
-				Plan: plan,
-				Rows: rowCount,
-				P50:  pct(lats, 0.50),
-				P95:  pct(lats, 0.95),
-				P99:  pct(lats, 0.99),
-				Max:  lats[len(lats)-1],
+				Case:        c,
+				Plan:        plan,
+				Rows:        rowCount,
+				Protected:   c.Protected,
+				Granularity: gran,
+				Bucket:      bucket,
+				CapHit:      capHit,
+				P50:         pct(lats, 0.50),
+				P95:         pct(lats, 0.95),
+				P99:         pct(lats, 0.99),
+				Max:         lats[len(lats)-1],
 			})
 			fmt.Printf("[%s] %s：返回 %d 行，P50=%s P95=%s P99=%s\n",
 				plan, c.Name, rowCount,

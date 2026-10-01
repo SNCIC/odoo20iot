@@ -8,6 +8,7 @@ DEVBOX_USER ?= xfusion
 PROJECT_DIR ?= /home/xfusion/projects/odoo20iot
 GO_RUN      ?= docker exec -u $(DEVBOX_USER) $(DEVBOX) bash -lc
 NATS_URL    ?= nats://100.64.0.3:28222
+GREPTIME_DSN ?= postgres://greptime:greptime@100.64.0.3:28403/public
 
 COMPOSE_DIR := deploy/compose
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -52,6 +53,11 @@ build: ## 编译全部服务到 bin/
 test-nats: ## A2 真实总线验证（要求 NATS 可达；`go test ./...` 默认跳过）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_NATS_URL=$(NATS_URL) \
 	  go test ./internal/gateway -run TestA2_RealNATS -count=1 -v'
+
+.PHONY: test-tsdb
+test-tsdb: ## B1 补充项（1）· 明细限行真实库验证（要求 GreptimeDB 可达；⚠️ 会 drop/重建 telemetry）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_GREPTIMEDB_DSN=$(GREPTIME_DSN) IOT_PERF_ASSERT=1 \
+	  go test ./internal/tsdb/greptimedb -run TestQuerySeries -count=1 -v'
 
 .PHONY: b1-bench
 b1-bench: ## Phase 0 · B1 时序表模型压测（需要 GreptimeDB 可达，约 3 分钟）

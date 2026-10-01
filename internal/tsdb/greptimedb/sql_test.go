@@ -3,6 +3,7 @@ package greptimedb
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
@@ -142,5 +143,107 @@ func TestBucketSQLRequiresPositiveInterval(t *testing.T) {
 	_, err := bucketSQL(tsdb.PlanJSON, tsdb.BucketQuery{Metric: "temperature", Bucket: 0})
 	if err == nil {
 		t.Fatal("分桶间隔为 0 必须报错")
+	}
+}
+
+// TestRangeSQLContent 锁定范围查询的关键约束：
+// 显式 limit、确定性排序 `ORDER BY ts, device_id`、Until 存在时多一个占位符。
+func TestRangeSQLContent(t *testing.T) {
+	t.Run("无 Until：limit 是 $3", func(t *testing.T) {
+		sql, err := rangeSQL(tsdb.PlanJSON, tsdb.RangeQuery{
+			ProjectID: 1, DeviceIDs: []int64{2, 3}, Metric: "temperature",
+		}, 5001)
+		if err != nil {
+			t.Fatalf("构造失败: %v", err)
+		}
+		for _, want := range []string{
+			"project_id = $1", "ts > $2", "ORDER BY ts, device_id", "LIMIT $3",
+		} {
+			if !strings.Contains(sql, want) {
+				t.Errorf("缺少 %q:\n%s", want, sql)
+			}
+		}
+		if strings.Contains(sql, "ts <= $3") {
+			t.Errorf("未设 Until 不应出现上界条件:\n%s", sql)
+		}
+	})
+
+	t.Run("有 Until：上界占 $3，limit 顺延为 $4", func(t *testing.T) {
+		sql, err := rangeSQL(tsdb.PlanJSON, tsdb.RangeQuery{
+			ProjectID: 1, DeviceIDs: []int64{2}, Metric: "temperature",
+			Until: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
+		}, 5001)
+		if err != nil {
+			t.Fatalf("构造失败: %v", err)
+		}
+		for _, want := range []string{"ts <= $3", "LIMIT $4"} {
+			if !strings.Contains(sql, want) {
+				t.Errorf("缺少 %q:\n%s", want, sql)
+			}
+		}
+	})
+
+	t.Run("limit 非正直接报错", func(t *testing.T) {
+		if _, err := rangeSQL(tsdb.PlanJSON, tsdb.RangeQuery{Metric: "temperature"}, 0); err == nil {
+			t.Fatal("limit=0 必须报错，不能静默退化成全量扫描")
+		}
+	})
+}
+
+// TestProbeSQLContent 锁定廉价探测查询：
+// **只取常量 1、不出现指标表达式、不排序**（这三点正是它比取数查询快的全部原因）。
+func TestProbeSQLContent(t *testing.T) {
+	sql, err := probeSQL(tsdb.PlanJSON, tsdb.RangeQuery{
+		ProjectID: 1, DeviceIDs: []int64{2, 3}, Metric: "temperature",
+	}, 5001)
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	for _, want := range []string{"SELECT 1 FROM telemetry", "project_id = $1", "ts > $2", "LIMIT $3"} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("缺少 %q:\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "json_get") {
+		t.Errorf("探测不得解析指标:\n%s", sql)
+	}
+	if strings.Contains(sql, "ORDER BY") {
+		t.Errorf("探测不得排序:\n%s", sql)
+	}
+
+	// 有 Until 时多一个上界占位符。
+	sql, err = probeSQL(tsdb.PlanWide, tsdb.RangeQuery{
+		ProjectID: 1, DeviceIDs: []int64{2},
+		Until: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
+	}, 5001)
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	if !strings.Contains(sql, "ts <= $3") || !strings.Contains(sql, "LIMIT $4") {
+		t.Errorf("有 Until 时占位符应顺延:\n%s", sql)
+	}
+
+	if _, err := probeSQL(tsdb.PlanJSON, tsdb.RangeQuery{Metric: "temperature"}, 0); err == nil {
+		t.Fatal("limit=0 必须报错")
+	}
+}
+
+// TestBucketSQLUntil 校验聚合查询的上界条件与「刻意不加 LIMIT」。
+func TestBucketSQLUntil(t *testing.T) {
+	sql, err := bucketSQL(tsdb.PlanJSON, tsdb.BucketQuery{
+		ProjectID: 1, DeviceIDs: []int64{2}, Metric: "temperature", Bucket: 10 * time.Second,
+		Until: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	if !strings.Contains(sql, "ts <= $3") {
+		t.Errorf("缺少上界条件:\n%s", sql)
+	}
+	if !strings.Contains(sql, "ORDER BY bucket, device_id") {
+		t.Errorf("聚合应按桶与设备排序:\n%s", sql)
+	}
+	if strings.Contains(sql, "LIMIT") {
+		t.Errorf("聚合查询不得加 LIMIT（行预算由桶数学保证，加 LIMIT 等于静默截断）:\n%s", sql)
 	}
 }

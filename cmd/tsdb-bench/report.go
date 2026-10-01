@@ -26,6 +26,11 @@ type queryResult struct {
 	P95  time.Duration
 	P99  time.Duration
 	Max  time.Duration
+	// 受保护入口（QuerySeries）的结果元数据；未保护用例为零值。
+	Protected   bool
+	Granularity tsdb.Granularity
+	Bucket      time.Duration
+	CapHit      bool
 }
 
 type report struct {
@@ -176,6 +181,28 @@ func (r *report) render() string {
 			fmt.Fprintf(&b, "- %s：最差 P95 = %s（%s）→ %s\n",
 				planLabel(plan), worst.Round(time.Microsecond), worstCase, verdict(worst < targetQueryP95))
 		}
+
+		// §5.2 展示 B1 补充项（1）的落地效果：同一 Q3 形态，未保护 vs 受保护。
+		b.WriteString("\n### 5.2 明细限行前后对比（Q3 形态：10 设备 × 1h × 1Hz ≈ 3.6 万行）\n\n")
+		b.WriteString("| 方案 | 入口 | 返回行数 | 粒度 | 桶宽 | P50 | P95 | P99 | 判定 |\n")
+		b.WriteString("|---|---|---:|---|---:|---:|---:|---:|---|\n")
+		for _, plan := range plans(r.Variants) {
+			if raw, ok := r.findQuery("Q3 多设备近 1h 曲线", plan); ok {
+				fmt.Fprintf(&b, "| %s | 未保护 SelectRange | %d | raw | — | %s | %s | %s | %s |\n",
+					planLabel(plan), raw.Rows,
+					raw.P50.Round(time.Microsecond), raw.P95.Round(time.Microsecond),
+					raw.P99.Round(time.Microsecond), verdict(raw.P95 < targetQueryP95))
+			}
+			if prot, ok := r.findQuery("Q3P 多设备近 1h 曲线（受保护）", plan); ok {
+				fmt.Fprintf(&b, "| %s | 受保护 QuerySeries | %d | %s | %s | %s | %s | %s | %s |\n",
+					planLabel(plan), prot.Rows, prot.Granularity, prot.Bucket,
+					prot.P50.Round(time.Microsecond), prot.P95.Round(time.Microsecond),
+					prot.P99.Round(time.Microsecond), verdict(prot.P95 < targetQueryP95))
+			}
+		}
+		b.WriteString("\n> 受保护入口命中 5000 行上限后**自动降采样**（不静默截断）：返回行数被桶数学压到 ≤5000，" +
+			"代价是粒度从逐点变为时间桶均值；`Granularity` / `Bucket` / `CapHit` 随结果返回，" +
+			"调用方可据此引导异步导出。落地细节与边界见 `02 §4.3.1.1`。\n")
 	}
 
 	if len(r.Notes) > 0 {

@@ -109,19 +109,25 @@ func (r Row) String() string {
 
 // RangeQuery 对应 02 §4.3 的「单设备近 N 曲线」与「多设备对比」
 // （两者是同一个查询，只是设备数不同；§4.3 要求多设备强制 ≤ 50）。
+//
+// Until 为零值时不设上界（`ts > Since`）；非零时加 `ts <= Until`。
 type RangeQuery struct {
 	ProjectID int64
 	DeviceIDs []int64
 	Since     time.Time
+	Until     time.Time
 	Metric    string
 	Limit     int
 }
 
 // BucketQuery 对应 02 §4.3 的「单设备/多设备区间聚合 + 时间分桶降采样」。
+//
+// Until 语义同 RangeQuery。
 type BucketQuery struct {
 	ProjectID int64
 	DeviceIDs []int64
 	Since     time.Time
+	Until     time.Time
 	Bucket    time.Duration
 	Metric    string // AVG/MAX 的目标指标
 }
@@ -141,4 +147,162 @@ type BucketRow struct {
 	Avg      float64
 	Max      float64
 	Count    int64
+}
+
+// ---------- 查询保护（02 §4.3 / §4.3.1） ----------
+//
+// 以下策略**全部在适配层强制**，业务代码不可绕过（02 §4.3 的「查询保护」）。
+// 本批次只落地「明细限行 + 自适应降采样」及几条廉价校验；
+// 并发上限（20）、慢查询降级（>3s）、预聚合表路由是后续批次，尚未实现。
+
+const (
+	// MaxDetailRows 是明细查询单次返回行数的硬上限（02 §4.3.1，默认 5000）。
+	// 依据：实测 3.6 万行 ≈ 240ms，按 P95<200ms 预算留 2× 余量反推。
+	MaxDetailRows = 5000
+	// MaxDetailDevices 是单次查询的设备数上限（02 §4.3）。
+	MaxDetailDevices = 50
+	// MaxProjectedMetrics 是明细查询单次投影的指标数上限（02 §4.3.1）。
+	//
+	// 当前 SeriesQuery 是单指标模型，天然 ≤ 本上限；保留该常量作为契约上限，
+	// 未来多指标端点组合 ≤ MaxProjectedMetrics 次单指标查询即可（见 §4.3.1 决策）。
+	MaxProjectedMetrics = 4
+	// DefaultLookback 是未显式给 Since 时的默认回溯（02 §4.3）。
+	DefaultLookback = 24 * time.Hour
+	// MaxLookback 是单次查询允许的最大回溯，超限引导走异步导出（02 §4.3）。
+	MaxLookback = 90 * 24 * time.Hour
+	// MinBucketWidth 是分桶间隔下限：`date_bin` 不接受小于 1s 的间隔。
+	MinBucketWidth = time.Second
+)
+
+// Granularity 标注返回数据的粒度，回答「这是原始明细还是降采样」。
+type Granularity string
+
+const (
+	// GranularityRaw 表示逐点明细。
+	GranularityRaw Granularity = "raw"
+	// GranularityDownsampled 表示命中行数上限后按时间桶聚合的结果。
+	GranularityDownsampled Granularity = "downsampled"
+)
+
+// PolicyError 是查询保护规则拒绝请求时返回的错误。
+//
+// Rule 是机器可判定的规则名（便于上层区分「引导导出」与「参数错误」），
+// 单测按 Rule 断言而不是匹配文案。
+type PolicyError struct {
+	Rule string
+	Msg  string
+}
+
+func (e *PolicyError) Error() string { return "查询保护[" + e.Rule + "]: " + e.Msg }
+
+// SeriesQuery 是受保护的曲线查询参数（业务代码的唯一读入口，见 QuerySeries）。
+type SeriesQuery struct {
+	ProjectID int64
+	DeviceIDs []int64
+	Since     time.Time
+	Until     time.Time // 零值 = now
+	Metric    string    // 物模型白名单内的单指标
+	Limit     int       // 0 = MaxDetailRows；不允许超过 MaxDetailRows
+}
+
+// SeriesResult 携带粒度元数据。
+//
+// Granularity == raw 时 Points 有效；== downsampled 时 Buckets 有效（恰好其一非 nil）。
+type SeriesResult struct {
+	Granularity Granularity
+	// Bucket 是 downsampled 时的有效桶宽；raw 时为 0。
+	Bucket time.Duration
+	// CapHit 表示明细行数超过上限、已自动降采样（调用方可据此引导异步导出）。
+	CapHit  bool
+	Points  []SeriesPoint
+	Buckets []BucketRow
+}
+
+// Normalize 校验保护规则并补默认值，返回规范化副本。
+//
+// now 由调用方注入（而非内部取 time.Now），使单测可确定性地断言默认回溯。
+// 任一条不满足返回 *PolicyError。
+func (q SeriesQuery) Normalize(now time.Time) (SeriesQuery, error) {
+	if q.ProjectID <= 0 {
+		return SeriesQuery{}, &PolicyError{"project_id", "必须提供正的 project_id（强制租户等值条件）"}
+	}
+	if len(q.DeviceIDs) == 0 {
+		return SeriesQuery{}, &PolicyError{"devices", "设备列表为空"}
+	}
+	if len(q.DeviceIDs) > MaxDetailDevices {
+		return SeriesQuery{}, &PolicyError{"devices", fmt.Sprintf("设备数 %d 超过上限 %d", len(q.DeviceIDs), MaxDetailDevices)}
+	}
+	if _, ok := LookupMetric(q.Metric); !ok {
+		return SeriesQuery{}, &PolicyError{"metric", fmt.Sprintf("指标 %q 不在物模型白名单内", q.Metric)}
+	}
+
+	if q.Until.IsZero() {
+		q.Until = now
+	}
+	if q.Since.IsZero() {
+		q.Since = q.Until.Add(-DefaultLookback)
+	}
+	if !q.Since.Before(q.Until) {
+		return SeriesQuery{}, &PolicyError{"range", "Since 必须早于 Until"}
+	}
+	if span := q.Until.Sub(q.Since); span > MaxLookback {
+		return SeriesQuery{}, &PolicyError{"lookback", fmt.Sprintf("回溯 %s 超过上限 %s，请走异步导出", span, MaxLookback)}
+	}
+
+	if q.Limit == 0 {
+		q.Limit = MaxDetailRows
+	}
+	if q.Limit < 0 || q.Limit > MaxDetailRows {
+		return SeriesQuery{}, &PolicyError{"limit", fmt.Sprintf("行数上限 %d 非法，允许区间 [1, %d]", q.Limit, MaxDetailRows)}
+	}
+	return q, nil
+}
+
+// bucketSteps 是自适应桶宽的可读阶梯。
+//
+// 向上取整到阶梯值既保证行预算，也让返回的时间桶落在人能读的刻度上
+// （10s / 5m / 15m / 24h …），而不是 7.2s 这种由除法凑出来的数。
+var bucketSteps = []time.Duration{
+	1 * time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second,
+	15 * time.Second, 30 * time.Second,
+	1 * time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute,
+	15 * time.Minute, 30 * time.Minute,
+	1 * time.Hour, 2 * time.Hour, 3 * time.Hour, 6 * time.Hour,
+	12 * time.Hour, 24 * time.Hour,
+}
+
+// AdaptiveBucket 在「行 = 设备数 × 桶数 ≤ rowCap」约束下求最小可用桶宽。
+//
+// 取整方向：raw = ceil(span / maxBuckets)，再向上取到阶梯值，因此
+// buckets = ceil(span / bucket) ≤ maxBuckets，返回行数必然 ≤ rowCap。
+// 这是「不静默截断」的另一半保证 —— 超限时宁可降采样，也不丢点。
+func AdaptiveBucket(span time.Duration, devices, rowCap int) (time.Duration, error) {
+	if span <= 0 {
+		return 0, &PolicyError{"bucket", fmt.Sprintf("跨度必须为正，得到 %s", span)}
+	}
+	if devices < 1 {
+		return 0, &PolicyError{"bucket", fmt.Sprintf("设备数必须 ≥1，得到 %d", devices)}
+	}
+	if rowCap < 1 {
+		return 0, &PolicyError{"bucket", fmt.Sprintf("行预算必须 ≥1，得到 %d", rowCap)}
+	}
+
+	maxBuckets := rowCap / devices
+	if maxBuckets < 1 {
+		return 0, &PolicyError{"device_budget", fmt.Sprintf("%d 台设备超过 %d 行的行预算", devices, rowCap)}
+	}
+
+	raw := time.Duration((int64(span) + int64(maxBuckets) - 1) / int64(maxBuckets))
+	if raw < MinBucketWidth {
+		raw = MinBucketWidth
+	}
+	for _, s := range bucketSteps {
+		if s >= raw {
+			return s, nil
+		}
+	}
+
+	// 超出阶梯最大档（>24h）：按整天向上取整。
+	day := 24 * time.Hour
+	return ((raw + day - 1) / day) * day, nil
 }
