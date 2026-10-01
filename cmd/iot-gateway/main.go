@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,7 +27,11 @@ func main() {
 	logJSON := flag.Bool("log-json", true, "日志输出为 JSON（生产）；false 为开发可读格式")
 	flag.Parse()
 
-	logger := newLogger(*logJSON)
+	logger, err := newLogger(*logJSON)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "初始化日志失败: %v\n", err)
+		os.Exit(1)
+	}
 	defer func() { _ = logger.Sync() }()
 
 	mux := http.NewServeMux()
@@ -65,18 +70,17 @@ func main() {
 	logger.Info("已退出")
 }
 
-func newLogger(jsonFormat bool) *zap.Logger {
+// newLogger 按配置构造日志实例。
+//
+// 构造失败时返回错误，由调用方终止启动 —— 一个没有日志输出的服务不应被允许运行，
+// 因此这里不做静默降级。
+func newLogger(jsonFormat bool) (*zap.Logger, error) {
 	if jsonFormat {
 		return zap.NewProduction()
 	}
 	cfg := zap.NewDevelopmentConfig()
 	cfg.Encoding = "console"
-	l, err := cfg.Build()
-	if err != nil {
-		// 开发格式构建失败不应影响启动，退回生产格式。
-		return zap.NewNop()
-	}
-	return l
+	return cfg.Build()
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {
