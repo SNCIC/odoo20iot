@@ -7,6 +7,7 @@ DEVBOX      ?= devbox
 DEVBOX_USER ?= xfusion
 PROJECT_DIR ?= /home/xfusion/projects/odoo20iot
 GO_RUN      ?= docker exec -u $(DEVBOX_USER) $(DEVBOX) bash -lc
+NATS_URL    ?= nats://100.64.0.3:28222
 
 COMPOSE_DIR := deploy/compose
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -46,6 +47,16 @@ tidy: ## 整理依赖
 build: ## 编译全部服务到 bin/
 	$(GO_RUN) 'cd $(PROJECT_DIR) && mkdir -p bin && \
 	  go build -ldflags "$(LDFLAGS)" -o bin/iot-gateway ./cmd/iot-gateway'
+
+.PHONY: test-nats
+test-nats: ## A2 真实总线验证（要求 NATS 可达；`go test ./...` 默认跳过）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_NATS_URL=$(NATS_URL) \
+	  go test ./internal/gateway -run TestA2_RealNATS -count=1 -v'
+
+.PHONY: run-gateway
+run-gateway: ## 前台运行网关（连开发栈 NATS）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/iot-gateway \
+	  -mqtt-addr 127.0.0.1:11883 -http-addr 127.0.0.1:18080 -nats-url $(NATS_URL)'
 
 .PHONY: ci
 ci: fmt vet test ## 提交前门禁

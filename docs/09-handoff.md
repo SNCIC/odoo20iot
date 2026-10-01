@@ -7,8 +7,9 @@
 
 ## 1. 一句话现状
 
-**Phase 0（技术验证）刚起步**：环境已就绪、骨架已跑通、开发栈已起来（四个中间件全部 healthy）。
-**尚未开始验证任何 ADR 决策点** —— 第一个要打的是 A2（QoS1 PUBACK 时机）。
+**Phase 0（技术验证）进行中**：环境已就绪、骨架已跑通、开发栈已起来（四个中间件全部 healthy）。
+**第一个决策点 A2（QoS1 PUBACK 时机）已验证通过** —— ADR-001 的定制点成立，**不必回退 EMQX**。
+下一个要打的是 **B1（GreptimeDB JSON vs 宽表）** 与 **C1（`expr` 条件引擎）**。
 
 ---
 
@@ -56,6 +57,8 @@
 | git | devbox 2.53.0 | 提交身份 `Gavin <963645882@qq.com>` |
 | Docker / Compose | 宿主 29.8.1 / v5.5.1 | 镜像源已配国内镜像（daocloud / 1panel） |
 | Odoo 20 | devbox `odoo@odoo20tbb` | 容器内 `127.0.0.1:8070`，Tailscale `100.64.0.3:9070` |
+| `mochi-mqtt/server/v2` | **`v2.7.9`（必须锁版本）** | A2 的挂载点依赖其 `processPublish` 对 `packets.ErrRejectPacket` 的处理（见 `03` §4.4.1 边界 5） |
+| `nats-io/nats.go` | `v1.54.0` | 纯 Go，无 cgo（ADR-010） |
 
 ### 2.4 端口规划（全部避开宿主已占用）
 
@@ -153,6 +156,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 3 | 开发栈四件套运行中 | 全部 `healthy`；**从 devbox 侧**逐项验证：GreptimeDB HTTP(28400) + PG-wire(28403) + 我们的 PG(28543) + NATS(28224) + Redis(28637) |
 | 4 | 代码质量门禁通过 | `go build ./...`、`go vet ./...`、`go test ./...` 全绿 |
 | 5 | Odoo 现状审计勘误 | `07-odoo-integration.md` §2.5 / §2.6 已按**服务器实际配置**重写（原审计基于已废弃的 Windows 旧布局快照，8 项里 5 项误判） |
+| 6 | **A2 · QoS1 PUBACK 时机（P0）** | **通过**。`mochi-mqtt` v2.7.9 可在「等待 NATS `PublishAck` 后再回 PUBACK」下工作：`OnPublish` 返回 `packets.ErrRejectPacket` 阻止自动 PUBACK，业务侧 `cl.WritePacket(ack)` 显式确认。实测往返 **0.52 ~ 1.12 ms**（5 次采样，中位 ≈ 0.92 ms）。结论与边界见 `03-ingestion.md` §4.4.1；代码 `internal/gateway`；用例 `a2_test.go`（含**崩溃注入**与**对照实验**）、`nats_test.go`（真实 JetStream，PUBACK 后消息可读回） |
 
 ---
 
@@ -162,12 +166,15 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 
 | 优先级 | 项 | 说明 |
 |---|---|---|
-| **P0** | **A2 · QoS1 PUBACK 时机** | 唯一一条「不成立就要换掉整个接入层」的路径（ADR-001）。**先打这个** |
-| P0 | B1 · GreptimeDB JSON vs 宽表 | 决定 `02` 文档 §4 的表模型 |
+| ~~P0~~ | ~~A2 · QoS1 PUBACK 时机~~ | ✅ **已完成**（见 §4 第 6 项） |
+| **P0** | **B1 · GreptimeDB JSON vs 宽表** | 决定 `02` 文档 §4 的表模型。**下一个打这个** |
 | P0 | C1 · `expr` 条件引擎 | 编译期类型校验 + 求值 P99 ≤ 2 µs |
-| P1 | A1 / A3 / A4 / A5 | 认证 Hook、集群路由、5 万连接 24h、计量埋点 |
+| P1 | A1 · 设备认证 Hook | **当前网关放行全部连接**（`gateway.New` 里显式标注），三档认证（ADR-008）未实现 |
+| P1 | A3 / A4 / A5 | 集群路由、5 万连接 24h、计量埋点 |
+| P1 | A4 补充项 | A2 引入了「收包协程同步阻塞 ≤ `PubackTimeout`」，需在 5 万连接 24h 压测中实测其对 `PINGREQ` 与掉线判定的影响（见 `03` §4.4.1 边界 1） |
 | P1 | D2 / D3 | Odoo JSON-2 客户端骨架、`sn_edge_integration` 模块骨架 |
 | P2 | 文档收尾 | 把「IoT 平台部署位置」的决策补进 `07` §11.2（**已定：宿主 Docker Compose**） |
+| P2 | 日志口径统一 | 网关层用 `log/slog`（mochi-mqtt 的 Hook 签名即 slog），`cmd/iot-gateway` 仍用 zap，二者应合并为一条流水线（见 `main.go:newSlogLogger`） |
 
 ### 5.2 命令速查
 
@@ -178,6 +185,14 @@ docker exec -it -u xfusion devbox bash
 
 # 编译 / 静态检查 / 测试
 docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && go build ./... && go vet ./... && go test ./...'
+
+# A2 真实总线验证（`go test ./...` 默认跳过，需显式给 NATS 地址）
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
+  IOT_NATS_URL=nats://100.64.0.3:28222 go test ./internal/gateway -run TestA2_RealNATS -count=1 -v'
+# 等价：make test-nats
+
+# 本地起网关（冒烟）
+make run-gateway              # → MQTT 127.0.0.1:11883，HTTP 127.0.0.1:18080（/healthz /metrics）
 
 # 开发栈
 cd /home/xfusion/projects/odoo20iot/deploy/compose
@@ -215,6 +230,11 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 | 9 | `max_cron_threads = 0` | `edge_outbox` 的 cron 投递**根本不执行** | 开发库故意关闭 cron；**集成测试前必须临时调起**，否则会把环境问题误判成代码 bug |
 | 10 | 拿废弃快照当现状 | Odoo 配置审计 8 项里 **5 项误判** | Windows 的 `odoo20.conf` 属 2026-09-21 前的旧布局；**一切以服务器实际配置为准** |
 | 11 | 归一化换行符后 `git status` 仍报 M | `cmp` 字节一致、`git hash-object` 与索引 SHA 相同、`git diff --summary` 为空，**但 status 显示 3 个文件被修改** | `git update-index --refresh` **只比 stat 不比内容**，清不掉；执行 `git add -A` 刷新索引即可（不产生暂存内容）。根因：bind mount 下 `sed -i` 的 mtime 与索引 stat 缓存不匹配 |
+| 12 | **`OnPublish` 返回普通 error 无法阻止 PUBACK** | 以为「返回错误 = 拒绝」，实测 broker 照常回 PUBACK → A2 静默失效 | **只有 `packets.ErrRejectPacket` 会让 `processPublish` 直接 `return nil`**；其他 error 会继续走原生路径。见 `03` §4.4.1 |
+| 13 | 手写 MQTT CONNECT 时漏填 `ProtocolName` | 服务端回 `CONNACK reason=130`（`BadUsernameOrPassword`），看起来像认证失败，实际是报文非法 | 用 `packets.Packet` 构造 CONNECT 时必须设 `Connect.ProtocolName = []byte("MQTT")` |
+| 14 | `mqtt.Server.Close()` 不可重入 | 二次调用 panic：`close of closed channel` | 自己做 `sync.Once` 保护；**且它已经关闭了监听器**，不要再 `ln.Close()`（否则报 `use of closed network connection`） |
+| 15 | 无匹配 Stream 的 subject | JetStream 返回 `nats: no response from stream`（**不是**超时，也**不是**连接错误） | 若误把该错误当「已确认」，配置失误就会静默丢数据。A2 实现按「未确认」处理（见 `03` §4.4.1 边界 3） |
+| 16 | `js.SubscribeSync` 早于 Stream 创建 | `nats: no stream matches subject` | 测试里必须先建 Stream 再订阅 |
 
 ---
 

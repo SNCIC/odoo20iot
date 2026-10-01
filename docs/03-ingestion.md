@@ -455,6 +455,32 @@ type Batcher[T any] struct {
 
 > **实现位置**：`gw-mqtt` 的 `OnPublished` Hook 为异步，无法直接满足「先确认再 PUBACK」。需改为在消息处理链中**同步等待**：`mochi-mqtt` 的 PUBLISH 处理路径中，用 `OnPublish` 返回错误来阻止自动 PUBACK，业务代码在 PublishAck 到达后显式触发 PUBACK。**这是 ADR-001「内嵌 broker」相对 EMQX 的一个明确定制点**，Phase 0 必须验证该 Hook 语义可行。
 
+#### 4.4.1 验证结论（Phase 0 · A2，2026-10-01 · **通过**）
+
+**结论：ADR-001 的定制点成立** —— `mochi-mqtt` v2.7.9 可以在「等待 NATS `PublishAck` 后再回 PUBACK」的语义下工作，无需自建 PUBLISH 处理路径，也无需回退 EMQX。
+
+| 事实 | 内容 |
+|---|---|
+| **挂载点** | `mqtt.Hook` 的 `OnPublish(cl, pk) (packets.Packet, error)`，**同步**执行于该连接的收包协程内 |
+| **阻止自动 PUBACK 的精确机制** | 返回 `packets.ErrRejectPacket` 时，`server.go:processPublish` 立即 `return nil` —— 既不回 PUBACK，也不投递给本地订阅者。**必须用这个哨兵错误**：返回其他 error 会继续走原生路径并照常回 PUBACK（静默失效，极难发现） |
+| **显式确认** | 业务侧构造 `packets.Packet{Type: Puback, PacketID, ReasonCode: packets.QosCodes[1].Code}` 并调用 `cl.WritePacket(ack)`；字段构造对齐库内部 `buildAck`，避免 MQTT 5 的 Properties 语义分叉 |
+| **超时** | 复用同一返回路径：不回 PUBACK 即可，设备按 QoS1 重传。实测「未收到 PUBACK」与「收到 PUBACK」两种行为可被客户端区分 |
+| **实测延迟** | 设备 PUBLISH → PUBACK 往返 **0.52 ~ 1.12 ms**（5 次采样，中位 ≈ 0.92 ms；含 JetStream 落盘 + 一次本地 RTT）。与 §4.4「本地 NATS 通常 < 1 ms」的假设吻合，且远低于 §3 的 100 ms P99 接入确认预算 |
+
+**验证用例**（`internal/gateway`）：总线未确认时无 PUBACK；超时后无 PUBACK 且计入 `gw_puback_timeout_total`；**注入网关崩溃**（收包后、确认前关闭进程）后设备重传、消息不丢；对照实验证明原生 broker 会立即回 PUBACK（排除断言假阳性）；真实 JetStream 上 PUBACK 之后消息可被读回。
+
+**代价与已知边界**（实现时按此验收，不要当成缺陷）：
+
+| # | 边界 | 影响与处置 |
+|---|---|---|
+| 1 | **阻塞该连接的收包协程**（最长 = `PubackTimeout`，默认 5 s） | 这是「一设备一确认」的直接后果（本节已禁止合并等待）。对 `KeepAlive ≥ 60s` 的设备无协议影响，但 `PINGREQ` 响应同样被推迟 —— **需在 A4（5 万连接 24h）实测其对重传与掉线判定的影响** |
+| 2 | **QoS2 未被覆盖** | 端侧契约只使用 QoS0/QoS1；实现选择**显式拒绝 QoS2**并计入 `gw_unsupported_qos_total`，而不是静默降级（后者会让消息绕过「先持久化再确认」） |
+| 3 | **配置失误会暴露为重传而非丢数据** | 若业务 subject 未被任何 JetStream Stream 捕获，总线返回 `no response from stream`；网关按「未确认」处理、拒绝 PUBACK。**这是期望行为**（故障可见，而不是静默丢数据） |
+| 4 | **优雅关闭会取消在途等待** | 关闭时未确认的消息不回 PUBACK，由设备重传兜底。否则关闭会被拖长到超时上限 |
+| 5 | **依赖库内部行为** | 该机制依赖 `processPublish` 对 `ErrRejectPacket` 的处理，属库内部实现。**必须锁版本**（当前 `v2.7.9`），且 `TestA2_PubackOnlyAfterPersist` 即为回归哨兵 —— 库若改变该行为，该用例会立刻失败 |
+
+> 验证代码：`internal/gateway`（`hook.go` 为上表机制的实现，`a2_test.go` / `nats_test.go` 为判据）。运行方式见 `09-handoff.md` §5.2。
+
 ### 4.5 背压与过载保护
 
 | 水位 | 动作 |
