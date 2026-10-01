@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/SNCIC/odoo20iot/internal/natsjs"
 )
 
 // natsPublisher 把告警事件写进 JetStream。
@@ -25,37 +26,20 @@ func (p *natsPublisher) Publish(_ context.Context, subject string, data []byte) 
 	return nil
 }
 
-// ensureStream 幂等地确保流存在且覆盖给定的 subject 前缀。
+// ensureStream 幂等地确保流存在，并校正**保留口径**（走共享实现：建或校 + WARN）。
 //
-// 已存在但**不覆盖**时直接报错，而不是自动改配置：改流的 subjects 会影响
-// 其他消费者，属部署动作。这里的失败信息要能一眼看出缺了哪个前缀，
-// 否则表现是「发布成功但没人收到」——那种故障查起来最花时间。
+// subjects 用**严格**策略：已存在但**不覆盖**时直接报错，而不是自动改配置 ——
+// 改流的 subjects 会影响其他消费者，属部署动作。这里的失败信息要能一眼看出
+// 缺了哪个前缀，否则表现是「发布成功但没人收到」——那种故障查起来最花时间。
+//
+// 保留口径则相反，按既定策略**自动校正并告警**：先于口径代码建出来的流会停在
+// `MaxAge=0`（无限保留），服务不自愈的话它会一直涨下去。
 func ensureStream(js nats.JetStreamContext, name string, subjects []string, maxAge time.Duration) error {
-	info, err := js.StreamInfo(name)
-	if err == nil {
-		for _, want := range subjects {
-			covered := false
-			for _, have := range info.Config.Subjects {
-				if have == want || strings.HasPrefix(want, strings.TrimSuffix(have, ">")) {
-					covered = true
-					break
-				}
-			}
-			if !covered {
-				return fmt.Errorf("流 %s 未覆盖 subject %s（现有 %v）："+
-					"需在部署侧调整，本服务不自动改流的订阅范围", name, want, info.Config.Subjects)
-			}
-		}
-		return nil
-	}
-	if _, err := js.AddStream(&nats.StreamConfig{
-		Name:      name,
-		Subjects:  subjects,
-		Retention: nats.LimitsPolicy,
-		Storage:   nats.FileStorage,
-		MaxAge:    maxAge,
-	}); err != nil {
-		return fmt.Errorf("建流 %s: %w", name, err)
-	}
-	return nil
+	return natsjs.EnsureStream(js, natsjs.StreamSpec{
+		Name:           name,
+		Subjects:       subjects,
+		Replicas:       1,
+		MaxAge:         maxAge,
+		StrictSubjects: true,
+	})
 }

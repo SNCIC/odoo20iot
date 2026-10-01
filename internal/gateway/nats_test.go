@@ -256,26 +256,3 @@ func TestEnsureStreamReconcilesRetention(t *testing.T) {
 		t.Fatalf("二次 EnsureStream 应幂等: %v", err)
 	}
 }
-
-// TestSameStringSet 覆盖 subjects 比较的边界。
-//
-// 顺序不同**不算**漂移：NATS 返回 subjects 的顺序不保证与写入一致，
-// 若按切片逐位比较，每次启动都会误判成漂移并重建一次配置。
-func TestSameStringSet(t *testing.T) {
-	cases := []struct {
-		a, b []string
-		want bool
-	}{
-		{nil, nil, true},
-		{[]string{"a"}, []string{"a"}, true},
-		{[]string{"a", "b"}, []string{"b", "a"}, true},
-		{[]string{"a"}, []string{"b"}, false},
-		{[]string{"a"}, []string{"a", "b"}, false},
-		{[]string{"a", "a"}, []string{"a"}, false},
-	}
-	for _, c := range cases {
-		if got := sameStringSet(c.a, c.b); got != c.want {
-			t.Errorf("sameStringSet(%v, %v) = %v，期望 %v", c.a, c.b, got, c.want)
-		}
-	}
-}

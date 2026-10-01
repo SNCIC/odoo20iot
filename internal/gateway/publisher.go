@@ -11,13 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/SNCIC/odoo20iot/internal/natsjs"
 )
 
 // ErrPubackTimeout 表示「等待总线持久化确认」超时。
@@ -80,30 +81,15 @@ const (
 	DefaultStreamMaxMsgsPerSubject = 1000
 )
 
-// StreamSpec 描述要保证的 Stream 配置。
-//
-// 用结构体而非位置参数：这些字段会随 03 §4.2 的细则增加，位置参数每加一个
-// 就要改一遍全部调用点，也容易把副本数与条数这类同为整型的参数写反。
-type StreamSpec struct {
-	// Subjects 是该 Stream 捕获的 subject（可含通配）。
-	Subjects []string
-	// Replicas 是副本数（§4.4：要求 RPO=0 的租户用 3）。<=0 取 1。
-	Replicas int
-	// MaxAge 是消息保留时长。<=0 取 DefaultStreamMaxAge。
-	MaxAge time.Duration
-	// MaxMsgsPerSubject 是单 subject 的消息上限（防洪）。<=0 取 DefaultStreamMaxMsgsPerSubject。
-	MaxMsgsPerSubject int64
-}
+// StreamSpec 是 natsjs.StreamSpec 的别名：网关调用方不必直接依赖 natsjs，
+// 而实现只有一份（见 natsjs.EnsureStream）。
+type StreamSpec = natsjs.StreamSpec
 
 // EnsureStream 幂等地保证目标 Stream 存在，且保留口径与 03 §4.2 一致。
 //
-// ⚠️ 它会对**已存在**的 Stream 做校正。早期实现只在「不存在」时创建，
-// 于是先于本口径建出来的流会一直是**无限保留**（`MaxAge=0`）—— 磁盘随写入
-// 无上限增长，且是「重启即重放」的放大器（保留窗口越长，一次误删消费者的
-// 代价越大，见 §6 坑 42）。校正成更短的 MaxAge 会**立即清掉超期消息**，
-// 这是设计意图（保留窗口就是 24h），但属破坏性动作，故显式记一条日志。
-//
-// 不动既存 Stream 的副本数：副本数是部署期按租户 RPO 决定的，不是本函数的职责。
+// 真正的工作在 natsjs.EnsureStream（建或校 + WARN）。这里只负责补上遥测流的
+// 默认口径；`MaxAge=0` 曾是本项目的真实缺陷（无限保留 → 磁盘无上限增长，
+// 且是「重启即重放」的放大器），故此处对零值补默认而非放行。
 func (p *NATSPublisher) EnsureStream(spec StreamSpec) error {
 	if spec.MaxAge <= 0 {
 		spec.MaxAge = DefaultStreamMaxAge
@@ -111,89 +97,12 @@ func (p *NATSPublisher) EnsureStream(spec StreamSpec) error {
 	if spec.MaxMsgsPerSubject <= 0 {
 		spec.MaxMsgsPerSubject = DefaultStreamMaxMsgsPerSubject
 	}
-	replicas := spec.Replicas
-	if replicas <= 0 {
-		replicas = 1
+	if spec.Discard == 0 {
+		// 03 §4.2：防洪时丢新不丢旧 —— 丢旧会把消费者还没读到的数据删掉。
+		spec.Discard = nats.DiscardNew
 	}
-
-	want := nats.StreamConfig{
-		Name:              p.stream,
-		Subjects:          spec.Subjects,
-		Replicas:          replicas,
-		Storage:           nats.FileStorage,
-		Retention:         nats.LimitsPolicy,
-		Discard:           nats.DiscardNew,
-		MaxAge:            spec.MaxAge,
-		MaxMsgsPerSubject: spec.MaxMsgsPerSubject,
-	}
-
-	got, err := p.js.StreamInfo(p.stream)
-	switch {
-	case err == nil:
-		return p.reconcileStream(got, &want)
-	case errors.Is(err, nats.ErrStreamNotFound):
-	default:
-		return fmt.Errorf("查询 Stream %q: %w", p.stream, err)
-	}
-
-	if _, err := p.js.AddStream(&want); err != nil {
-		return fmt.Errorf("创建 Stream %q: %w", p.stream, err)
-	}
-	return nil
-}
-
-// reconcileStream 把既存 Stream 校正到期望口径；已一致则什么都不做。
-//
-// 只改保留相关字段（subjects / MaxAge / MaxMsgsPerSubject / Discard），
-// 在 `got.Config` 上原地改而不是整体替换 —— 否则会把部署期设的其它字段
-// （副本数、去重窗口、存储后端等）一并抹回本函数的默认值。
-func (p *NATSPublisher) reconcileStream(got *nats.StreamInfo, want *nats.StreamConfig) error {
-	cur := got.Config
-	if sameStringSet(cur.Subjects, want.Subjects) &&
-		cur.MaxAge == want.MaxAge &&
-		cur.MaxMsgsPerSubject == want.MaxMsgsPerSubject &&
-		cur.Discard == want.Discard {
-		return nil
-	}
-
-	slog.Warn("Stream 保留口径与 03 §4.2 不一致，正在校正",
-		"stream", p.stream,
-		"old_max_age", cur.MaxAge, "new_max_age", want.MaxAge,
-		"old_max_msgs_per_subject", cur.MaxMsgsPerSubject,
-		"new_max_msgs_per_subject", want.MaxMsgsPerSubject,
-		"note", "缩短 MaxAge 会立即删除超期消息")
-
-	cur.Subjects = want.Subjects
-	cur.MaxAge = want.MaxAge
-	cur.MaxMsgsPerSubject = want.MaxMsgsPerSubject
-	cur.Discard = want.Discard
-	if _, err := p.js.UpdateStream(&cur); err != nil {
-		return fmt.Errorf("校正 Stream %q 配置: %w", p.stream, err)
-	}
-	return nil
-}
-
-// sameStringSet 判断两个字符串集合是否相等（顺序无关、忽略重复）。
-//
-// 用集合而不是切片比较：NATS 返回 subjects 的顺序不保证与写入一致，
-// 直接 `slices.Equal` 会把「内容相同、顺序不同」误判成漂移，每次都重建一次配置。
-func sameStringSet(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	set := make(map[string]struct{}, len(a))
-	for _, s := range a {
-		set[s] = struct{}{}
-	}
-	if len(set) != len(a) {
-		return false
-	}
-	for _, s := range b {
-		if _, ok := set[s]; !ok {
-			return false
-		}
-	}
-	return true
+	spec.Name = p.stream
+	return natsjs.EnsureStream(p.js, spec)
 }
 
 // Publish 同步等待 PublishAck。

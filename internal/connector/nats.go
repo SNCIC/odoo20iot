@@ -2,11 +2,12 @@ package connector
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/SNCIC/odoo20iot/internal/natsjs"
 )
 
 // OdooStream 是承载 `iot.odoo.>` 事件的 JetStream Stream。
@@ -48,27 +49,17 @@ func NewNATSPublisher(nc *nats.Conn, stream string) (*NATSPublisher, error) {
 // Stream 返回 Stream 名（观测用）。
 func (p *NATSPublisher) Stream() string { return p.stream }
 
-// EnsureStream 幂等地保证 `iot.odoo.>` 的 Stream 存在。
+// EnsureStream 幂等地保证 `iot.odoo.>` 的 Stream 存在，并校正保留口径。
+//
+// 走共享实现（建或校 + WARN）：早期「不存在才创建」的写法会让**先于口径代码
+// 建出来的流**永远停在 `MaxAge=0`（无限保留）。
 func (p *NATSPublisher) EnsureStream() error {
-	_, err := p.js.StreamInfo(p.stream)
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, nats.ErrStreamNotFound):
-	default:
-		return fmt.Errorf("查询 Stream %s: %w", p.stream, err)
-	}
-
-	if _, err := p.js.AddStream(&nats.StreamConfig{
-		Name:      p.stream,
-		Subjects:  []string{OdooSubjectPrefix + ".>"},
-		Storage:   nats.FileStorage,
-		Retention: nats.LimitsPolicy,
-		MaxAge:    DefaultOdooStreamMaxAge,
-	}); err != nil {
-		return fmt.Errorf("创建 Stream %s: %w", p.stream, err)
-	}
-	return nil
+	return natsjs.EnsureStream(p.js, natsjs.StreamSpec{
+		Name:     p.stream,
+		Subjects: []string{OdooSubjectPrefix + ".>"},
+		Replicas: 1,
+		MaxAge:   DefaultOdooStreamMaxAge,
+	})
 }
 
 // Publish 同步等待 `PublishAck`。
