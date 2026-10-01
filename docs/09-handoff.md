@@ -8,8 +8,11 @@
 ## 1. 一句话现状
 
 **Phase 0（技术验证）进行中**：环境已就绪、骨架已跑通、开发栈已起来（四个中间件全部 healthy）。
-**第一个决策点 A2（QoS1 PUBACK 时机）已验证通过** —— ADR-001 的定制点成立，**不必回退 EMQX**。
-下一个要打的是 **B1（GreptimeDB JSON vs 宽表）** 与 **C1（`expr` 条件引擎）**。
+**两个决策点已通过**：
+- **A2（QoS1 PUBACK 时机）** —— ADR-001 的定制点成立，**不必回退 EMQX**（`03` §4.4.1）；
+- **B1（GreptimeDB JSON vs 宽表）** —— JSON 方案写入达标 3.8×，**维持 JSON 为默认，不切宽表**（`02` §4.1.1）。
+
+下一个要打的是 **C1（`expr` 条件引擎）**。
 
 ---
 
@@ -59,6 +62,8 @@
 | Odoo 20 | devbox `odoo@odoo20tbb` | 容器内 `127.0.0.1:8070`，Tailscale `100.64.0.3:9070` |
 | `mochi-mqtt/server/v2` | **`v2.7.9`（必须锁版本）** | A2 的挂载点依赖其 `processPublish` 对 `packets.ErrRejectPacket` 的处理（见 `03` §4.4.1 边界 5） |
 | `nats-io/nats.go` | `v1.54.0` | 纯 Go，无 cgo（ADR-010） |
+| `jackc/pgx/v5` | `v5.11.0` | 访问 GreptimeDB 的 PostgreSQL wire 端点；纯 Go。**注意 `Ping()` 与 simple protocol 都不可用**，见 §6 坑 19 |
+| GreptimeDB | **`1.2.1`**（compose 里是 `:latest`，**上生产前必须锁版本**） | JSON 能力边界按 1.2.1 实测，见 `02` §4.1.1 ④ |
 
 ### 2.4 端口规划（全部避开宿主已占用）
 
@@ -156,6 +161,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 3 | 开发栈四件套运行中 | 全部 `healthy`；**从 devbox 侧**逐项验证：GreptimeDB HTTP(28400) + PG-wire(28403) + 我们的 PG(28543) + NATS(28224) + Redis(28637) |
 | 4 | 代码质量门禁通过 | `go build ./...`、`go vet ./...`、`go test ./...` 全绿 |
 | 5 | Odoo 现状审计勘误 | `07-odoo-integration.md` §2.5 / §2.6 已按**服务器实际配置**重写（原审计基于已废弃的 Windows 旧布局快照，8 项里 5 项误判） |
+| 7 | **B1 · 时序表模型（P0）** | **通过**。`cmd/tsdb-bench` 在 GreptimeDB 1.2.1 上对比 A（JSON）/ B（宽表）：写入 19.1 万 / 16.1 万 points/s（验收线 5 万，内联字面量路径 64.0 万）；查询单设备全部达标，多设备明细两方案**都**超线 → 结论「维持 JSON 默认」。含**前置一致性校验**（两方案 3599 点逐点相等）。结论与边界 `02` §4.1.1；原始报告 `docs/reports/b1-tsdb-bench.md` |
 | 6 | **A2 · QoS1 PUBACK 时机（P0）** | **通过**。`mochi-mqtt` v2.7.9 可在「等待 NATS `PublishAck` 后再回 PUBACK」下工作：`OnPublish` 返回 `packets.ErrRejectPacket` 阻止自动 PUBACK，业务侧 `cl.WritePacket(ack)` 显式确认。实测往返 **0.52 ~ 1.12 ms**（5 次采样，中位 ≈ 0.92 ms）。结论与边界见 `03-ingestion.md` §4.4.1；代码 `internal/gateway`；用例 `a2_test.go`（含**崩溃注入**与**对照实验**）、`nats_test.go`（真实 JetStream，PUBACK 后消息可读回） |
 
 ---
@@ -167,8 +173,11 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 优先级 | 项 | 说明 |
 |---|---|---|
 | ~~P0~~ | ~~A2 · QoS1 PUBACK 时机~~ | ✅ **已完成**（见 §4 第 6 项） |
-| **P0** | **B1 · GreptimeDB JSON vs 宽表** | 决定 `02` 文档 §4 的表模型。**下一个打这个** |
-| P0 | C1 · `expr` 条件引擎 | 编译期类型校验 + 求值 P99 ≤ 2 µs |
+| ~~P0~~ | ~~B1 · GreptimeDB JSON vs 宽表~~ | ✅ **已完成**（见 §4 第 7 项） |
+| **P0** | **C1 · `expr` 条件引擎** | 编译期类型校验 + 求值 P99 ≤ 2 µs。**下一个打这个** |
+| P0 | B1 补充项（1） | **明细查询限行**必须落地（`02` §4.3.1）：实测多设备 3.6 万行明细 P95 达 247/211 ms，两方案都超线 |
+| P0 | B1 补充项（2） | **预聚合表从「可选优化」升为必做**：多设备 × 长跨度聚合在 JSON 下已骑在 SLO 线（198~213 ms），宽表 91 ms |
+| P1 | B1 补充项（3） | 上生产前按 **3 副本集群 + NVMe** 重测写入吞吐；宽表开启前用**租户真实样本**重测存储占用 |
 | P1 | A1 · 设备认证 Hook | **当前网关放行全部连接**（`gateway.New` 里显式标注），三档认证（ADR-008）未实现 |
 | P1 | A3 / A4 / A5 | 集群路由、5 万连接 24h、计量埋点 |
 | P1 | A4 补充项 | A2 引入了「收包协程同步阻塞 ≤ `PubackTimeout`」，需在 5 万连接 24h 压测中实测其对 `PINGREQ` 与掉线判定的影响（见 `03` §4.4.1 边界 1） |
@@ -190,6 +199,10 @@ docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && g
 docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
   IOT_NATS_URL=nats://100.64.0.3:28222 go test ./internal/gateway -run TestA2_RealNATS -count=1 -v'
 # 等价：make test-nats
+
+# B1 时序表模型压测（约 3 分钟；会 drop/重建 telemetry* 表）
+#   建议先 docker restart iot-greptimedb：连续压测会留下 compaction backlog
+make b1-bench
 
 # 本地起网关（冒烟）
 make run-gateway              # → MQTT 127.0.0.1:11883，HTTP 127.0.0.1:18080（/healthz /metrics）
@@ -235,6 +248,14 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 | 14 | `mqtt.Server.Close()` 不可重入 | 二次调用 panic：`close of closed channel` | 自己做 `sync.Once` 保护；**且它已经关闭了监听器**，不要再 `ln.Close()`（否则报 `use of closed network connection`） |
 | 15 | 无匹配 Stream 的 subject | JetStream 返回 `nats: no response from stream`（**不是**超时，也**不是**连接错误） | 若误把该错误当「已确认」，配置失误就会静默丢数据。A2 实现按「未确认」处理（见 `03` §4.4.1 边界 3） |
 | 16 | `js.SubscribeSync` 早于 Stream 创建 | `nats: no stream matches subject` | 测试里必须先建 Stream 再订阅 |
+| 17 | `metrics` 是 GreptimeDB 保留关键字 | 建表报 `Cannot use keyword 'metrics' as column name` | DDL 里写成 `"metrics"`（`02` §4.2 已修正） |
+| 18 | **JSON 列在 PG 协议下是 bytea** | 普通字符串参数报 `\x prefix expected for bytea`；`CAST($1 AS JSON)` 报 `Unsupported SQL type JSON` | 只有两条路：内联字面量（快 3.4×）或 `\x`+十六进制参数（体积 ×2） |
+| 19 | pgx 的两个默认行为都不兼容 GreptimeDB | `Ping()` 发空语句 → `empty statements`；simple protocol → `standard_conforming_strings` 为 off 被 pgx 拒绝 | 探活用 `SELECT 1`；保持扩展协议并显式指定取值编码 |
+| 20 | **漏检 `rows.Err()` = 静默空结果** | 本次探测中 `json_get` 作用于 TEXT 列，`Query()` 不报错、`Next()` 直接为 false，被误判成「静默返回空」 | pgx 的查询错误不一定从 `Query()` 返回；所有迭代后必须 `rows.Err()` |
+| 21 | **压缩比必须先 `ADMIN FLUSH_TABLE`** | 写入刚结束数据还在 memtable，读 `disk_size` 得到的是残余，字节/行虚高 2~6 倍（实测 72.8 → 16.1） | 任何存储结论都要先强制落盘 |
+| 22 | **小数据集压测会给出相反结论** | 4200 行的冒烟跑出「JSON 比宽表慢 3 倍」，112 万行时变成「JSON 快 4 倍」——预热开销主导 | 压测必须跑到稳态；本次全量 3 轮写入吞吐复现性 ±3% |
+| 23 | **取值生成器会翻转存储结论** | 周期序列下 A/B 存储比 3.31×，随机/自相关下 0.96× | 压测必须声明取值模型（`-value-model`），存储维度不能只看一次 |
+| 24 | 连续压测把 GreptimeDB 拖入 compaction backlog | 连跑 4 轮后单轮写入从 28s 涨到 5min+（CPU 560%） | 压测前 `docker restart iot-greptimedb`，并先 drop 无关表 |
 
 ---
 

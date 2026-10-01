@@ -18,6 +18,8 @@
 | [06-operations.md](./06-operations.md) | 高可用、容灾备份、容量规划与压测、可观测与 SLO、CI/CD、成本、演进路线、风险 | SRE / 管理层 |
 | [07-odoo-integration.md](./07-odoo-integration.md) | 与 Odoo 20（`D:\odoo\odoo20tbb`）的集成：事实基线、通道选型、连接器设计、数据映射、集成场景、bridge 模块 | 后端 / ERP 集成 |
 | [08-odoo-perf-alignment.md](./08-odoo-perf-alignment.md) | 与《Odoo 20 高性能架构技术方案》的对齐：定位对齐、八项冲突裁定、统一约定层、Odoo 生产配置、分期对齐 | 架构 / 全员 |
+| [09-handoff.md](./09-handoff.md) | **交接与工作约定**：环境事实、命令速查、踩过的坑、当前进度与下一步 | **新会话 / 新同事先读这份** |
+| [reports/](./reports/) | 压测与验证的原始报告（自动生成，随代码一起入库） | 后端 / SRE |
 
 **约定**：文中的架构决策以 `ADR-xxx` 编号记录；所有量化指标为设计目标（SLO），需在压测阶段验证。
 

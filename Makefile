@@ -53,6 +53,13 @@ test-nats: ## A2 真实总线验证（要求 NATS 可达；`go test ./...` 默�
 	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_NATS_URL=$(NATS_URL) \
 	  go test ./internal/gateway -run TestA2_RealNATS -count=1 -v'
 
+.PHONY: b1-bench
+b1-bench: ## Phase 0 · B1 时序表模型压测（需要 GreptimeDB 可达，约 3 分钟）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/tsdb-bench -plan all \
+	  -fleet-devices 300 -span 24h -hot-devices 12 -hot-span 6h \
+	  -writers 8 -query-iters 30 -value-model correlated \
+	  -report tmp/b1-report.md'
+
 .PHONY: run-gateway
 run-gateway: ## 前台运行网关（连开发栈 NATS）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/iot-gateway \
