@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -142,6 +144,40 @@ type Metrics struct {
 	UnroutableTotal atomic.Int64
 	// UnsupportedQosTotal 超出端侧契约的 QoS（当前为 QoS2）报文数。
 	UnsupportedQosTotal atomic.Int64
+
+	// ---- 认证与 ACL（06 §4：gw_connect_fail_total / gw_auth_cache_hit_ratio）----
+
+	// AuthSuccessTotal 认证通过的连接数。
+	AuthSuccessTotal atomic.Int64
+	// ConnectFailTotal 认证失败的连接数（按 reason 细分见下）。
+	ConnectFailTotal atomic.Int64
+	// ACLDeniedTotal 被 ACL 拒绝的收发操作数。
+	ACLDeniedTotal atomic.Int64
+
+	failMu      sync.Mutex
+	failReasons map[string]int64
+}
+
+// recordConnectFail 按原因累加连接失败数。
+func (m *Metrics) recordConnectFail(reason string) {
+	m.failMu.Lock()
+	defer m.failMu.Unlock()
+	if m.failReasons == nil {
+		m.failReasons = make(map[string]int64, 8)
+	}
+	m.failReasons[reason]++
+}
+
+// connectFailReasons 返回按原因分类的连接失败快照。
+func (m *Metrics) connectFailReasons() map[string]int64 {
+	m.failMu.Lock()
+	defer m.failMu.Unlock()
+
+	out := make(map[string]int64, len(m.failReasons))
+	for k, v := range m.failReasons {
+		out[k] = v
+	}
+	return out
 }
 
 // WriteProm 以 Prometheus 文本格式导出计数器。
@@ -153,6 +189,22 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	writeMetric(w, "gw_puback_write_error_total", "回写 PUBACK 失败数", m.PubackWriteErrorTotal.Load())
 	writeMetric(w, "gw_unroutable_total", "无法路由的上报数", m.UnroutableTotal.Load())
 	writeMetric(w, "gw_unsupported_qos_total", "超出端侧契约的 QoS 报文数", m.UnsupportedQosTotal.Load())
+
+	writeMetric(w, "gw_auth_success_total", "设备认证通过的连接数", m.AuthSuccessTotal.Load())
+	writeMetric(w, "gw_connect_fail_total", "设备认证失败的连接数（见 reason 维度）", m.ConnectFailTotal.Load())
+	writeMetric(w, "gw_acl_denied_total", "被 ACL 拒绝的收发操作数", m.ACLDeniedTotal.Load())
+
+	// 按原因分类（06 §4 的 gw_connect_fail_total{reason}）。固定顺序输出，
+	// 便于人工比对与抓取。
+	reasons := m.connectFailReasons()
+	keys := make([]string, 0, len(reasons))
+	for k := range reasons {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		_, _ = fmt.Fprintf(w, "gw_connect_fail_total{reason=%q} %d\n", k, reasons[k])
+	}
 }
 
 func writeMetric(w io.Writer, name, help string, v int64) {

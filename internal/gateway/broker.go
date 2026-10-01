@@ -9,8 +9,10 @@ import (
 	"time"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/hooks/auth"
+	mqttauth "github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
+
+	"github.com/SNCIC/odoo20iot/internal/auth"
 )
 
 // Options 是接入网关的启动参数。
@@ -27,6 +29,17 @@ type Options struct {
 	Metrics *Metrics
 	// Log 可为空；空时使用 slog 默认实例。
 	Log *slog.Logger
+
+	// Authenticator 提供 03 §2.1 的三档设备认证。
+	// 与 AllowAnonymous 二选一，**必须显式指定其一**。
+	Authenticator *auth.Authenticator
+
+	// AllowAnonymous 显式开启「放行全部连接」。
+	//
+	// 它存在只是为了本地冒烟与单元测试。把它做成必须显式声明的开关，
+	// 是为了让「忘记配认证」不能静默退化成「谁都能连」——
+	// 后者是接入层最危险的默认值。
+	AllowAnonymous bool
 }
 
 // Broker 是接入网关的内嵌 MQTT Broker（ADR-001）。
@@ -34,8 +47,9 @@ type Broker struct {
 	Server  *mqtt.Server
 	Metrics *Metrics
 
-	addr    string
-	serveCh chan error
+	addr     string
+	serveCh  chan error
+	authHook *AuthHook
 
 	cancelClose context.CancelFunc
 	closeOnce   sync.Once
@@ -75,13 +89,29 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	}
 
 	server := mqtt.New(&mqtt.Options{Logger: opts.Log})
+	var authHook *AuthHook
 
-	// ⚠️ Phase 0 临时放行全部连接：三档设备认证（A1）尚未实现。
-	// 此处刻意保持「无认证」而不是伪造一个假认证 hook —— A1 未完成就是未完成。
-	if err := server.AddHook(new(auth.AllowHook), nil); err != nil {
+	// 认证必须显式配置：要么给认证器，要么显式声明放行匿名。
+	if opts.Authenticator == nil && !opts.AllowAnonymous {
 		cancelClose()
 		ln.Close()
-		return nil, fmt.Errorf("装载认证 hook: %w", err)
+		return nil, fmt.Errorf(
+			"未配置 Options.Authenticator：请提供认证器，或显式设置 Options.AllowAnonymous=true（仅限本地冒烟/测试）")
+	}
+	if opts.Authenticator == nil {
+		opts.Log.Error("⚠️ 已放行全部连接（Options.AllowAnonymous=true）：此模式不得用于任何非本地环境")
+		if err := server.AddHook(new(mqttauth.AllowHook), nil); err != nil {
+			cancelClose()
+			ln.Close()
+			return nil, fmt.Errorf("装载匿名放行 hook: %w", err)
+		}
+	} else {
+		authHook = NewAuthHook(runCtx, opts.Authenticator, opts.Metrics, opts.Log)
+		if err := server.AddHook(authHook, nil); err != nil {
+			cancelClose()
+			ln.Close()
+			return nil, fmt.Errorf("装载认证 hook: %w", err)
+		}
 	}
 
 	acker := NewAcker(opts.Publisher, opts.PubackTimeout, opts.Metrics)
@@ -104,8 +134,15 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		addr:        ln.Addr().String(),
 		serveCh:     make(chan error, 1),
 		cancelClose: cancelClose,
+		authHook:    authHook,
 	}, nil
 }
+
+// AuthHook 返回认证 Hook；未启用认证时为 nil。
+//
+// 暴露它是为了让控制面（凭据轮换后清缓存）与测试能拿到它 ——
+// mochi 的 Server 没有 Hooks() 访问器。
+func (b *Broker) AuthHook() *AuthHook { return b.authHook }
 
 // Addr 返回实际监听地址（测试中用 :0 时取真实端口）。
 func (b *Broker) Addr() string { return b.addr }

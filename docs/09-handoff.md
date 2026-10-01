@@ -12,7 +12,9 @@
 - **B1（GreptimeDB JSON vs 宽表）** —— JSON 方案写入达标 3.8×，**维持 JSON 为默认，不切宽表**（`02` §4.1.1）；
 - **C1（`expr` 条件引擎）** —— 编译期校验与 P99 均达标，但**校验必须自建 AST 层**（`04` §1.2.1）。
 
-下一步进入 **Phase 1（骨架落地）**：A1 设备认证、A3 集群路由、D2/D3 Odoo 集成骨架。
+**Phase 1 已开工**：**A1 设备认证**（三档 + 物模型 ACL + Argon2 容量实测）已完成。
+
+下一步：**A3 集群路由**、**A5 计量埋点**、D2/D3 Odoo 集成骨架。
 
 ---
 
@@ -162,6 +164,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 3 | 开发栈四件套运行中 | 全部 `healthy`；**从 devbox 侧**逐项验证：GreptimeDB HTTP(28400) + PG-wire(28403) + 我们的 PG(28543) + NATS(28224) + Redis(28637) |
 | 4 | 代码质量门禁通过 | `go build ./...`、`go vet ./...`、`go test ./...` 全绿 |
 | 5 | Odoo 现状审计勘误 | `07-odoo-integration.md` §2.5 / §2.6 已按**服务器实际配置**重写（原审计基于已废弃的 Windows 旧布局快照，8 项里 5 项误判） |
+| 9 | **A1 · 设备认证（P1）** | **完成**。`internal/auth` 实现三档认证（A 档默认关闭）、物模型驱动 ACL、L1 缓存 + fail-closed 降级、失败计数与黑名单、过载与凭据失败分离；`internal/gateway/authhook.go` 接入 broker，**端到端 5 个用例**（凭据判定 / ACL 订阅 / 越权发布断连 / 网关子设备命名空间 / 断连回收）。容量实测：单次 Argon2 **116ms**、冷启动 **51 次/秒**；**文档参数被否决**，改为 `t=3 m=32MiB p=2` + 并发 8。见 `03` §2.1.1 |
 | 8 | **C1 · 规则条件引擎（P0）** | **通过**。`internal/rules` 实现编译期校验（AST + 物模型类型表）、41 个白名单函数、编译缓存与 `Runner`。实测求值 **P50 0.60~0.81 µs / P99 0.98~1.74 µs**（验收线 2 µs，6 轮；余量 1.15~2.04×，**生产机型需复测**）；编译缓存命中 121 ns / 0 分配。核心发现：**`expr.Env` 的类型化环境覆盖不了小写物模型键**，校验必须自建（`04` §1.2.1） |
 | 7 | **B1 · 时序表模型（P0）** | **通过**。`cmd/tsdb-bench` 在 GreptimeDB 1.2.1 上对比 A（JSON）/ B（宽表）：写入 19.1 万 / 16.1 万 points/s（验收线 5 万，内联字面量路径 64.0 万）；查询单设备全部达标，多设备明细两方案**都**超线 → 结论「维持 JSON 默认」。含**前置一致性校验**（两方案 3599 点逐点相等）。结论与边界 `02` §4.1.1；原始报告 `docs/reports/b1-tsdb-bench.md` |
 | 6 | **A2 · QoS1 PUBACK 时机（P0）** | **通过**。`mochi-mqtt` v2.7.9 可在「等待 NATS `PublishAck` 后再回 PUBACK」下工作：`OnPublish` 返回 `packets.ErrRejectPacket` 阻止自动 PUBACK，业务侧 `cl.WritePacket(ack)` 显式确认。实测往返 **0.52 ~ 1.12 ms**（5 次采样，中位 ≈ 0.92 ms）。结论与边界见 `03-ingestion.md` §4.4.1；代码 `internal/gateway`；用例 `a2_test.go`（含**崩溃注入**与**对照实验**）、`nats_test.go`（真实 JetStream，PUBACK 后消息可读回） |
@@ -177,7 +180,8 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | ~~P0~~ | ~~A2 · QoS1 PUBACK 时机~~ | ✅ **已完成**（见 §4 第 6 项） |
 | ~~P0~~ | ~~B1 · GreptimeDB JSON vs 宽表~~ | ✅ **已完成**（见 §4 第 7 项） |
 | ~~P0~~ | ~~C1 · `expr` 条件引擎~~ | ✅ **已完成**（见 §4 第 8 项） |
-| **P1** | **A1 · 设备认证 Hook** | **当前网关放行全部连接**（`gateway.New` 里显式标注）。三档认证（ADR-008）未实现。**下一批的第一项** |
+| ~~P1~~ | ~~A1 · 设备认证 Hook~~ | ✅ **已完成**（见 §4 第 9 项）。⚠️ 遗留：L2/L3 凭据来源（Redis/svc-auth）未接入，当前用本地凭据文件（仅开发/PoC） |
+| P1 | A1 补充项 | A 档六项强制措施（IP 白名单/异常检测/轮换提醒/按键审计）未实现；mTLS 端到端未实测 |
 | P1 | 规则索引与窗口算子 | C1 只覆盖了「表达式」；拓扑匹配过滤、`window.*` 的窗口算子、DAG 编排、动作分发均未实现（`04` §1.2.1 ⑧） |
 | P0 | B1 补充项（1） | **明细查询限行**必须落地（`02` §4.3.1）：实测多设备 3.6 万行明细 P95 达 247/211 ms，两方案都超线 |
 | P0 | B1 补充项（2） | **预聚合表从「可选优化」升为必做**：多设备 × 长跨度聚合在 JSON 下已骑在 SLO 线（198~213 ms），宽表 91 ms |
@@ -212,7 +216,14 @@ make b1-bench
 make c1-bench
 # 等价于：IOT_PERF_ASSERT=1 go test ./internal/rules -run TestPerf -count=1 -v
 
-# 本地起网关（冒烟）
+# A1 认证容量实测（约 3 分钟）
+make a1-capacity
+
+# 生成一份演示凭据并本地起网关（带认证）
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
+  go run ./cmd/iot-gateway -gen-auth-file=tmp/dev-credentials.json'
+make run-gateway        # 默认读取 tmp/dev-credentials.json
+
 make run-gateway              # → MQTT 127.0.0.1:11883，HTTP 127.0.0.1:18080（/healthz /metrics）
 
 # 开发栈
@@ -271,6 +282,10 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 | 29 | **编译期模板里的 nil 会收窄类型** | 环境模板把 `prev` 写成 `nil` → 检查器把 prev 收窄成 nil 类型 → `prev.temperature` 报 `type nil has no field temperature` | 编译期模板一律给空映射；「prev 可能为空」只在运行时表达 |
 | 30 | **`expr.Run` 的池化开销决定了 P99 是否达标** | 同样表达式：直接用 `expr.Run` P99 = 2.03 µs（超线），改用 `Runner` 复用 VM 后 0.98~1.52 µs | 热路径用 `rules.Runner`；这类预算里常数项就是结论 |
 | 31 | **漏检 `rows.Err()` / 只看 P50 会给出错误结论** | 小规模与单点测量都会骗人（B1 的小数据集、C1 的 P50） | 结论必须看**分布**与**全量**，不看单点或均值 |
+| 32 | **MQTT 3.1.1 的 SUBACK 返回码不是 0/1 表示成败** | 返回 `1` 被误读成失败，实际是「授予 QoS1」 | 判据是 `code < 0x80` 才算成功；`0x80` 是失败 |
+| 33 | **Argon2 的并发上限不能按 CPU 核数定** | 槽位 4→32 时认证吞吐反而 51→19 次/秒；CPU 利用率封顶 25% | 瓶颈是**内存带宽**；按实测峰值附近取值（8C16G 取 8） |
+| 34 | **「缓存命中率高」≠「认证容量够」** | L1 只省 157ns 的目录查询，省不掉 116ms 的 Argon2（占 0.00016%） | 容量必须按 KDF 成本算；别用命中率论证容量 |
+| 35 | 限流与安全计数的混淆 | 把「网关过载」计入凭据失败窗口，重连风暴会把**全部正常设备**拉黑 | 过载/后端不可用必须单列：不计失败、不进黑名单、返回可重试语义 |
 
 ---
 

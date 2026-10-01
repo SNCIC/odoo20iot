@@ -1,13 +1,14 @@
 // Command iot-gateway 是 MQTT 接入网关。
 //
-// Phase 0 的目标是验证 A2（QoS1 PUBACK 时机，ADR-001 的关键定制点）：
-// 网关必须在 NATS JetStream 确认持久化之后，才向设备回 PUBACK。
-// 实现与判据见 internal/gateway。
+// 当前覆盖的能力（Phase 0 验证 + Phase 1 首批）：
+//   - A2：QoS1 确认时序 —— 等 NATS 确认持久化后再回 PUBACK（internal/gateway）；
+//   - A1：三档设备认证 + 物模型驱动 ACL（internal/auth）；
+//   - B1：GreptimeDB 表模型选型（internal/tsdb，压测工具 cmd/tsdb-bench）。
 //
-// 尚未实现（刻意留白，不做假实现）：
-//   - A1 三档设备认证：当前放行全部连接，见 gateway.New 中的说明；
+// 尚未实现（如实留白，不做假实现）：
+//   - L2/L3 凭据来源（Redis / svc-auth gRPC）：当前用本地凭据文件（仅开发/PoC）；
 //   - A3 集群路由：单节点，无跨节点投递；
-//   - 会话持久化（CleanSession=false 的 inflight 窗口落 Redis）。
+//   - 物模型解析与落库管道（svc-pipeline）：只有压测路径，没有消费链路。
 package main
 
 import (
@@ -20,12 +21,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/SNCIC/odoo20iot/internal/auth"
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
 	"github.com/SNCIC/odoo20iot/internal/gateway"
 )
@@ -34,11 +37,18 @@ func main() {
 	httpAddr := flag.String("http-addr", ":8080", "HTTP 监听地址（健康检查与指标端点）")
 	mqttAddr := flag.String("mqtt-addr", ":1883", "MQTT 监听地址")
 	natsURL := flag.String("nats-url", "nats://100.64.0.3:28222", "NATS JetStream 地址")
-	natsStream := flag.String("nats-stream", "IOT_TELEMETRY", "遥测 Stream 名称（Phase 0 占位，待与 03 文档对齐）")
+	natsStream := flag.String("nats-stream", "IOT_TELEMETRY", "遥测 Stream 名称（Phase 0 占位，待与 03 对齐）")
 	natsSubjects := flag.String("nats-subjects", "iot.telemetry.>", "遥测 Stream 捕获的 subject，逗号分隔")
 	pubackTimeout := flag.Duration("puback-timeout", gateway.DefaultPubackTimeout, "等待 PublishAck 的上限（超时则不回 PUBACK）")
-	project := flag.String("project", "spike", "**占位**租户标识：A1 设备凭据注册表未实现，无法真正解析租户")
+	project := flag.String("project", "spike", "**占位**租户标识：真实租户投影依赖 A1 的凭据注册表")
 	shards := flag.Int("shards", gateway.DefaultShards, "总线分片数（编译期常量，见 P0-3）")
+
+	authFile := flag.String("auth-file", "tmp/dev-credentials.json", "设备凭据文件（L1 之外的凭据来源；仅开发/PoC）")
+	allowAnonymous := flag.Bool("allow-anonymous", false, "⚠️ 放行全部连接（仅本地冒烟；生产绝不可开）")
+	allowProjectMode := flag.Bool("allow-project-mode", false, "允许 A 档（项目级共享凭据）；ADR-008 要求显式开启")
+	maxVerify := flag.Int("auth-max-concurrent", auth.DefaultPolicy().MaxConcurrentVerify, "Argon2 并发校验上限（按内存带宽定，见 03 §2.1.1）")
+	genAuth := flag.String("gen-auth-file", "", "生成一份演示凭据文件后退出（值为文件路径；会打印一次明文 secret）")
+
 	logJSON := flag.Bool("log-json", true, "日志输出为 JSON（生产）；false 为开发可读格式")
 	flag.Parse()
 
@@ -49,13 +59,26 @@ func main() {
 	}
 	defer func() { _ = logger.Sync() }()
 
+	if *genAuth != "" {
+		if err := generateDemoCredentials(*genAuth); err != nil {
+			logger.Fatal("生成演示凭据失败", zap.Error(err))
+		}
+		return
+	}
+
 	// 网关层（含 mochi-mqtt）使用 log/slog：mochi-mqtt 的 Hook 接口就是 slog 签名，
 	// 用它可以让 broker 内部日志与业务日志共用同一条流水线。
 	gwLog := newSlogLogger(*logJSON)
 
+	metrics := new(gateway.Metrics)
+
+	authenticator, err := buildAuthenticator(*authFile, *allowAnonymous, *allowProjectMode, *maxVerify, logger)
+	if err != nil {
+		logger.Fatal("初始化认证失败", zap.Error(err))
+	}
+
 	// 总线不可达即拒绝启动：一个无法确认持久化的网关只会静默丢数据，
 	// 而「不回 PUBACK」在设备侧表现为重传风暴 —— 两者都不该被掩盖。
-	metrics := new(gateway.Metrics)
 	pub, err := gateway.NewNATSPublisher(*natsURL, *natsStream)
 	if err != nil {
 		logger.Fatal("连接 NATS 失败", zap.Error(err))
@@ -70,12 +93,14 @@ func main() {
 	defer stop()
 
 	broker, err := gateway.New(ctx, gateway.Options{
-		MQTTAddr:      *mqttAddr,
-		Publisher:     pub,
-		Router:        gateway.ContractRouter{Project: *project, Shards: *shards},
-		PubackTimeout: *pubackTimeout,
-		Metrics:       metrics,
-		Log:           gwLog,
+		MQTTAddr:       *mqttAddr,
+		Publisher:      pub,
+		Router:         gateway.ContractRouter{Project: *project, Shards: *shards},
+		PubackTimeout:  *pubackTimeout,
+		Metrics:        metrics,
+		Log:            gwLog,
+		Authenticator:  authenticator,
+		AllowAnonymous: *allowAnonymous,
 	})
 	if err != nil {
 		logger.Fatal("启动 MQTT 接入失败", zap.Error(err))
@@ -97,11 +122,13 @@ func main() {
 			zap.String("http_addr", *httpAddr),
 			zap.String("mqtt_addr", broker.Addr()),
 			zap.String("nats_url", *natsURL),
+			zap.Bool("auth_enabled", authenticator != nil),
+			zap.Bool("project_mode_allowed", *allowProjectMode),
+			zap.Int("auth_max_concurrent", *maxVerify),
 			zap.Duration("puback_timeout", *pubackTimeout),
 			zap.Int("shards", *shards),
 			zap.String("version", buildinfo.Version),
 			zap.String("commit", buildinfo.Commit),
-			zap.String("build_time", buildinfo.BuildTime),
 			zap.String("runtime", buildinfo.Runtime()),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -125,10 +152,77 @@ func main() {
 	logger.Info("已退出")
 }
 
+// buildAuthenticator 组装认证器。放行匿名时必须由部署者**显式**声明，
+// 不能让「忘记配凭据文件」静默退化成「谁都能连」。
+func buildAuthenticator(file string, anonymous, allowProjectMode bool, maxVerify int, logger *zap.Logger) (*auth.Authenticator, error) {
+	if anonymous {
+		logger.Warn("⚠️ 已放行全部连接（-allow-anonymous）：此模式不得用于任何非本地环境")
+		return nil, nil
+	}
+
+	dir, err := auth.LoadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("%w\n提示：用 -gen-auth-file=%s 生成一份演示凭据，或改用具名凭据后端", err, file)
+	}
+
+	policy := auth.DefaultPolicy()
+	policy.AllowProjectMode = allowProjectMode
+	if maxVerify > 0 {
+		policy.MaxConcurrentVerify = maxVerify
+	}
+
+	metrics := new(auth.Metrics)
+	a := auth.NewAuthenticator(
+		// L1 缓存包在文件目录之外；生产替换为 Redis/svc-auth 时这一层不变。
+		auth.NewCachedDirectory(dir, auth.WithCacheTTL(auth.DefaultCacheTTL)),
+		policy, metrics)
+
+	logger.Info("认证已启用",
+		zap.String("auth_file", file),
+		zap.Int("devices", dir.Size()),
+		zap.Bool("project_mode", allowProjectMode),
+		zap.Int("max_concurrent_verify", policy.MaxConcurrentVerify),
+		zap.String("argon2", auth.DefaultParams.String()))
+	return a, nil
+}
+
+// generateDemoCredentials 生成一份演示凭据文件，并把明文 secret 打印一次。
+func generateDemoCredentials(path string) error {
+	token, err := auth.GenerateSecret()
+	if err != nil {
+		return err
+	}
+	key, err := auth.GenerateSecret()
+	if err != nil {
+		return err
+	}
+
+	plain, err := auth.WriteCredentials(path, []auth.DeviceCredential{
+		{DeviceKey: "dev-demo-perdevice", ProjectID: 1, DeviceTypeID: 55, Mode: auth.ModePerDevice},
+		{DeviceKey: "dev-demo-gateway", ProjectID: 1, DeviceTypeID: 60, Mode: auth.ModePerDevice, IsGateway: true},
+		{DeviceKey: "dev-demo-project", ProjectID: 1, DeviceTypeID: 55, Mode: auth.ModeProject,
+			ProjectToken: token, ProjectKey: key},
+	}, auth.DefaultParams)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("已生成 %s（文件中只存摘要，明文仅在此展示一次）：\n\n", path)
+	keys := make([]string, 0, len(plain))
+	for k := range plain {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("  %-38s %s\n", k, plain[k])
+	}
+	fmt.Printf("\n用法（B 档设备级）：\n  clientId=dev-demo-perdevice\n  username=dev-demo-perdevice\n  password=<上面对应的 secret>\n")
+	return nil
+}
+
 // newLogger 按配置构造 zap 实例。
 //
-// 构造失败时返回错误，由调用方终止启动 —— 一个没有日志输出的服务不应被允许运行，
-// 因此这里不做静默降级。
+// 构造失败时返回错误，由调用方终止启动 —— 一个没有日志输出的服务不应被允许运行。
 func newLogger(jsonFormat bool) (*zap.Logger, error) {
 	if jsonFormat {
 		return zap.NewProduction()
@@ -140,8 +234,8 @@ func newLogger(jsonFormat bool) (*zap.Logger, error) {
 
 // newSlogLogger 构造网关层使用的 slog 实例。
 //
-// 与 zap 并行存在属于 Phase 0 的临时状态：一旦团队确定统一口径，
-// 二者应合并为一条流水线；此处不做「假装统一」的适配层。
+// 与 zap 并行存在属于临时状态：一旦统一口径，二者应合并为一条流水线；
+// 此处不做「假装统一」的适配层。
 func newSlogLogger(jsonFormat bool) *slog.Logger {
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if jsonFormat {

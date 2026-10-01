@@ -37,21 +37,47 @@ func dialTestDevice(t *testing.T, addr, clientID string) *testDevice {
 	return d
 }
 
-// connect 发送 CONNECT 并校验 CONNACK。
+// close 主动断开连接（模拟设备下线）。
+func (d *testDevice) close() {
+	_ = d.conn.Close()
+}
+
+// connect 发送不带凭据的 CONNECT 并校验 CONNACK 成功。
 func (d *testDevice) connect(clientID string) {
 	d.t.Helper()
 
-	pk := packets.Packet{
+	code := d.connectWith(clientID, "", "")
+	if code != packets.CodeSuccess.Code {
+		d.t.Fatalf("CONNACK 拒绝连接，reason=%d", code)
+	}
+}
+
+// connectWith 发送带凭据的 CONNECT，返回 CONNACK 的返回码（成功为 0）。
+//
+// 返回码而不是直接 Fatal，是为了让「应当被拒绝」的用例能断言具体码值。
+func (d *testDevice) connectWith(clientID, username, password string) byte {
+	d.t.Helper()
+
+	params := packets.ConnectParams{
+		ProtocolName:     []byte("MQTT"),
+		ClientIdentifier: clientID,
+		Keepalive:        60,
+		Clean:            true,
+	}
+	if username != "" {
+		params.Username = []byte(username)
+		params.UsernameFlag = true
+	}
+	if password != "" {
+		params.Password = []byte(password)
+		params.PasswordFlag = true
+	}
+
+	d.write(&packets.Packet{
 		FixedHeader:     packets.FixedHeader{Type: packets.Connect},
 		ProtocolVersion: 4,
-		Connect: packets.ConnectParams{
-			ProtocolName:     []byte("MQTT"),
-			ClientIdentifier: clientID,
-			Keepalive:        60,
-			Clean:            true,
-		},
-	}
-	d.write(&pk)
+		Connect:         params,
+	})
 
 	got, err := d.read(3 * time.Second)
 	if err != nil {
@@ -60,8 +86,56 @@ func (d *testDevice) connect(clientID string) {
 	if got.FixedHeader.Type != packets.Connack {
 		d.t.Fatalf("期望 CONNACK，得到报文类型 %d", got.FixedHeader.Type)
 	}
-	if got.ReasonCode != packets.CodeSuccess.Code {
-		d.t.Fatalf("CONNACK 拒绝连接，reason=%d", got.ReasonCode)
+	return got.ReasonCode
+}
+
+// subscribe 发送 SUBSCRIBE，返回 SUBACK 里该过滤器的返回码。
+//
+// ⚠️ MQTT 3.1.1 的 SUBACK 返回码语义容易看错：
+//
+//	0x00/0x01/0x02 = **授予的 QoS**（成功），0x80 = 失败。
+//
+// 因此「成功」的判据是 `< 0x80`，不是 `== 0`。
+func (d *testDevice) subscribe(filter string, id uint16) byte {
+	d.t.Helper()
+
+	d.write(&packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Subscribe, Qos: 1},
+		ProtocolVersion: 4,
+		PacketID:        id,
+		Filters: packets.Subscriptions{
+			{Filter: filter, Qos: 1, Identifier: 1},
+		},
+	})
+
+	got, err := d.read(3 * time.Second)
+	if err != nil {
+		d.t.Fatalf("等待 SUBACK 失败: %v", err)
+	}
+	if got.FixedHeader.Type != packets.Suback {
+		d.t.Fatalf("期望 SUBACK，得到报文类型 %d", got.FixedHeader.Type)
+	}
+	if len(got.ReasonCodes) == 0 {
+		d.t.Fatal("SUBACK 未带返回码")
+	}
+	return got.ReasonCodes[0]
+}
+
+// expectClosed 断言连接被服务端关闭（或在关闭前收到了 DISCONNECT）。
+//
+// 用于验证「越权发布」这类必须立即断开的场景。
+func (d *testDevice) expectClosed(window time.Duration) {
+	d.t.Helper()
+
+	pk, err := d.read(window)
+	if err == nil && pk.FixedHeader.Type == packets.Disconnect {
+		return // v5 会先发 DISCONNECT 再断开
+	}
+	if err == nil {
+		d.t.Fatalf("期望连接被关闭，却收到了报文类型 %d", pk.FixedHeader.Type)
+	}
+	if errors.Is(err, errNoPacket) {
+		d.t.Fatal("期望连接被关闭，但连接仍然存活（读取超时）")
 	}
 }
 
@@ -160,6 +234,8 @@ func (d *testDevice) write(pk *packets.Packet) {
 		err = pk.ConnectEncode(&buf)
 	case packets.Publish:
 		err = pk.PublishEncode(&buf)
+	case packets.Subscribe:
+		err = pk.SubscribeEncode(&buf)
 	default:
 		d.t.Fatalf("测试客户端不支持发送报文类型 %d", pk.FixedHeader.Type)
 	}
@@ -207,6 +283,8 @@ func (d *testDevice) read(timeout time.Duration) (packets.Packet, error) {
 		err = pk.ConnackDecode(body)
 	case packets.Puback:
 		err = pk.PubackDecode(body)
+	case packets.Suback:
+		err = pk.SubackDecode(body)
 	default:
 		// 其他类型在本测试中不解码，保留 FixedHeader 供断言使用。
 	}

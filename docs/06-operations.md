@@ -103,7 +103,7 @@
 
 | 域 | 关键指标 | 说明 |
 |---|---|---|
-| 接入 | `gw_connections_current`、`gw_connect_rate`、`gw_connect_fail_total{reason}`、`gw_auth_cache_hit_ratio` | 连接数与认证健康度 |
+| 接入 | `gw_connections_current`、`gw_connect_rate`、`gw_connect_fail_total{reason}`、`gw_auth_success_total`、`gw_acl_denied_total` | 连接数与认证健康度。⚠️ `gw_connect_fail_total{reason=overloaded}` **必须与凭据失败分开告警**：前者是容量问题，后者才可能是攻击（03 §2.1.1 ⑤） |
 | 消息 | `gw_msgs_in_total`、`gw_msgs_out_total`、`gw_msgs_dropped_total{priority}`、`gw_msg_size_bytes` | 吞吐与丢弃 |
 | 管道 | `pipeline_consume_lag`、`pipeline_process_duration_seconds`、`pipeline_batch_size`、`pipeline_dlq_total` | 滞后与批处理效率 |
 | 规则 | `rule_match_duration_seconds`、`rule_exec_duration_seconds`、`rule_exec_error_total{type}`、`rule_timeout_total` | 沙箱健康度 |
@@ -347,7 +347,7 @@ connector 队列等待 ≈ 告警到达速率 - connector 可持续处理速率
 | **幂等与 ACK 时序验证**（评审 R-01/R-02） | 用故障注入证明：在「解析后崩溃」「入批后未 flush 即崩溃」两种场景下，消息**均能从 NATS 重投并被正确落库**，无丢失、无重复入库 |
 | **分片消费与顺序验证**（评审 R-03） | 同一 `device_id` 在 3 副本 × N 分片下，规则 `prev` 上下文与影子合并均无乱序；实例故障接管期间该分片**暂停消费**而非并行 |
 | **离线 Stream 元数据规模压测**（评审 R-12） | 给出 100 万设备下 Stream/Consumer 元数据规模，以及分片数 N 的选型依据 |
-| **Argon2 认证容量与重连风暴**（评审 R-24） | 60s 内 N 台设备并发重连，网关 CPU 不饱和；给出 `t/m/p` 参数与副本数结论 |
+| ✅ **Argon2 认证容量与重连风暴**（评审 R-24，2026-10-01 通过） | 60s 内 N 台设备并发重连，网关 CPU 不饱和；给出 `t/m/p` 参数与副本数结论。**结论：参数改为 `t=3, m=32MiB, p=2`；并发上限 8（按内存带宽定）；「60s 内 8 万设备」这条口径本身不可行（需 51 个节点），改为端侧重连抖动摊到 ≥30 分钟（1 个节点）**。另发现 L1 缓存命中率与认证容量无关（只省 µs 级目录查询）。见 [03 §2.1.1](./03-ingestion.md) 与 [03 §5.3.1](./03-ingestion.md) |
 | **L3 逃生舱限制 PoC**（评审 R-17） | 验证 goja 能否精确计数指令与硬限制内存；**不能则降级为「超时 + 并发上限」近似限制并如实标注** |
 | **私有化 Lite 交付验证**（评审 R-22） | Compose 单机包在 4C8G 上跑通端到端（接入 → 落库 → 规则 → 告警）；**单实例消费 32 分片**的并行度与资源占用达标 |
 | ✅ **QoS1 PUBACK 时机验证**（开工前清单 P0-4，2026-10-01 通过） | 验证 `mochi-mqtt` 能在「等待 NATS PublishAck 后再回 PUBACK」的语义下工作（`OnPublish` 阻止自动 PUBACK + 显式触发）；**注入网关崩溃证明设备会重传**。**这是 ADR-001 的明确定制点，不成立则需自建 PUBLISH 处理路径或回退 EMQX**。结论与边界见 [03 §4.4.1](./03-ingestion.md) |

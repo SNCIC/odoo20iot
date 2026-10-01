@@ -113,6 +113,9 @@ func newTestBrokerWithRouter(t *testing.T, pub Publisher, timeout time.Duration,
 		PubackTimeout: timeout,
 		Metrics:       metrics,
 		Log:           testLogger(),
+		// 这组用例验证的是 QoS1 确认时序，与认证无关；
+		// 放行匿名必须显式声明（见 Options.AllowAnonymous）。
+		AllowAnonymous: true,
 	})
 	if err != nil {
 		t.Fatalf("构造 broker 失败: %v", err)
