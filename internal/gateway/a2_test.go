@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
+
+	"github.com/SNCIC/odoo20iot/internal/envelope"
 )
 
 // ---------- 测试替身 ----------
@@ -115,7 +118,8 @@ func newTestBrokerWithRouter(t *testing.T, pub Publisher, timeout time.Duration,
 		Log:           testLogger(),
 		// 这组用例验证的是 QoS1 确认时序，与认证无关；
 		// 放行匿名必须显式声明（见 Options.AllowAnonymous）。
-		AllowAnonymous: true,
+		AllowAnonymous:     true,
+		EnableInlineClient: true,
 	})
 	if err != nil {
 		t.Fatalf("构造 broker 失败: %v", err)
@@ -252,8 +256,17 @@ func TestA2_GatewayCrashBeforePuback_MessageNotLost(t *testing.T) {
 	if !ok {
 		t.Fatal("总线最终未收到消息 —— 数据丢失")
 	}
-	if string(call.payload) != string(payload) {
-		t.Fatalf("载荷被改写：期望 %s，得到 %s", payload, call.payload)
+	// 总线载荷是**统一信封**（03 §2.4）：归属元数据 + 原始报文。
+	// 若只发裸 payload，device_key 会随 subject 一并丢失，下游消费者无从落库。
+	env, err := envelope.Decode(call.payload)
+	if err != nil {
+		t.Fatalf("总线载荷不是合法信封: %v", err)
+	}
+	if env.DeviceKey != "dev-3" || env.Stream != "events" {
+		t.Fatalf("信封归属元数据错误: device_key=%s stream=%s", env.DeviceKey, env.Stream)
+	}
+	if !bytes.Equal(env.Payload, payload) {
+		t.Fatalf("信封内原始报文被改写：期望 %s，得到 %s", payload, env.Payload)
 	}
 	if call.subject != fmt.Sprintf("iot.events.spike.shard.%d", hashShard("dev-3", DefaultShards)) {
 		t.Fatalf("subject 映射错误: %s", call.subject)
@@ -330,6 +343,26 @@ func TestA2_Qos2Rejected(t *testing.T) {
 	}
 	if pub.callCount() != 0 {
 		t.Fatalf("QoS2 不应进入总线，却投递了 %d 次", pub.callCount())
+	}
+}
+
+// TestA2_内部注入报文必须放行 是 A3 倒逼出来的回归用例。
+//
+// 跨节点投递复用 inline client 注入，那条路径同样经过 OnPublish。
+// 若这里把注入的 QoS1 报文当成设备上报（路由 + 拒绝），跨节点投递会静默失效。
+func TestA2_内部注入报文必须放行(t *testing.T) {
+	pub := &fakePublisher{}
+	broker, metrics := newTestBroker(t, pub, time.Second)
+
+	if err := broker.Server.Publish("v1/devices/dev-x/telemetry", []byte(`{"n":1}`), false, 1); err != nil {
+		t.Fatalf("注入失败: %v", err)
+	}
+
+	if got := metrics.PublishTotal.Load(); got != 0 {
+		t.Fatalf("注入的报文不应进入 A2 时序（会被路由回总线并拒绝），实际进入 %d 次", got)
+	}
+	if got := pub.callCount(); got != 0 {
+		t.Fatalf("注入的报文不应被投到总线，实际 %d 次", got)
 	}
 }
 

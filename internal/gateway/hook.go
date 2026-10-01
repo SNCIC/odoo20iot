@@ -2,11 +2,18 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
+
+	"github.com/SNCIC/odoo20iot/internal/cluster"
+	"github.com/SNCIC/odoo20iot/internal/envelope"
+	"github.com/SNCIC/odoo20iot/internal/metering"
 )
 
 // Hook 把 A2 时序接入 mochi-mqtt 的 PUBLISH 处理路径。
@@ -24,6 +31,23 @@ import (
 // 代价：当前实现会**同步阻塞该客户端的收包协程**（最长 PubackTimeout）。
 // 这是「一设备一确认」语义的直接后果（§4.4 明确禁止合并等待）；对 KeepAlive ≥ 60s
 // 的设备无协议影响，但 PINGREQ 的响应也会被推迟，需在 A4（5 万连接 24h）中实测。
+// Meter 是网关热路径上的计量累加器（04 §6）。
+//
+// 实现必须低开销：每条**成功持久化**的消息调用一次，且**不得做 IO** ——
+// 累加与上报分离（上报由 internal/metering 的 Reporter 按窗口批量发出）。
+type Meter interface {
+	Add(projectID int64, metric string, delta int64)
+}
+
+// HookConfig 是 A2 hook 的非依赖配置。
+type HookConfig struct {
+	// ProjectID / DeviceTypeID 是 Phase 0 的归属占位值（见 internal/envelope）。
+	ProjectID    int64
+	DeviceTypeID int64
+	// Meter 为 nil 时不做计量（不影响 A2 时序）。
+	Meter Meter
+}
+
 type Hook struct {
 	mqtt.HookBase
 
@@ -32,12 +56,19 @@ type Hook struct {
 	router  SubjectRouter
 	metrics *Metrics
 	logger  *slog.Logger
+
+	// 归属占位值（Phase 0）。真实 tenant / 设备主键投影依赖 A1 注册表，
+	// 见 internal/envelope 包注释。
+	projectID    int64
+	deviceTypeID int64
+
+	meter Meter
 }
 
 var _ mqtt.Hook = (*Hook)(nil)
 
 // NewHook 构造 A2 hook。baseCtx 决定「优雅关闭时在途等待是否立即放弃」。
-func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metrics *Metrics, log *slog.Logger) *Hook {
+func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metrics *Metrics, log *slog.Logger, cfg HookConfig) *Hook {
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
@@ -48,11 +79,14 @@ func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metric
 		log = slog.Default()
 	}
 	return &Hook{
-		baseCtx: baseCtx,
-		acker:   acker,
-		router:  router,
-		metrics: metrics,
-		logger:  log,
+		baseCtx:      baseCtx,
+		acker:        acker,
+		router:       router,
+		metrics:      metrics,
+		logger:       log,
+		projectID:    cfg.ProjectID,
+		deviceTypeID: cfg.DeviceTypeID,
+		meter:        cfg.Meter,
 	}
 }
 
@@ -67,6 +101,16 @@ func (h *Hook) Provides(b byte) bool {
 
 // OnPublish 是 A2 的核心实现，详见类型注释。
 func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
+	// 内部注入的报文（跨节点投递、未来的服务端下发）直接放行。
+	//
+	// 这是 A3 倒逼出来的必要分支：跨节点投递要复用 broker 的订阅匹配，
+	// 只能走 inline client 注入，而那条路径同样会经过本 hook。
+	// 若不区分，注入的 QoS1 报文会被当成设备上报 —— 既会被路由回总线，
+	// 又会被拒绝（ErrRejectPacket），跨节点投递直接失效。
+	if cl.Net.Inline {
+		return pk, nil
+	}
+
 	switch pk.FixedHeader.Qos {
 	case 0:
 		// QoS0 无确认语义，与 A2 无关：交回 broker 原生路径，不阻塞。
@@ -90,11 +134,28 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.ErrRejectPacket
 	}
 
-	if err := h.acker.AwaitPersist(h.baseCtx, subject, pk.Payload); err != nil {
+	// 包装统一信封：把归属元数据与原始报文一起发到总线（03 §2.4）。
+	// 不这样做，`device_key` 会随 subject 一并丢失，下游消费者无从落库。
+	data, err := h.buildEnvelope(pk)
+	if err != nil {
+		// 报文不是合法 JSON（或 topic 解析不出归属）属**不可重试**的客户端错误：
+		// 与「无法路由」同类，不回 PUBACK 只会让设备无意义地重传同一份垃圾。
+		h.metrics.InvalidPayloadTotal.Add(1)
+		h.logger.Warn("拒绝无法封装的上报", "client", cl.ID, "topic", pk.TopicName, "error", err)
+		return pk, packets.ErrRejectPacket
+	}
+
+	if err := h.acker.AwaitPersist(h.baseCtx, subject, data); err != nil {
 		h.logger.Error("未回 PUBACK：总线未确认持久化，等待设备重传",
 			"client", cl.ID, "topic", pk.TopicName, "subject", subject,
 			"packet_id", pk.PacketID, "dup", pk.FixedHeader.Dup, "error", err)
 		return pk, packets.ErrRejectPacket
+	}
+
+	// 计量：只有**已持久化**的消息才计入（04 §6「每条消息可归属到 project_id」）。
+	// 热路径只做一次加锁自增，无 IO。
+	if h.meter != nil {
+		h.meter.Add(h.projectID, metering.MetricMsgCount, 1)
 	}
 
 	if err := writePuback(cl, pk); err != nil {
@@ -106,6 +167,36 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	}
 
 	return pk, packets.ErrRejectPacket
+}
+
+// buildEnvelope 把一次设备上报包装成总线信封并编码（03 §2.4）。
+//
+// device_key / stream 从 topic 解析；project_id / device_id / device_type_id
+// 为 Phase 0 占位值（真实映射依赖 A1 注册表，见 internal/envelope 包注释）。
+func (h *Hook) buildEnvelope(pk packets.Packet) ([]byte, error) {
+	deviceKey, rest := cluster.ParseDeviceTopic(pk.TopicName)
+	if deviceKey == "" {
+		return nil, fmt.Errorf("topic %q 解析不出 device_key", pk.TopicName)
+	}
+	stream, _, _ := strings.Cut(rest, "/")
+	if stream == "" {
+		return nil, fmt.Errorf("topic %q 解析不出 stream", pk.TopicName)
+	}
+	// 03 §2.4：进入管道的报文必须是合法 JSON（拒绝尾随逗号、单引号等）。
+	// 等到 Marshal 才失败的话，错误信息离开现场更远、更难定位。
+	if !json.Valid(pk.Payload) {
+		return nil, fmt.Errorf("payload 不是合法 JSON（%d 字节）", len(pk.Payload))
+	}
+
+	return envelope.Envelope{
+		ProjectID:    h.projectID,
+		DeviceKey:    deviceKey,
+		DeviceID:     envelope.PlaceholderDeviceID(deviceKey),
+		DeviceTypeID: h.deviceTypeID,
+		Stream:       stream,
+		ReceivedAt:   time.Now().UTC(),
+		Payload:      json.RawMessage(pk.Payload),
+	}.Encode()
 }
 
 // writePuback 显式向设备回 PUBACK。

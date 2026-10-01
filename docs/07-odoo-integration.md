@@ -427,6 +427,81 @@ UNIQUE(company_id, integration_name, idempotency_key)
 | 变更推送接收（C-2 webhook） | Odoo postcommit → 连接器 HTTP 入口 → 进 NATS 异步消费；**幂等按 `(ext_model, ext_id, write_date)` 去重** |
 | **定时对账（必做）** | 每 **15 min** 扫描一次：① Odoo `edge_outbox` 非终态行；② C-2 路径的 `write_date` 水位差；③ 未绑定告警待办。发现遗漏即补投，并对连续两次遗漏告警 |
 
+#### 4.4.1 事件通道的落地约定（**代码已固化，Odoo 侧必须一致**）
+
+本节原表只写了「投递到 Redis Streams」「翻译为 `iot.odoo.*`」，未定义键名与末级结构。
+连接器实现时这些必须定下来，故在此固化；改动需**两侧同步**。
+
+**C-1（Outbox → NATS）**：
+
+| 项 | 取值 |
+|---|---|
+| Redis Stream 键 | `odoo:outbox`（消费组 `odoo-connector`） |
+| 记录字段 | 与 `edge.outbox` 对齐：`event_id` / `company_id` / `aggregate_model` / `aggregate_id` / `version` / `occurred_at` / `payload` |
+| 时间格式 | `occurred_at` 用 Odoo 的 `YYYY-MM-DD HH:MM:SS`（**按 UTC 解释**，Odoo 内部即存 UTC）；连接器**不信任本地时钟**，解析失败时宁可留零值也不回填本地时间 |
+| NATS subject | `iot.odoo.{aggregate_model}`，模型名的 `.` 归一化为 `_`（NATS 以 `.` 分层，`mrp.workorder` 会被切成两个 token，下游就无法用 `iot.odoo.mrp.>` 精确订阅） |
+| NATS Stream | `IOT_ODOO`（`iot.odoo.>`，FileStorage，保留 7 天） |
+| Odoo 侧配置 | 系统参数 `edge.outbox.redis_url`（默认 `redis://127.0.0.1:6379/0`）与 `edge.outbox.stream`（默认 `odoo:outbox`）；依赖 python 包 `redis`（manifest 声明 `external_dependencies`） |
+| Odoo 侧 cron | 每分钟投递一批（`DELIVER_BATCH=200`）。**先 XADD 成功才置 delivered**；失败按 5/15/60/300/900/1800/3600 秒退避，连续 10 次进死信。**Redis 整体不可达时整轮失败、不消耗 `attempts`** —— 那是基础设施故障，按逐条失败处理会让一次宕机把整批事件推成死信，反而丢数据 |
+
+**「至少一次」必须由两件事共同成立**，缺一不可：
+
+1. **XACK 只在发布成功之后**（拿到 `PublishAck` 才算成功）；
+2. **未确认的消息要能被捞回来重投** —— Redis Streams 的 `>` 只返回**从未投递**的新消息，
+   一旦读过没 ACK 就沉在 PEL 里，**只有 `XAUTOCLAIM` 才会重新投递**。
+
+只做第 1 步不做第 2 步，失败的消息会永远卡在 PEL —— 那是「零次」，不是「至少一次」。
+重复由信封里的 `event_id` 在下游去重。
+
+**坏记录的处理**：字段缺失/格式错的事件**永远不可能成功**，重投只是浪费，
+故 **ACK 丢弃并告警**（与 `svc-quota` 对非法上报的处理一致）；但必须告警 ——
+静默丢一条业务事件比丢一条计量上报严重得多。
+
+**C-2（webhook → NATS）**：
+
+| 项 | 取值 |
+|---|---|
+| 路径 | `POST /webhook/odoo` |
+| 鉴权 | `Authorization: Bearer <token>`，**未配置令牌则整个入口不注册**（匿名可写总线的端点比没有更危险） |
+| 请求体 | `{model, id, write_date, company_id, data}`；`data` 原样进事件载荷；上限 **1 MiB** |
+| 去重 | 按 `(model, id, write_date)`（§4.4 口径），窗口 1 小时；**去重器故障时放行**（重复比丢失轻，下游按 `event_id` 还能去） |
+| event_id | `c2:{model}:{id}:{write_date}` |
+
+> ⚠️ C-2 仍**不持久**（§3.2）：返回 5xx 也不会被 Odoo 重试，事件就此丢失，
+> 只能靠 15 min 对账补齐 —— **对账已实现，见 §4.4.2**。
+
+#### 4.4.2 定时对账的落地约定（**代码已固化**）
+
+| 项 | 取值 |
+|---|---|
+| 周期 | 15 min（`-reconcile-interval`）；**启动后立即跑第一轮**，不空等一个周期 |
+| 扫描 ① | Odoo `edge.outbox` 的非终态行（`pending` / `dead`），且 `next_attempt_at`（缺省时用 `create_date`）早于「现在 − `-reconcile-stale-after`」（默认 15 min） |
+| 扫描 ② | 对 `-reconcile-models` 列出的模型比对 `(write_date, id)` 水位差 |
+| 水位存储 | Redis `reconcile:c2:wm:{model}` = `<unix_micros>:<id>`，用 Lua 保证**只进不退** |
+
+**几条不可省的判据**：
+
+1. **退避中的行不算遗漏** —— 必须带宽限窗口。否则每轮都会把正在退避重试的行
+   当成遗漏立刻补投，等于把退避机制架空。
+2. **首次对账只建基线，不补投**。没有水位时若直接扫 `write_date > 0`，
+   首轮会把**全表历史记录**当遗漏打出去 —— 那是全量同步，不是对账。
+3. **水位必须是 `(write_date, id)` 二元组**。同一秒内可能写入多条记录，
+   只用时间戳做 `write_date > 水位` 会永远漏掉与水位同期的那几条。
+4. **补投沿用原 `event_id`**。原事件若其实已到达，下游按 `event_id` 去重即可；
+   换个新 id 就等于承认必然重复，去重就白做了。
+5. **连续两轮仍有遗漏才告警**（§4.4 原话）。单轮很可能是抖动（webhook 正在重投）；
+   连续两轮说明**补投本身没生效**，那是配置或环境问题，人必须知道。
+6. **补投失败不推进水位** —— 失败的那条必须留给下一轮，否则它就永久漏了。
+7. **对账的 Odoo 查询走连接器的编排层**（限流 / 熔断），不绕开 ——
+   否则「一对账就把 Odoo 打满」会是最讽刺的故障。
+
+`odoo_connector_cursor_lag_seconds` 是 **gauge**：**追平时必须归零**。
+「最新记录很旧」是**数据陈旧**，不是**我们落后**；混淆两者会让一个一周没变的
+模型把指标永远挂在告警线上（实测踩过：基线落在 8 天前的记录上，指标报 693941 秒）。
+
+> 对账的**第 ③ 项（未绑定告警待办）尚未实现**：它依赖 `t_external_ref`，
+> 该表尚未建立。在它落地之前，C-2 仍只应承载低价值通知。
+
 ### 4.5 可观测性
 
 | 类型 | 内容 |

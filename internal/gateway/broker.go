@@ -13,6 +13,7 @@ import (
 	"github.com/mochi-mqtt/server/v2/listeners"
 
 	"github.com/SNCIC/odoo20iot/internal/auth"
+	"github.com/SNCIC/odoo20iot/internal/cluster"
 )
 
 // Options 是接入网关的启动参数。
@@ -23,6 +24,12 @@ type Options struct {
 	Publisher Publisher
 	// Router 把设备 topic 映射为总线 subject。
 	Router SubjectRouter
+	// ProjectID / DeviceTypeID 是 Phase 0 的信封归属占位值（见 internal/envelope）。
+	// 真实值来自 A1 设备凭据注册表（尚未实现）；为 0 时取 Default* 常量。
+	ProjectID    int64
+	DeviceTypeID int64
+	// Meter 是计量累加器（04 §6）。为 nil 时不做计量。
+	Meter Meter
 	// PubackTimeout 是等待 PublishAck 的上限（§4.4 默认 5s）。
 	PubackTimeout time.Duration
 	// Metrics 可为空；空时内部新建。
@@ -33,6 +40,18 @@ type Options struct {
 	// Authenticator 提供 03 §2.1 的三档设备认证。
 	// 与 AllowAnonymous 二选一，**必须显式指定其一**。
 	Authenticator *auth.Authenticator
+
+	// Cluster 启用跨节点投递（03 §1.4）。为 nil 时网关是单节点。
+	//
+	// 启用它会自动打开 inline client（跨节点注入的唯一通道）。
+	Cluster *cluster.Node
+
+	// EnableInlineClient 开启 broker 的 inline client。
+	//
+	// 跨节点投递（A3）依赖它把其他节点路由来的消息注入本地订阅匹配；
+	// 默认关闭是 mochi 的选择（inline 收发会计入 $SYS 统计），
+	// 因此这里也保持默认关闭，由集群模式按需打开。
+	EnableInlineClient bool
 
 	// AllowAnonymous 显式开启「放行全部连接」。
 	//
@@ -47,9 +66,10 @@ type Broker struct {
 	Server  *mqtt.Server
 	Metrics *Metrics
 
-	addr     string
-	serveCh  chan error
-	authHook *AuthHook
+	addr        string
+	serveCh     chan error
+	authHook    *AuthHook
+	clusterHook *ClusterHook
 
 	cancelClose context.CancelFunc
 	closeOnce   sync.Once
@@ -58,6 +78,12 @@ type Broker struct {
 
 // 默认等待 PublishAck 的上限（docs/03-ingestion.md §4.4）。
 const DefaultPubackTimeout = 5 * time.Second
+
+// Phase 0 的信封归属占位值（真实值来自 A1 设备凭据注册表，尚未实现）。
+const (
+	DefaultProjectID    int64 = 1
+	DefaultDeviceTypeID int64 = 55
+)
 
 // New 组装 Broker：监听器 + 认证 hook + A2 hook。
 func New(ctx context.Context, opts Options) (*Broker, error) {
@@ -76,6 +102,12 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	if opts.Metrics == nil {
 		opts.Metrics = new(Metrics)
 	}
+	if opts.ProjectID == 0 {
+		opts.ProjectID = DefaultProjectID
+	}
+	if opts.DeviceTypeID == 0 {
+		opts.DeviceTypeID = DefaultDeviceTypeID
+	}
 
 	// 关闭时取消在途的等待：否则每个阻塞在 OnPublish 的连接都要等满
 	// PubackTimeout，优雅关闭会被拖长到超时上限。取消后这些消息走
@@ -88,7 +120,10 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		return nil, fmt.Errorf("监听 MQTT %q: %w", opts.MQTTAddr, err)
 	}
 
-	server := mqtt.New(&mqtt.Options{Logger: opts.Log})
+	server := mqtt.New(&mqtt.Options{
+		Logger:       opts.Log,
+		InlineClient: opts.EnableInlineClient || opts.Cluster != nil,
+	})
 	var authHook *AuthHook
 
 	// 认证必须显式配置：要么给认证器，要么显式声明放行匿名。
@@ -115,11 +150,26 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	}
 
 	acker := NewAcker(opts.Publisher, opts.PubackTimeout, opts.Metrics)
-	hook := NewHook(runCtx, acker, opts.Router, opts.Metrics, opts.Log)
+	hook := NewHook(runCtx, acker, opts.Router, opts.Metrics, opts.Log, HookConfig{
+		ProjectID:    opts.ProjectID,
+		DeviceTypeID: opts.DeviceTypeID,
+		Meter:        opts.Meter,
+	})
 	if err := server.AddHook(hook, nil); err != nil {
 		cancelClose()
 		ln.Close()
 		return nil, fmt.Errorf("装载 A2 hook: %w", err)
+	}
+
+	// 集群 Hook 必须在监听之前装入：OnPublished 要参与每一次本地投递。
+	var clusterHook *ClusterHook
+	if opts.Cluster != nil {
+		clusterHook = NewClusterHook(runCtx, opts.Cluster, server, opts.Metrics, opts.Log)
+		if err := server.AddHook(clusterHook, nil); err != nil {
+			cancelClose()
+			ln.Close()
+			return nil, fmt.Errorf("装载集群 hook: %w", err)
+		}
 	}
 
 	if err := server.AddListener(listeners.NewNet("mqtt-tcp", ln)); err != nil {
@@ -135,8 +185,14 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		serveCh:     make(chan error, 1),
 		cancelClose: cancelClose,
 		authHook:    authHook,
+		clusterHook: clusterHook,
 	}, nil
 }
+
+// ClusterHook 返回集群 Hook；单节点运行时为 nil。
+//
+// 暴露它是为了在 broker 起来之后调用 Start（它需要 broker 实例才能构造）。
+func (b *Broker) ClusterHook() *ClusterHook { return b.clusterHook }
 
 // AuthHook 返回认证 Hook；未启用认证时为 nil。
 //

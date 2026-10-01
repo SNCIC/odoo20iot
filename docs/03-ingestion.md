@@ -39,8 +39,8 @@
    gw-mqtt-1                  gw-mqtt-2                  gw-mqtt-3
    (内嵌 broker)              (内嵌 broker)              (内嵌 broker)
         │                          │                          │
-        │  ┌───── 订阅注册表 (Redis) ─────┐                    │
-        └──┤  gw:sub:{node} / gw:route:{filter_hash}          │
+        │  ┌─── 设备位置注册表 (Redis) ───┐                    │
+        └──┤  gw:client:{device_key} → node_id              │
            └────────────────────┬─────────┘                   │
                                 │                           │
         ┌───────────────────────┴───────────────────────────┴──┐
@@ -53,31 +53,35 @@
 
 **问题**：设备 A 连在节点 1，设备 B 连在节点 2；场景触发需向 A 下发命令；A 订阅的 topic 也可能被节点 3 的发布者命中。
 
-**方案：订阅注册表 + 定向路由**
+**方案：设备位置注册表（Locator）+ 定向路由 + 非设备广播兜底**
 
-1. 连接建立时，`gw-mqtt` 将 `(node_id, topic_filter)` 写入 Redis：
-   - `SADD gw:sub:{node_id} {filter_hash}`
-   - `SADD gw:route:{filter_hash} {node_id}`（反向索引）
-   - 本地同时维护 `subscribeStore`（Trie）用于本节点内投递。
-2. 发布消息时，查找匹配的 `topic_filter` 集合 → 求节点并集。
-3. 若仅本节点命中 → 本地直接投递（零网络开销，覆盖 90%+ 场景）。
-4. 若有其他节点命中 → 发布到 `iot.route.{node_id}`，携带原始 topic 与 payload。
-5. 目标节点消费后，用本地 Trie 精确匹配订阅者并投递。
+> **勘误：已从「filter 反向索引」改为「设备位置查询」。**
+> 早期方案用 `gw:route:{filter_hash}` 由 topic 反查「哪些节点有订阅」。但 MQTT 订阅是
+> **通配符过滤器**（`v1/devices/+/cmd/+`），按 filter 哈希建的索引只能**精确匹配** ——
+> 给定一条具体 topic，不枚举全部 filter 就无法找出匹配项，而设备级订阅数量与设备数
+> 同阶（10 万级），枚举不可行。好在 §2.2 的约束把问题化掉了：设备**只能**订阅自己的
+> 命名空间（防横向越权），于是「谁可能订阅 `v1/devices/{key}/...`」只剩一个答案：
+> **{key} 这台设备本身**。跨节点投递因此退化成一次 **O(1) 的位置查询**。
 
-**优化**：
-
-- `gw:route` 查询结果本地缓存 1s（订阅关系变更不频繁），降低 Redis QPS。
-- 高频 topic filter（如 `v1/devices/+/telemetry`，平台侧订阅）单独维护，排除在广播路径外。
-- **平台侧订阅不走 MQTT**：`svc-pipeline` 直接消费 NATS，网关无需关心。
-- 节点数 ≤ 8 时可用广播模式（`iot.route.broadcast`）简化实现，超过则切换定向模式。
+1. 连接建立时，`gw-mqtt` 把设备位置写入 Redis：`SET gw:client:{device_key} = node_id`
+   （带 TTL，默认 5 分钟；节点被 kill 时来不及解绑，TTL 是「僵尸位置」的最后防线）。
+2. 发布**下行**消息时，解析出目标 `device_key` 并查位置：
+   - 目标在本节点 → 本地直接投递（零网络开销，覆盖绝大多数场景）；
+   - 目标在别的节点 → 发布到 `iot.route.{node_id}`（1 条消息，同步等 `PublishAck`）；
+   - 目标不在线 → 落离线队列（§1.5）。
+3. **非设备命名空间**（应用侧订阅，数量少）→ **广播兜底**：发到每个对端节点的
+   `iot.route.{node_id}`，由对端用自己的订阅树判定是否命中。
+4. 目标节点用 **durable pull consumer** 消费自己的 `iot.route.{node_id}`，本地注入
+   成功才 ACK；注入失败/未确认在 `AckWait` 后重投（`MaxDeliver=-1` 永不放弃）。
 
 **投递语义**：
 
 | 场景 | QoS | 保证 |
 |---|---|---|
 | 本节点内投递 | 0/1 | 与客户端 QoS 一致 |
-| 跨节点投递 | 1 | 至少一次，接收端按 `msg_id` 去重 |
-| 节点故障 | — | NATS 消息未 ACK 则重投到其他节点（该节点已无连接，消息进离线队列） |
+| 跨节点投递 | 1 | 至少一次：注入成功才 ACK，失败/未确认在 `AckWait` 后重投 |
+| 接收端去重 | — | 按 `(Origin, Seq)` 进程内 best-effort 去重（拦截 NATS redelivery）；端到端幂等由设备侧 `msg_id` 兜底 |
+| 节点故障 | — | NATS 未 ACK 则重投；目标设备已无连接时消息进离线队列（§1.5） |
 
 ### 1.5 会话管理
 
@@ -544,7 +548,7 @@ type Batcher[T any] struct {
 
 | # | 边界 | 影响与处置 |
 |---|---|---|
-| 1 | **阻塞该连接的收包协程**（最长 = `PubackTimeout`，默认 5 s） | 这是「一设备一确认」的直接后果（本节已禁止合并等待）。对 `KeepAlive ≥ 60s` 的设备无协议影响，但 `PINGREQ` 响应同样被推迟 —— **需在 A4（5 万连接 24h）实测其对重传与掉线判定的影响** |
+| 1 | **阻塞该连接的收包协程**（最长 = `PubackTimeout`，默认 5 s） | 这是「一设备一确认」的直接后果（本节已禁止合并等待）。**A4 已做机制性实测**（`internal/gateway/a4_test.go`，不依赖真实 NATS）：PUBLISH 处理期间同连接的 PINGREQ 被排在后面，「PINGREQ → PINGRESP」实测 ≈ `PubackTimeout`（400 ms 超时用例实测 **400 ms**）；阻塞**仅限该连接**，其他连接的 PINGREQ 不受影响。对 `KeepAlive ≥ 60s` 的设备，单次上报引入的推迟 ≪ keepalive 窗口，无协议影响；**残余风险**在「连续上报 × 总线持续超时」时 PINGRESP 反复迟到，可能引发设备侧误判重连 —— 需在 5 万连接 24h 压测中观测 |
 | 2 | **QoS2 未被覆盖** | 端侧契约只使用 QoS0/QoS1；实现选择**显式拒绝 QoS2**并计入 `gw_unsupported_qos_total`，而不是静默降级（后者会让消息绕过「先持久化再确认」） |
 | 3 | **配置失误会暴露为重传而非丢数据** | 若业务 subject 未被任何 JetStream Stream 捕获，总线返回 `no response from stream`；网关按「未确认」处理、拒绝 PUBACK。**这是期望行为**（故障可见，而不是静默丢数据） |
 | 4 | **优雅关闭会取消在途等待** | 关闭时未确认的消息不回 PUBACK，由设备重传兜底。否则关闭会被拖长到超时上限 |

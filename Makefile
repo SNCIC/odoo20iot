@@ -69,6 +69,11 @@ c1-bench: ## Phase 0 · C1 规则条件引擎：P99 验收 + 求值基准
 a1-capacity: ## Phase 1 · A1 认证容量实测（Argon2 参数 + 重连风暴，约 3 分钟）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_CAPACITY=1 go test ./internal/auth -run TestCapacity -count=1 -v'
 
+.PHONY: a4-bench
+a4-bench: ## Phase 0 · A4 网关连接容量压测（⚠️ 5 万连接须分机部署压测客户端；先起网关）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/mqtt-bench \
+	  -broker tcp://127.0.0.1:11883 -conn 50000 -rate 2000 -duration 24h'
+
 .PHONY: run-gateway
 run-gateway: ## 前台运行网关（连开发栈 NATS）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/iot-gateway \

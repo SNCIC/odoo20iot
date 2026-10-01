@@ -144,6 +144,8 @@ type Metrics struct {
 	UnroutableTotal atomic.Int64
 	// UnsupportedQosTotal 超出端侧契约的 QoS（当前为 QoS2）报文数。
 	UnsupportedQosTotal atomic.Int64
+	// InvalidPayloadTotal 无法封装为总线信封的报文数（非合法 JSON 等，03 §2.4）。
+	InvalidPayloadTotal atomic.Int64
 
 	// ---- 认证与 ACL（06 §4：gw_connect_fail_total / gw_auth_cache_hit_ratio）----
 
@@ -153,6 +155,13 @@ type Metrics struct {
 	ConnectFailTotal atomic.Int64
 	// ACLDeniedTotal 被 ACL 拒绝的收发操作数。
 	ACLDeniedTotal atomic.Int64
+
+	// ---- 集群路由（A3）----
+
+	// ClusterRouteFailTotal 跨节点路由失败数（含登记/清除位置、离线回放）。
+	ClusterRouteFailTotal atomic.Int64
+	// ClusterOfflineReplayTotal 累计回放的离线消息条数。
+	ClusterOfflineReplayTotal atomic.Int64
 
 	failMu      sync.Mutex
 	failReasons map[string]int64
@@ -193,6 +202,8 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	writeMetric(w, "gw_auth_success_total", "设备认证通过的连接数", m.AuthSuccessTotal.Load())
 	writeMetric(w, "gw_connect_fail_total", "设备认证失败的连接数（见 reason 维度）", m.ConnectFailTotal.Load())
 	writeMetric(w, "gw_acl_denied_total", "被 ACL 拒绝的收发操作数", m.ACLDeniedTotal.Load())
+	writeMetric(w, "gw_cluster_route_fail_total", "跨节点路由失败数", m.ClusterRouteFailTotal.Load())
+	writeMetric(w, "gw_cluster_offline_replay_total", "累计回放的离线消息条数", m.ClusterOfflineReplayTotal.Load())
 
 	// 按原因分类（06 §4 的 gw_connect_fail_total{reason}）。固定顺序输出，
 	// 便于人工比对与抓取。

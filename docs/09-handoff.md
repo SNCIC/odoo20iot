@@ -12,9 +12,14 @@
 - **B1（GreptimeDB JSON vs 宽表）** —— JSON 方案写入达标 3.8×，**维持 JSON 为默认，不切宽表**（`02` §4.1.1）；
 - **C1（`expr` 条件引擎）** —— 编译期校验与 P99 均达标，但**校验必须自建 AST 层**（`04` §1.2.1）。
 
-**Phase 1 已开工**：**A1 设备认证**（三档 + 物模型 ACL + Argon2 容量实测）已完成。
+**Phase 1 已开工**：**A1 设备认证**（三档 + 物模型 ACL + Argon2 容量实测）已完成；
+**A3 集群路由**（跨节点投递 + 离线队列 + 接收端去重 + 生产启动装配）已完成；
+**消息管道 `svc-pipeline`**（统一信封 + 物模型解析 + 攒批 + GreptimeDB 写入 + 落库后 ACK + 两阶段幂等）MVP 已完成并端到端跑通；
+**A5 计量埋点**（网关热路径累加 + 窗口批量上报 + Redis 用量计数器）原型已完成，计数误差实测为 0；
+**D2/D3 Odoo 集成骨架**（Go 侧 JSON-2 客户端 + Odoo 侧 `sn_edge_integration`）已完成、**已在 odoo20 库安装验证**并提交推送；
+**`odoo-connector`** 已完成 07 §4.3 编排层（限流/准入/熔断/重试/幂等占位）、§4.4 的**两条事件入口**（C-1 Outbox→NATS、C-2 webhook→NATS）与 **15min 定时对账**（Outbox 非终态行补投 + C-2 水位差补投）；Odoo 侧 Outbox cron 投递也已接通。均端到端实测通过（真实 Odoo、真实 Redis、真实 NATS）。
 
-下一步：**A3 集群路由**、**A5 计量埋点**、D2/D3 Odoo 集成骨架。
+下一步：A4 连接压测待有干净环境后再跑；`odoo-connector` 的主数据拉取与死信；Odoo 侧 S1/S3 集成场景端到端。
 
 ---
 
@@ -108,6 +113,11 @@
   ⚠️ 写成 `git@github.com:...` 会命中 `github.com` 别名 → 使用 wsd 的 key → push 报
   `ERROR: Repository not found`。**这个坑已经踩过一次。**
 
+- **第二个仓库：Odoo 自定义模块（D3）**。`sn_edge_integration` **不在本仓库**，
+  而在 `/home/xfusion/projects/odoo/odoo20tbb/addons/`（独立仓 `SNCIC/odoo20tbb`，
+  远端别名 `github-odoo20tbb`）。改动该模块时 Git 操作要指向那个目录与该别名，
+  **不要误提到本仓库**；反之亦然。
+
 - 提交身份 `Gavin <963645882@qq.com>`；风格 `type(scope): 中文摘要——补充说明`，正文写背景 / 实现要点 / 验证结论。
 - 直接提交推 `main`，不开分支、不走 PR（沿用 `AGENTS.md`）。
 
@@ -168,6 +178,12 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 8 | **C1 · 规则条件引擎（P0）** | **通过**。`internal/rules` 实现编译期校验（AST + 物模型类型表）、41 个白名单函数、编译缓存与 `Runner`。实测求值 **P50 0.60~0.81 µs / P99 0.98~1.74 µs**（验收线 2 µs，6 轮；余量 1.15~2.04×，**生产机型需复测**）；编译缓存命中 121 ns / 0 分配。核心发现：**`expr.Env` 的类型化环境覆盖不了小写物模型键**，校验必须自建（`04` §1.2.1） |
 | 7 | **B1 · 时序表模型（P0）** | **通过**。`cmd/tsdb-bench` 在 GreptimeDB 1.2.1 上对比 A（JSON）/ B（宽表）：写入 19.1 万 / 16.1 万 points/s（验收线 5 万，内联字面量路径 64.0 万）；查询单设备全部达标，多设备明细两方案**都**超线 → 结论「维持 JSON 默认」。含**前置一致性校验**（两方案 3599 点逐点相等）。结论与边界 `02` §4.1.1；原始报告 `docs/reports/b1-tsdb-bench.md` |
 | 6 | **A2 · QoS1 PUBACK 时机（P0）** | **通过**。`mochi-mqtt` v2.7.9 可在「等待 NATS `PublishAck` 后再回 PUBACK」下工作：`OnPublish` 返回 `packets.ErrRejectPacket` 阻止自动 PUBACK，业务侧 `cl.WritePacket(ack)` 显式确认。实测往返 **0.52 ~ 1.12 ms**（5 次采样，中位 ≈ 0.92 ms）。结论与边界见 `03-ingestion.md` §4.4.1；代码 `internal/gateway`；用例 `a2_test.go`（含**崩溃注入**与**对照实验**）、`nats_test.go`（真实 JetStream，PUBACK 后消息可读回） |
+| 10 | **A3 · 集群路由（P1）** | **完成（核心实现 + 端到端实测）**。`internal/cluster` 实现设备位置 Locator + 定向路由 + 非设备广播兜底、离线分片队列与游标回放、接收端 `(Origin, Seq)` 去重；`internal/gateway` 的 `ClusterHook`/inline 注入有确定性单测；`cmd/iot-gateway` 已接入显式集群装配（`-cluster-node-id` + `-redis-url`）。文档 `03` §1.4 已从「filter 反向索引」勘误为「设备位置查询」。真实 NATS/Redis 端到端用例（`redis_test.go`：RedisLocator 跨节点定向路由 + RedisCursor 跨节点回放续传）已实测通过（`IOT_NATS_URL` + `IOT_REDIS_URL` 触发） |
+| 11 | **统一信封（Phase 0 缺口修复）** | **完成**。修掉一个实现缺口：网关原先只把**裸 payload** 发到 NATS，`device_key` 随 subject 丢失，下游无从落库。现新增 `internal/envelope`（归属元数据 + 原始报文，payload 用 `json.RawMessage` 内联避免 base64 膨胀），网关 `buildEnvelope` 在发布前封装（非法 JSON → `gw_invalid_payload` 拒绝）；`03` §2.4/§4.3 的「统一信封」由注释变成实现 |
+| 12 | **消息管道 `svc-pipeline`（P0 · 物模型解析 + GreptimeDB 写入 + 幂等）** | **完成（MVP）**。`internal/pipeline`：`Parser`（信封 → `Record`，ISO8601 校验、缺失指标记 Null、毒消息标 `ErrPermanent`）+ `Batcher`（**或**语义 200ms/1000 行、非阻塞入批 + `Ticket.Wait`）+ **两阶段幂等**（`processing` 60s 仅并发互斥、`done` 5min 才放行 ACK；Redis 实现 + 内存实现）+ `Handler`（解信封 → done 检查 → 抢占 processing → 入批 → 落库 → 写 done）；`cmd/svc-pipeline` 消费 `iot.telemetry.>` durable consumer，**落库后 ACK**、批次失败 NAK 重投、毒消息计数后 ACK 释放、按 `concurrency` 并发处理。**端到端实测**：230 条遥测全链路落库；**幂等探针**（两条完全相同信封）→ `duplicate=921 / rows_written=1 / idem_errors=0`，GreptimeDB 增量**恰为 1** |
+| 13 | **A5 · 计量埋点（P0 · 计量埋点原型）** | **完成（原型）**。`internal/metering`：`Accumulator`（热路径**只做一次加锁自增、无 IO**）+ `Reporter`（窗口批量上报 `iot.quota.usage`，**取出即清零**：宁可少报也不重复计费）+ 退出前补发最后窗口；网关 `Hook` 在**已持久化**后累加 `msg_count`（`gateway.Meter` 窄接口）；`internal/quota` + `cmd/svc-quota` 消费上报 → Redis `INCRBY quota:{pid}:{metric}:{yyyymmdd}`（TTL 7d）。**端到端实测**：网关累加 → 上报 → 累加，Redis 计数器 `quota:1:msg_count:20261001 = 192` 与实发 **192 条完全一致**（误差 0%，验收线 <0.1%）。**遗留**：每分钟落 PG（按 `(metric, ts_minute)` 幂等）、每小时对账、配额限流与分级预警、设备数/存储量/API 调用数三类指标 |
+| 14 | **D2/D3 · Odoo 集成骨架（P1）** | **完成（骨架）**。**D2**（Go，本仓库）：`internal/odoo` —— JSON-2 客户端（`POST /json/2/{model}/{method}`、Bearer 鉴权、**强制注入 `X-Odoo-Database`**、命名参数、`search_read` 分页），错误码 → 哨兵错误（401/403/409/422）+ `IsRetryable`（**仅 5xx/429/网络错误可重试，4xx 不重试**，07 §4.3）；httptest 5 组用例全过。**D3**（Odoo，⚠️ **在另一仓库 `SNCIC/odoo20tbb` 的 `addons/`**）：`sn_edge_integration` 骨架 —— `edge.idempotency`（ADR-015 五态 + `UNIQUE(company_id, integration_name, idempotency_key)`，**只有 SUCCEEDED 才回放**）、`edge.outbox`（事务内事件 + `event_id` 唯一）、`/api/iot/v1/health`。**已在 odoo20 库实测安装通过**（`Module loaded in 2.18s`、两个 `_uniq` 约束 `contype=u` 落地、`ir_access` 记录生成、health 返回 200），并已提交推送（`fdf6a52`）。**安装期查出两处 Odoo 20 不兼容**（按 19 及更早的写法会直接失败或静默失效）：① 访问权文件必须叫 `security/ir.access.csv`（`ir.model.access` 已由 `ir.access` 取代）、列改为 `operation` 字母组合，写旧名会在加载时 `KeyError` **中断安装**；② 唯一约束必须用 `models.Constraint`（`_sql_constraints` 仅打印告警、**约束不生效**）。完整清单见 07 §7.2 |
+| 15 | **`odoo-connector` 编排层 + 事件入口 + 定时对账（P1 · 07 §4.3 / §4.4）** | **完成（骨架 + 真实 Odoo 实测）**。`internal/connector`：令牌桶限流（20 req/s）+ 有界排队准入（在途 8 / 队列 1000，超出拒绝并告警）+ 熔断（`gobreaker`；连续 10 次失败**或**失败率 > 50% 且样本 ≥ 20 → 打开 60s；**401/403 立即跳闸**；**业务 4xx 不计入**）+ 退避重试（1s/3s/9s，最多 3 次；**仅 5xx/429/网络错误**，且**超时仅在携带幂等键时重试**）+ 错误码映射（§4.3.2 八码）+ 幂等占位（§4.3.1 第 2 步，Redis Lua 原子「查—比—写」；**占位不可用则降级放行**，权威账本仍在 Odoo `edge.idempotency`）+ 超时（连接 3s / 读 15s）。**`cmd/odoo-connector`** 骨架：`/healthz` + `/readyz`（真打 Odoo）+ `/metrics`。**实测**：对真实 Odoo 用无效凭据 → `/readyz` 返回 `AUTH_REQUIRED`、随即触发 P1 熔断、再次返回 `CIRCUIT_OPEN` 且不再触达 Odoo。**顺带修一处信息泄露**：`odoo.APIError` 现在剥离 Odoo 返回的 Python traceback（技术方案 p.7 明令禁止外泄）。**事件入口已完成（§4.4）**。**C-1**：消费 Odoo Outbox 投递到 Redis Stream `odoo:outbox` 的事件（消费组 `odoo-connector`），翻译为 `iot.odoo.{model}` 发布到 NATS `IOT_ODOO`。**「至少一次」由两件事共同成立**：XACK 只在发布成功之后 **+** 未确认消息由 `XAUTOCLAIM` 接管重投 —— 只做前者不做后者，失败消息会永远沉在 PEL 里，语义是「零次」而非「至少一次」。**C-2**：`POST /webhook/odoo`（Bearer 鉴权，**无令牌即不注册该路由**；请求体上限 1 MiB），按 `(model, id, write_date)` 去重，去重器故障时**放行**（重复比丢失轻，下游按 `event_id` 还能去）。**实测端到端**：XADD 一条 Outbox 事件 + POST 一次 webhook → NATS 收到 `iot.odoo.stock_move` / `iot.odoo.maintenance_equipment`，消费组待确认为 0；同一 webhook 重投返回 `duplicate:true` 且不重复发布；未授权返回 401。**查出并修掉两个真实缺陷**：① 漏了 PEL 重投（见上）；② `XReadGroup` 传 `Block: 0` 被 go-redis 下发为 **`BLOCK 0`＝永久阻塞**，会把消费循环挂死（已译为负值＝非阻塞，并有回归用例）。**Odoo 侧 cron 投递已接通**：`sn_edge_integration` 新增 `data/edge_outbox_cron.xml`（每分钟）与 `edge.outbox` 的投递逻辑 —— **先 XADD 成功才置 delivered**；失败按 5/15/60/300/900/1800/3600 秒退避，连续 10 次进**死信**；**Redis 整体不可达则整轮失败、不消耗 attempts**（逐条失败会让一次宕机把整批事件推成死信，反而丢数据）。依赖 python 包 `redis`（已装入 `odoo20` venv 8.1.0，并写入 manifest 的 `external_dependencies`）；地址与流名走系统参数 `edge.outbox.redis_url` / `edge.outbox.stream`。**实测**（odoo shell，含真实 cron 路径 `method_direct_trigger()`）：正常投递 → `delivered`；走真实 cron → `delivered` 且事件入 Redis；Redis 不可达 → 抛错且 `attempts` 保持 0；单条失败（WRONGTYPE）→ `attempts=1` + 退避 + `last_error` 记真实原因；连续 10 次 → `state=dead`。**全链路已打通**：Odoo 业务 → Outbox → cron → Redis Streams → connector → NATS `IOT_ODOO`（`messages:1`、`lag:0`、PEL 0）。**又查出两处 Odoo 20 API 变更**：① `ir.config_parameter` 的 `get_param`/`set_param` 已被类型化访问器 `get_str`/`set_str` 等取代（沿用旧名会在 **cron 运行时**才 `AttributeError`，属性面板上看不出来）；② `ir.cron` 不再有独立 `code` 字段，需经 `ir_actions_server_id` 委托 `ir.actions.server`。**定时对账已完成（§4.4）**：`Reconciler` 每 15 min 跑两路扫描 —— ① 补投 Odoo `edge.outbox` 的非终态行（domain 带宽限窗口，**退避中的行不算遗漏**；死信也补投并标记需人工排查）；② 比对 C-2 水位差并补投（水位是 `(write_date, id)` **二元组**，只用时间戳会漏掉同秒写入的多条记录；**首次对账只建基线**，否则会把全表历史当遗漏一次打爆下游）；**连续两轮仍有遗漏才告警**（单轮很可能是抖动）。补投**沿用原 `event_id`**，原事件若其实已到达，由下游去重 —— 换个新 id 就等于承认必然重复。水位由 webhook 推进、对账比对，两侧共用 Redis，并在 Lua 里保证**只进不退**（水位被拉回去会重复处理一整段）。**实测**（真实 Odoo/Redis/NATS，3s 间隔加速）：首轮建基线；造一条卡住的 Outbox 行 → `对账①：补投遗漏的 Outbox 事件`；改一条 `res.partner` 但**不发 webhook** → `对账②：补投水位差`（这正是 C-2 会静默丢事件的场景）；连续多轮未收敛 → ERROR 告警并提示检查 `max_cron_threads`。**顺带修一个我自己的调用 bug**：`-log-json false` 因 Go flag 的布尔语义导致**其后所有参数被静默丢弃**（不报错的配置错误），已改为 `-log-format text|json`。**遗留**：主数据增量拉取与游标（Redis+PG）、死信 `t_dlq` + 按 `entity_type` 聚合告警、对账第 ③ 项（未绑定待办，依赖尚未建立的 `t_external_ref`） |
 
 ---
 
@@ -186,10 +202,13 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | P0 | B1 补充项（1） | **明细查询限行**必须落地（`02` §4.3.1）：实测多设备 3.6 万行明细 P95 达 247/211 ms，两方案都超线 |
 | P0 | B1 补充项（2） | **预聚合表从「可选优化」升为必做**：多设备 × 长跨度聚合在 JSON 下已骑在 SLO 线（198~213 ms），宽表 91 ms |
 | P1 | B1 补充项（3） | 上生产前按 **3 副本集群 + NVMe** 重测写入吞吐；宽表开启前用**租户真实样本**重测存储占用 |
-| P1 | A1 · 设备认证 Hook | **当前网关放行全部连接**（`gateway.New` 里显式标注），三档认证（ADR-008）未实现 |
-| P1 | A3 / A4 / A5 | 集群路由、5 万连接 24h、计量埋点 |
-| P1 | A4 补充项 | A2 引入了「收包协程同步阻塞 ≤ `PubackTimeout`」，需在 5 万连接 24h 压测中实测其对 `PINGREQ` 与掉线判定的影响（见 `03` §4.4.1 边界 1） |
-| P1 | D2 / D3 | Odoo JSON-2 客户端骨架、`sn_edge_integration` 模块骨架 |
+| ~~P1~~ | ~~A3 补充项~~ | ✅ **已完成**：Redis Locator/Cursor 跨节点端到端已实测（`redis_test.go`，`IOT_NATS_URL`+`IOT_REDIS_URL` 触发） |
+| ~~P0~~ | ~~svc-pipeline（物模型解析 + GreptimeDB 写入 + 幂等）~~ | ✅ **已完成（MVP）**（见 §4 第 12 项）。**遗留**：`raw_parsers` 二进制解析沙箱、32 分片静态绑定消费、Redis 最新值 Write-Through、`normalized` 转发、DLQ 与毒消息落 `event(parse_error)` |
+| P1 | A4 | **压测工具已完成三个阶段**（`cmd/mqtt-bench`：阶段 1 建连/保持/资源采样/泄漏趋势判定，阶段 2 QoS1 发布路径，阶段 3 背靠背吞吐 + 接入确认延迟 P50/P95/P99 + SLO 判定；引入 `eclipse/paho.mqtt.golang` v1.5.1）。**5 万连接 24h 正式实测待跑**：需先起网关，且压测客户端**须分机部署**（同机跑会把工具开销算进网关）。冒烟：10 连接背靠背 → 13585 msg/s、P99 = 2ms、SLO ✅；200 连接 + 1s 周期发布 → 2098 条全成功 |
+| P1 | A4 补充项 | **机制性验证已完成**（`internal/gateway/a4_test.go`，不依赖真实 NATS）：PUBLISH 同步阻塞同连接的 PINGREQ，PINGRESP 推迟 ≈ `PubackTimeout`（400ms 用例实测 400ms）；阻塞**仅限该连接**。**5 万连接 24h 下的规模化影响**（连续上报 × 总线超时 → 设备侧误判重连）仍待压测观测（`03` §4.4.1 边界 1） |
+| ~~P0~~ | ~~A5 · 计量埋点原型~~ | ✅ **已完成（原型）**（见 §4 第 13 项）。遗留：每分钟落 PG（按 `(metric, ts_minute)` 幂等）+ 每小时对账、配额限流与分级预警、其余三类指标（设备数/存储量/API 调用数） |
+| ~~P1~~ | ~~D2 / D3~~ | ✅ **已完成（骨架 + 安装验证 + 已推送）**（见 §4 第 14 项）。**遗留**：D3 的完整实现（facade / 其余 IoT 路由 / cron 投递 / 视图 / `tests/` / `EXTENSIONS.md`）、S1/S3 集成场景端到端 |
+| P1 | `odoo-connector` 补充项 | **编排层 + 两条事件入口 + Odoo 侧 cron 投递 + 15min 定时对账均已完成并实测**（见 §4 第 15 项）。**遗留**：主数据增量拉取与游标（Redis+PG）、死信 `t_dlq` + 聚合告警、对账第 ③ 项（依赖尚未建立的 `t_external_ref`） |
 | P2 | 文档收尾 | 把「IoT 平台部署位置」的决策补进 `07` §11.2（**已定：宿主 Docker Compose**） |
 | P2 | 日志口径统一 | 网关层用 `log/slog`（mochi-mqtt 的 Hook 签名即 slog），`cmd/iot-gateway` 仍用 zap，二者应合并为一条流水线（见 `main.go:newSlogLogger`） |
 
@@ -218,6 +237,38 @@ make c1-bench
 
 # A1 认证容量实测（约 3 分钟）
 make a1-capacity
+
+# A4 网关容量压测（先起网关；⚠️ 5 万连接须分机部署压测客户端）
+make a4-bench
+# 等价：go run ./cmd/mqtt-bench -broker tcp://127.0.0.1:11883 -conn 50000 -rate 2000 -duration 24h
+# 阶段 2 周期发布（QoS1）：追加 -publish-interval 1s
+# 阶段 3 吞吐 + 接入确认延迟：-publish-interval 0（背靠背，尽可能快）
+# 冒烟：go run ./cmd/mqtt-bench -conn 10 -rate 100 -duration 4s -interval 3s -publish-interval 0
+
+# 消息管道 svc-pipeline（消费网关上报 → 物模型解析 → 攒批写 GreptimeDB；落库后 ACK）
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
+  go run ./cmd/svc-pipeline -nats-url nats://100.64.0.3:28222 \
+  -dsn "postgres://greptime:greptime@100.64.0.3:28403/public"'
+
+# 计量用量聚合 svc-quota（消费 iot.quota.usage → Redis 计数器 quota:{pid}:{metric}:{yyyymmdd}）
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
+  go run ./cmd/svc-quota -nats-url nats://100.64.0.3:28222 -redis-url redis://100.64.0.3:28637/0'
+
+# Odoo 连接器（07 §4.3 编排层 + §4.4 事件入口与对账；API Key 与令牌由 Vault/环境变量注入，切勿写进命令行历史）
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
+  ODOO_API_KEY=xxx ODOO_WEBHOOK_TOKEN=yyy go run ./cmd/odoo-connector \
+    -odoo-url http://127.0.0.1:8070 -odoo-db odoo20 \
+    -log-format text -reconcile-models maintenance.equipment'
+# ⚠️ -log-format 是字符串 flag：不要用 -log-json false 这种写法 ——
+#    Go 的 flag 包遇到第一个非 flag 参数会**静默丢弃其后所有参数**。
+# 对账调试：-reconcile-interval 4s -reconcile-stale-after 2s（加速观察补投）
+# 探活：curl -sS 127.0.0.1:18091/healthz ；就绪（真打 Odoo）：/readyz ；指标：/metrics
+# C-1 入口：Odoo 侧 cron XADD 到 Redis Stream odoo:outbox，连接器自动搬运到 NATS IOT_ODOO
+# C-2 入口：curl -sS -X POST -H "Authorization: Bearer yyy" -H 'Content-Type: application/json' \
+#   -d '{"model":"maintenance.equipment","id":7,"write_date":"2026-10-01 06:30:00","company_id":1,"data":{}}' \
+#   http://127.0.0.1:18091/webhook/odoo
+# 真实 Redis/NATS 下的集成用例（默认跳过）：
+#   IOT_REDIS_URL=redis://100.64.0.3:28637/0 go test ./internal/connector -count=1
 
 # 生成一份演示凭据并本地起网关（带认证）
 docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \

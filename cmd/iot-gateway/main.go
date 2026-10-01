@@ -3,12 +3,7 @@
 // 当前覆盖的能力（Phase 0 验证 + Phase 1 首批）：
 //   - A2：QoS1 确认时序 —— 等 NATS 确认持久化后再回 PUBACK（internal/gateway）；
 //   - A1：三档设备认证 + 物模型驱动 ACL（internal/auth）；
-//   - B1：GreptimeDB 表模型选型（internal/tsdb，压测工具 cmd/tsdb-bench）。
-//
-// 尚未实现（如实留白，不做假实现）：
-//   - L2/L3 凭据来源（Redis / svc-auth gRPC）：当前用本地凭据文件（仅开发/PoC）；
-//   - A3 集群路由：单节点，无跨节点投递；
-//   - 物模型解析与落库管道（svc-pipeline）：只有压测路径，没有消费链路。
+//   - A3：显式配置节点 ID 后启用跨节点路由与 Redis 在线位置/离线游标。
 package main
 
 import (
@@ -26,22 +21,29 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"github.com/SNCIC/odoo20iot/internal/auth"
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/cluster"
 	"github.com/SNCIC/odoo20iot/internal/gateway"
+	"github.com/SNCIC/odoo20iot/internal/metering"
 )
 
 func main() {
 	httpAddr := flag.String("http-addr", ":8080", "HTTP 监听地址（健康检查与指标端点）")
 	mqttAddr := flag.String("mqtt-addr", ":1883", "MQTT 监听地址")
 	natsURL := flag.String("nats-url", "nats://100.64.0.3:28222", "NATS JetStream 地址")
+	clusterNodeID := flag.String("cluster-node-id", "", "A3 集群节点 ID；为空则关闭集群路由")
+	clusterPeers := flag.String("cluster-peers", "", "A3 对端节点 ID，逗号分隔")
+	redisURL := flag.String("redis-url", "redis://100.64.0.3:28637/0", "A3 集群 Redis 地址")
 	natsStream := flag.String("nats-stream", "IOT_TELEMETRY", "遥测 Stream 名称（Phase 0 占位，待与 03 对齐）")
 	natsSubjects := flag.String("nats-subjects", "iot.telemetry.>", "遥测 Stream 捕获的 subject，逗号分隔")
 	pubackTimeout := flag.Duration("puback-timeout", gateway.DefaultPubackTimeout, "等待 PublishAck 的上限（超时则不回 PUBACK）")
 	project := flag.String("project", "spike", "**占位**租户标识：真实租户投影依赖 A1 的凭据注册表")
 	shards := flag.Int("shards", gateway.DefaultShards, "总线分片数（编译期常量，见 P0-3）")
+	meterWindow := flag.Duration("metering-window", metering.DefaultWindow, "计量上报窗口（04 §6：每 10s 批量上报）")
 
 	authFile := flag.String("auth-file", "tmp/dev-credentials.json", "设备凭据文件（L1 之外的凭据来源；仅开发/PoC）")
 	allowAnonymous := flag.Bool("allow-anonymous", false, "⚠️ 放行全部连接（仅本地冒烟；生产绝不可开）")
@@ -89,8 +91,56 @@ func main() {
 		logger.Fatal("确保遥测 Stream 存在失败", zap.Error(err))
 	}
 
+	var node *cluster.Node
+	if *clusterNodeID != "" {
+		redisOpts, err := redis.ParseURL(*redisURL)
+		if err != nil {
+			logger.Fatal("解析集群 Redis 地址失败", zap.Error(err))
+		}
+		rdb := redis.NewClient(redisOpts)
+		if err := rdb.Ping(context.Background()).Err(); err != nil {
+			_ = rdb.Close()
+			logger.Fatal("连接集群 Redis 失败", zap.Error(err))
+		}
+		defer func() { _ = rdb.Close() }()
+
+		node, err = cluster.New(context.Background(), cluster.Options{
+			ID:      *clusterNodeID,
+			Peers:   splitNonEmpty(*clusterPeers),
+			NATSURL: *natsURL,
+			Cursor:  cluster.NewRedisCursor(rdb, "gw:offline:cursor"),
+			Logger:  gwLog,
+		}, cluster.NewRedisLocator(rdb, "gw:client", cluster.DefaultLocatorTTL))
+		if err != nil {
+			logger.Fatal("初始化 A3 集群节点失败", zap.Error(err))
+		}
+		defer node.Close()
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 计量（04 §6）：本地累加 + 按窗口批量上报。
+	// 用独立 Stream 捕获 `iot.quota.usage`，与遥测流分离（计量数据不进遥测流）。
+	meterAcc := metering.NewAccumulator()
+	quotaPub, err := gateway.NewNATSPublisher(*natsURL, "IOT_QUOTA")
+	if err != nil {
+		logger.Fatal("连接计量上报通道失败", zap.Error(err))
+	}
+	if err := quotaPub.EnsureStream([]string{"iot.quota.>"}, 1); err != nil {
+		logger.Fatal("确保计量 Stream 存在失败", zap.Error(err))
+	}
+	meterReporter, err := metering.NewReporter(metering.ReporterOptions{
+		Accumulator: meterAcc,
+		Publisher:   quotaPub,
+		NodeID:      *clusterNodeID,
+		Window:      *meterWindow,
+		Logger:      gwLog,
+	})
+	if err != nil {
+		logger.Fatal("构造计量上报器失败", zap.Error(err))
+	}
+	go meterReporter.Run(ctx)
 
 	broker, err := gateway.New(ctx, gateway.Options{
 		MQTTAddr:       *mqttAddr,
@@ -101,9 +151,17 @@ func main() {
 		Log:            gwLog,
 		Authenticator:  authenticator,
 		AllowAnonymous: *allowAnonymous,
+		Cluster:        node,
+		Meter:          meterAcc,
 	})
 	if err != nil {
 		logger.Fatal("启动 MQTT 接入失败", zap.Error(err))
+	}
+	if node != nil {
+		if err := node.Start(broker.ClusterHook()); err != nil {
+			_ = broker.Close()
+			logger.Fatal("启动 A3 集群路由失败", zap.Error(err))
+		}
 	}
 	broker.Serve()
 
@@ -149,7 +207,13 @@ func main() {
 	if err := broker.Close(); err != nil {
 		logger.Error("关闭 MQTT 接入失败", zap.Error(err))
 	}
-	logger.Info("已退出")
+	// 上报器已在上面的 ctx 取消时补发了最后一个窗口，这里释放发布通道。
+	if err := quotaPub.Close(); err != nil {
+		logger.Error("关闭计量上报通道失败", zap.Error(err))
+	}
+	logger.Info("已退出",
+		zap.Int64("meter_reports", meterReporter.Metrics().ReportsTotal.Load()),
+		zap.Int64("meter_counters", meterReporter.Metrics().CountersReported.Load()))
 }
 
 // buildAuthenticator 组装认证器。放行匿名时必须由部署者**显式**声明，
@@ -242,6 +306,16 @@ func newSlogLogger(jsonFormat bool) *slog.Logger {
 		return slog.New(slog.NewJSONHandler(os.Stderr, opts))
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, opts))
+}
+
+func splitNonEmpty(value string) []string {
+	var result []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func metricsHandler(m *gateway.Metrics) http.HandlerFunc {

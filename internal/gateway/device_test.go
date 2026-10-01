@@ -236,6 +236,8 @@ func (d *testDevice) write(pk *packets.Packet) {
 		err = pk.PublishEncode(&buf)
 	case packets.Subscribe:
 		err = pk.SubscribeEncode(&buf)
+	case packets.Pingreq:
+		err = pk.PingreqEncode(&buf)
 	default:
 		d.t.Fatalf("测试客户端不支持发送报文类型 %d", pk.FixedHeader.Type)
 	}
@@ -285,8 +287,49 @@ func (d *testDevice) read(timeout time.Duration) (packets.Packet, error) {
 		err = pk.PubackDecode(body)
 	case packets.Suback:
 		err = pk.SubackDecode(body)
+	case packets.Publish:
+		err = pk.PublishDecode(body)
+	case packets.Pingresp:
+		err = pk.PingrespDecode(body)
 	default:
 		// 其他类型在本测试中不解码，保留 FixedHeader 供断言使用。
 	}
 	return pk, err
+}
+
+// pingreq 发送 PINGREQ（无载荷）。
+func (d *testDevice) pingreq() {
+	d.t.Helper()
+	d.write(&packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Pingreq}})
+}
+
+// awaitPingresp 在给定超时内等待 PINGRESP。
+func (d *testDevice) awaitPingresp(timeout time.Duration) error {
+	d.t.Helper()
+	got, err := d.read(timeout)
+	if err != nil {
+		return err
+	}
+	if got.FixedHeader.Type != packets.Pingresp {
+		d.t.Fatalf("期望 PINGRESP，得到报文类型 %d", got.FixedHeader.Type)
+	}
+	return nil
+}
+
+// assertNoPacket 断言在窗口内**没有收到任何报文**。
+//
+// 与 assertNoPuback 同构，但用于「任何报文都不该出现」的窗口：
+// 例如 PUBLISH 阻塞期间，PUBACK 未到，且同连接的 PINGRESP 也被阻塞。
+func (d *testDevice) assertNoPacket(window time.Duration) {
+	d.t.Helper()
+
+	_, err := d.read(window)
+	switch {
+	case errors.Is(err, errNoPacket):
+		return
+	case err != nil:
+		d.t.Fatalf("期望「无报文」，但读取报错: %v", err)
+	default:
+		d.t.Fatalf("期望「无报文」，但窗口 %s 内收到了报文", window)
+	}
 }
