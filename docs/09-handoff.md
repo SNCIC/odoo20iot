@@ -212,6 +212,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 22 | **Stream 保留口径丢失（`MaxAge` 侧）· 全局统一** | **完成**。起因：各服务的 `EnsureStream` 都写「**不存在才创建**」，于是**先于口径代码建出来的流**永远停在旧配置。`/jsz` 实测铁证：`IOT_TELEMETRY max_age=0 msgs=57400`、`IOT_ODOO max_age=0`、`IOT_ALARM max_age=0`（代码里明明设了 7d / 24h）—— 这些流**建于该行代码存在之前**，"只建不校"让它们再也修不回来。后果：磁盘随写入无上限增长，且是「重启即重放」的放大器（保留窗口越长，一次误删消费者的代价越大）。**修法**：抽成 **`natsjs.EnsureStream` + `natsjs.StreamSpec`**（建或校），`internal/gateway` / `internal/connector` / `cmd/svc-alarm` 三处统一调用，不再各写一遍。要点： ① 漂移则 `UpdateStream` 并打 **WARN**（缩短 `MaxAge` 会立即删超期消息，破坏性动作必须留痕）—— 策略为**自动校正 + 告警**；② **零值 = 不约束**：`MaxAge<=0`/`MaxMsgsPerSubject<=0`/`Discard==0` 既不检查也不改，服务不拿默认值覆盖部署侧的显式配置；③ `StrictSubjects` 保留 `svc-alarm` 的既有主张（subjects 不覆盖就**报错**、不自动改订阅范围），而网关/连接器按需校正；④ subjects 用**集合**比较（NATS 返回顺序不保证一致）；⑤ 刻意不校副本数（属部署期按 RPO 决定）。用例（真 NATS）：`TestEnsureStreamReconcilesRetention`（`max_age=0` 旧流 → 24h/1000/DiscardNew，日志见 `max_age=0s →=24h0m0s`）、`TestEnsureStreamLeavesZeroFieldsAlone`（零值不动既存的 7d/DiscardOld）、`TestEnsureStreamStrictSubjects`、`TestSameStringSet`、`TestSubjectCovers`（钉住坑 40：`foo.>` 不覆盖 `foo` 自身）。**⚠️ 生效时机**：既存流的校正发生在**对应服务下次启动**时；当前开发栈的 `IOT_TELEMETRY` 等仍是 `max_age=0`，需重启网关/连接器/告警服务（或手工校正）才会落到 24h —— 且**缩短保留会删掉超期消息**，属破坏性，故未在本次代跑 |
 | 21 | **「重启即重放」剩余 3 处（P1 · §5.1 原第 27 行）** | **完成**。`cmd/svc-pipeline` / `cmd/svc-quota` / `internal/cluster` 的路由消费者原先各自 `js.PullSubscribe(...)` 且 `defer sub.Unsubscribe()` —— 退出即**删掉消费者**，重启按 `DeliverAll` 重放整个保留窗口。三处统一改走 `internal/natsjs.Subscribe`：`svc-quota` 新增 `-consumer-inactive`（默认 24h）、`svc-pipeline` 新增同名列并透传 `MaxAckPending`（`natsjs.Options` 新增该字段）、`cluster.Options` 新增 `RouteRetention`（默认 1h，与路由流 `MaxAge` 用**同一个常量** `DefaultRouteRetention`，避免两处各自漂移）。⚠️ `internal/cluster.ReplayOffline` 的临时消费者（durable 为空 + `StartSequence` + `AckNone`）**刻意保留 `Unsubscribe`** —— 它现建现删、起点由 Redis 游标给出而非 `DeliverAll`，删掉才是正确清理；已就地加注释，防止后续被"统一"掉。**结构性防复发**：`natsjs.Subscribe` 的返回值由 `*nats.Subscription` 收窄为 `*natsjs.Subscription`（**只暴露 `Fetch`**）—— 调用方拿不到 `Unsubscribe`，这是坑 47「把规避方式做成可复用的东西」的落点；5 个调用点同步调整，`TestUnsubscribeDeletesDurableAndReplays` 改为**直接用原生 `js.PullSubscribe`** 演示坑本身（正因为收窄后就踩不到了）。**真 NATS 演练**（独立 stream/subject/durable/redis-key，不碰任何真实状态）：发布 5 条计量上报 → 计数器 `=5`；SIGTERM 停止后消费者**仍在**（`delivered=5 pending=0 ack_floor=5`，进度未丢）；重启后计数器**仍为 5**（未重放）。**对照**（复现缺陷）：停止后删掉消费者（等价旧的 `Unsubscribe`）→ 重启后计数器变成 **10**，重复计数被复现并由本修复消除。门禁 `gofmt` / `go build` / `go vet` / `go test` 全绿 |
 | 23 | **B1 补充项（1）· 明细查询限行 + 自适应降采样（P0 · 02 §4.3.1）** | **完成**。`internal/tsdb` 新增契约：`MaxDetailRows=5000` 等保护常量、`SeriesQuery.Normalize`（project_id>0 / 设备 ≤50 / 指标白名单 / 回溯 ≤90d / Limit ∈[1,5000]）、纯函数 `AdaptiveBucket(span, devices, cap)`（在「设备数 × 桶数 ≤ cap」下取最小可读桶宽，阶梯 1s…24h）。适配层 `QuerySeries`：Normalize → **廉价探测** `SELECT 1 ... LIMIT cap+1`（只取常量、不解析指标、不排序，超限时尽早终止）→ 未超限返回原始明细；超限按桶宽降采样返回并标注 `Granularity`/`Bucket`/`CapHit`，**绝不静默截断**（聚合若仍超限则直接报错）。裸查询改名为 `SelectRangeUnprotected`/`SelectBucketsUnprotected`（仅压测/诊断），业务侧唯一读入口是 `QuerySeries`。**实测**（`make b1-bench` §5.2，2026-10-01）：Q3 形态（10 设备 × 1h ≈ 3.6 万行）返回 **35990 → 3610** 行，P95 **257.4 → 152.4ms（JSON）/ 224.3 → 106.7ms（宽表）**，双双落回 P95<200ms 预算内；探测成本从「取指标值 + ORDER BY」的 **95.7ms** 降到 **20.4ms**（1.12M 行表实测）。集成测试 `internal/tsdb/greptimedb/query_test.go`（`IOT_GREPTIMEDB_DSN` + `IOT_PERF_ASSERT` 门控，`make test-tsdb`）。结论与边界 `02` §4.3.1.1；原始报告 `docs/reports/b1-detail-limit.md`。**遗留**：并发上限（20）、慢查询降级（>3s）、多指标端点（≤4）、大窗口（如 50 设备 × 90d）延迟实测 |
+| 24 | **B1 补充项（2）· 预聚合表 + 跨度路由（P0 · 02 §7）** | **完成**。**开工探针**（`internal/tsdb/greptimedb/capability_test.go`，临时表，6 项全过·无回退）：`INSERT…SELECT`+绑定参数可用、**非 append 表同键重写=覆盖**（幂等由表结构保证）、`json_get` 对 JSON 布尔返回 1（布尔可聚合）、rollup 表接受 TTL、`metric` 是保留字（须加引号）、全 NULL 分组写出 `sum=NULL,count=0` 行且 `NULLIF` 可用。**契约**：`Rollup`（1m/1h）、`Source`、纯函数 `RouteSource`（≤6h 原始 / 6h–30d 1m / >30d 1h，**只对 JSON 方案路由**），`SeriesResult.Source`。**表结构**：`telemetry_1m/1h` 长表 `(ts, project_id, device_id, device_type_id, "metric", "sum", "max", "count")`，**不设 append_mode**，物模型加指标零 DDL。**物化**：`Store.RollupWindow` 每指标一条 `INSERT…SELECT`；`cmd/svc-rollup` 增量调度（单飞 PG 咨询锁，失败不致命），水位落 PG `t_rollup_watermark`（迁移 `0005`，`GREATEST` 只进不退，**只在写入成功后推进**）。**路由**：`QuerySeries` 按源选表，agg 源再聚合 `SUM("sum")/NULLIF(SUM("count"),0)`（跨桶无损），输出桶宽不低于源粒度。**实测**（`make test-rollup`，2026-10-01）：10 设备 × 6h × 1Hz（21.6 万行）上 **守恒**（数值+布尔指标的 sum/max/count 与原始聚合逐项相等，1e-9）、**幂等**（重跑行数/取值不变）、**Q4 形态 P95 432.7 → 67.2ms**（同返回 730 行）；`make test-rollup-pg` 覆盖水位账本。结论与边界 `02` §4.3.2 / §7；原始报告 `docs/reports/b1-rollup.md`。**遗留**：1h（>30d）路径未单独压测、迟到数据超 `lag` 不回修、首次水位只回看 24h（更早需 `-backfill-since`）、多副本调度未压测、宽表方案未物化 |
 
 ---
 
@@ -229,7 +230,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | P1 | 规则索引与窗口算子 | C1 只覆盖了「表达式」；拓扑匹配过滤、`window.*` 的窗口算子、动作分发均未实现（`04` §1.2.1 ⑧）。**DAG 编排已于 §4 第 16 项落地**，与本项共同构成 `svc-rule` 的前置 |
 | P2 | Phase 2/3 其余批次 | **无法一次做完**（`06 §7` Phase 2 含 10 条产品轨 + 11 条工程轨 DoD，Phase 3 更在其上）。依赖当前环境**不存在**的基础设施者：K8s 多副本与 PDB、Vault、可视化前端、OTA 固件与目标硬件、C/Python 端侧 SDK。按「可独立完成且可验证」切批推进，第一批（L2 DAG）已完成 ✅ |
 | ~~P0~~ | ~~B1 补充项（1）~~ | ✅ **已完成**：明细查询限行 + 自适应降采样已落地（见 §4 第 23 项）。Q3 形态经 `QuerySeries` 后 P95 257→152ms（JSON）/ 224→107ms（宽表），双双达标 |
-| P0 | B1 补充项（2） | **预聚合表从「可选优化」升为必做**：多设备 × 长跨度聚合在 JSON 下已骑在 SLO 线（198~213 ms），宽表 91 ms |
+| ~~P0~~ | ~~B1 补充项（2）~~ | ✅ **已完成**：预聚合表 + 跨度路由已落地（见 §4 第 24 项）。Q4 形态 P95 432.7ms → 67.2ms，落回预算内 |
 | P1 | B1 补充项（3） | 上生产前按 **3 副本集群 + NVMe** 重测写入吞吐；宽表开启前用**租户真实样本**重测存储占用 |
 | ~~P1~~ | ~~A3 补充项~~ | ✅ **已完成**：Redis Locator/Cursor 跨节点端到端已实测（`redis_test.go`，`IOT_NATS_URL`+`IOT_REDIS_URL` 触发） |
 | ~~P0~~ | ~~svc-pipeline（物模型解析 + GreptimeDB 写入 + 幂等）~~ | ✅ **已完成（MVP）**（见 §4 第 12 项）。**遗留**：`raw_parsers` 二进制解析沙箱、32 分片静态绑定消费、Redis 最新值 Write-Through、`normalized` 转发、DLQ 与毒消息落 `event(parse_error)` |
@@ -268,6 +269,16 @@ make b1-bench
 # B1 补充项（1）· 明细限行真实库验证（env 门控；⚠️ 会 drop/重建 telemetry）
 #   断言 Q3 形态经 QuerySeries 降采样后 P95<200ms（报告见 docs/reports/b1-detail-limit.md）
 make test-tsdb
+
+# B1 补充项（2）· 预聚合真实库验证（env 门控；⚠️ 会 drop/重建 telemetry 与 telemetry_1m；约 2 分钟）
+make test-rollup
+# 水位账本的真实 PG 验证（建临时库）
+make test-rollup-pg
+
+# 预聚合服务（需先 iot-migrate 应用 0005）
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
+  go run ./cmd/svc-rollup -log-format text -interval 30s'
+# 健康与指标：curl -s http://127.0.0.1:18093/readyz ; curl -s http://127.0.0.1:18093/metrics
 
 # C1 规则条件引擎：P99 验收 + 求值基准
 make c1-bench

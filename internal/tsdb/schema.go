@@ -38,6 +38,74 @@ func TableName(p Plan) string {
 // Plans 返回全部方案（固定顺序，保证报告可复现）。
 func Plans() []Plan { return []Plan{PlanJSON, PlanWide} }
 
+// ---------- 预聚合（降采样物化，02 §7） ----------
+
+// Rollup 是预聚合粒度。刻意与 Plan 分开：
+// Plan 是「原始表模型」的封闭枚举，Rollup 是「派生表」的维度，两者正交。
+// 当前只从 JSON 方案的 telemetry 物化（宽表聚合已达标，不路由，见 RouteSource）。
+type Rollup string
+
+const (
+	// Rollup1m / Rollup1h 是两级预聚合粒度。
+	Rollup1m Rollup = "1m"
+	Rollup1h Rollup = "1h"
+
+	// Rollup1mTable / Rollup1hTable 是预聚合表名。
+	Rollup1mTable = "telemetry_1m"
+	Rollup1hTable = "telemetry_1h"
+
+	// Rollup1mTTL 覆盖路由阈值 30d 再留 5d 余量；1h 与原始表一致取 365d。
+	Rollup1mTTL = 35 * 24 * time.Hour
+	Rollup1hTTL = 365 * 24 * time.Hour
+)
+
+// RollupTableName 返回粒度对应的表名。
+func RollupTableName(r Rollup) string {
+	switch r {
+	case Rollup1m:
+		return Rollup1mTable
+	case Rollup1h:
+		return Rollup1hTable
+	default:
+		return ""
+	}
+}
+
+// RollupWidth 返回粒度对应的窗口宽度（date_bin 间隔）。
+func RollupWidth(r Rollup) (time.Duration, error) {
+	switch r {
+	case Rollup1m:
+		return time.Minute, nil
+	case Rollup1h:
+		return time.Hour, nil
+	default:
+		return 0, &PolicyError{"rollup", fmt.Sprintf("未知的预聚合粒度 %q", r)}
+	}
+}
+
+// Rollups 返回全部粒度（固定顺序，保证报告与调度可复现）。
+func Rollups() []Rollup { return []Rollup{Rollup1m, Rollup1h} }
+
+// ParseRollup 解析字符串粒度（CLI 用），非法值报 *PolicyError。
+func ParseRollup(s string) (Rollup, error) {
+	r := Rollup(s)
+	if _, err := RollupWidth(r); err != nil {
+		return "", err
+	}
+	return r, nil
+}
+
+// RollupableMetrics 返回可预聚合的指标集合。
+//
+// 探针（capability_test.go · P-c）实测 `json_get("metrics",'running',0.0)` 对 JSON 布尔
+// 返回数值 1，故布尔指标与数值指标走同一条路径 —— 本函数当前即全部 BenchMetrics。
+// 保留为函数而非直接引用切片，是为了让「某类指标不可聚合」时只需改这一处。
+func RollupableMetrics() []Metric {
+	out := make([]Metric, len(BenchMetrics))
+	copy(out, BenchMetrics)
+	return out
+}
+
 // Kind 是指标的数据类型。
 type Kind int
 
@@ -184,6 +252,66 @@ const (
 	GranularityDownsampled Granularity = "downsampled"
 )
 
+// Source 标注一次查询实际从哪张表取数（02 §7 的跨度路由）。
+//
+// 与 Granularity 分工：Granularity 说「是明细还是聚合」，Source 说「数据来自哪张表」。
+type Source string
+
+const (
+	// SourceRawJSON / SourceRawWide 是原始表。
+	SourceRawJSON Source = "raw_json"
+	SourceRawWide Source = "raw_wide"
+	// SourceRollup1m / SourceRollup1h 是预聚合表。
+	SourceRollup1m Source = "rollup_1m"
+	SourceRollup1h Source = "rollup_1h"
+)
+
+// 路由阈值（02 §7）：≤6h 原始；6h–30d 1m；>30d 1h。
+const (
+	// RawMaxSpan 是走原始表的最大跨度。
+	RawMaxSpan = 6 * time.Hour
+	// Rollup1mMaxSpan 是走 1m 表的最大跨度，超过走 1h 表。
+	Rollup1mMaxSpan = 30 * 24 * time.Hour
+)
+
+// RouteSource 按表模型与查询跨度选数据源（纯函数，可确定性单测）。
+//
+// **只对 JSON 方案路由**：宽表的聚合本就达标（B1 实测 Q4 P95 91ms），
+// 且预聚合只从 telemetry 物化，故 PlanWide 恒走原始表。
+func RouteSource(p Plan, span time.Duration) Source {
+	if p == PlanWide {
+		return SourceRawWide
+	}
+	switch {
+	case span <= RawMaxSpan:
+		return SourceRawJSON
+	case span <= Rollup1mMaxSpan:
+		return SourceRollup1m
+	default:
+		return SourceRollup1h
+	}
+}
+
+// RollupOfSource 返回预聚合数据源对应的粒度；原始源返回 false。
+func RollupOfSource(s Source) (Rollup, bool) {
+	switch s {
+	case SourceRollup1m:
+		return Rollup1m, true
+	case SourceRollup1h:
+		return Rollup1h, true
+	default:
+		return "", false
+	}
+}
+
+// SourceOfPlan 返回原始表模型对应的数据源（不通路由，纯粹是「哪张原始表」）。
+func SourceOfPlan(p Plan) Source {
+	if p == PlanWide {
+		return SourceRawWide
+	}
+	return SourceRawJSON
+}
+
 // PolicyError 是查询保护规则拒绝请求时返回的错误。
 //
 // Rule 是机器可判定的规则名（便于上层区分「引导导出」与「参数错误」），
@@ -210,9 +338,12 @@ type SeriesQuery struct {
 // Granularity == raw 时 Points 有效；== downsampled 时 Buckets 有效（恰好其一非 nil）。
 type SeriesResult struct {
 	Granularity Granularity
+	// Source 是本次数据实际来自的表（跨度路由的结果，见 RouteSource）。
+	Source Source
 	// Bucket 是 downsampled 时的有效桶宽；raw 时为 0。
 	Bucket time.Duration
 	// CapHit 表示明细行数超过上限、已自动降采样（调用方可据此引导异步导出）。
+	// 注意：按跨度路由到预聚合表**不算** CapHit（来源由 Source 表达）。
 	CapHit  bool
 	Points  []SeriesPoint
 	Buckets []BucketRow

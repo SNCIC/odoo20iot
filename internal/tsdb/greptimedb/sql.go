@@ -73,6 +73,129 @@ func DropTableSQL(p tsdb.Plan) string {
 	return "DROP TABLE IF EXISTS " + tsdb.TableName(p)
 }
 
+// ---------- 预聚合（02 §7） ----------
+
+// CreateRollupTableSQL 返回预聚合表的建表语句。
+//
+// 与原始表的三处关键差异（均由 capability_test.go 探针实测确认）：
+//   - **不设 `append_mode`**：非 append 表按 (PRIMARY KEY, TIME INDEX) 合并，
+//     同键重写=覆盖 —— 这是 rollup 幂等（重跑不重复）的**唯一依据**（探针 P-b）；
+//   - 列名 `metric`/`sum`/`max`/`count` 一律双引号：`metric` 是保留字，
+//     不引号会直接 `Cannot use keyword 'metric' as column name`（探针 P-e）；
+//   - 长表结构（每桶每设备每指标一行），故物模型加指标**不需要 DDL**。
+func CreateRollupTableSQL(r tsdb.Rollup) (string, error) {
+	var ttl time.Duration
+	switch r {
+	case tsdb.Rollup1m:
+		ttl = tsdb.Rollup1mTTL
+	case tsdb.Rollup1h:
+		ttl = tsdb.Rollup1hTTL
+	default:
+		return "", fmt.Errorf("未知的预聚合粒度 %q", r)
+	}
+
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+  ts              TIMESTAMP TIME INDEX,
+  project_id      BIGINT,
+  device_id       BIGINT,
+  device_type_id  BIGINT,
+  "metric"        STRING,
+  "sum"           DOUBLE,
+  "max"           DOUBLE,
+  "count"         BIGINT,
+  PRIMARY KEY (project_id, device_id, "metric")
+) WITH ('ttl' = '%dd')`, tsdb.RollupTableName(r), int(ttl.Hours()/24)), nil
+}
+
+// DropRollupTableSQL 返回删除预聚合表的语句。
+func DropRollupTableSQL(r tsdb.Rollup) string {
+	return "DROP TABLE IF EXISTS " + tsdb.RollupTableName(r)
+}
+
+// rollupInsertSQL 生成「单指标 × 单窗口」的 INSERT…SELECT。
+//
+// 窗口是**半开** [start, end)，由 $1/$2 绑定（探针 P-a 实测 INSERT…SELECT 接受绑定参数），
+// 因此相邻窗口天然平铺、不重不漏。metric 先过物模型白名单再内联为字面量（无注入面）。
+func rollupInsertSQL(r tsdb.Rollup, metricKey string) (string, error) {
+	expr, err := rollupValueExpr(metricKey)
+	if err != nil {
+		return "", err
+	}
+	width, err := tsdb.RollupWidth(r)
+	if err != nil {
+		return "", err
+	}
+	secs := int64(width / time.Second)
+	if secs <= 0 {
+		return "", fmt.Errorf("预聚合窗口必须 ≥ 1s，得到 %s", width)
+	}
+
+	return fmt.Sprintf(`INSERT INTO %s
+SELECT date_bin(INTERVAL '%d seconds', ts) AS ts, project_id, device_id, device_type_id, '%s',
+       SUM(%s), MAX(%s), COUNT(%s)
+FROM %s
+WHERE ts >= $1 AND ts < $2
+GROUP BY date_bin(INTERVAL '%d seconds', ts), project_id, device_id, device_type_id`,
+		tsdb.RollupTableName(r), secs, metricKey, expr, expr, expr, tsdb.PlanJSONTable, secs), nil
+}
+
+// rollupValueExpr 返回预聚合使用的**数值**取值表达式。
+//
+// 布尔指标也走数值形式（探针 P-c 实测 json_get 对 JSON 布尔返回 1/0）：
+// 这样 SUM/COUNT 得到「真值占比」、MAX 得到「是否出现过真」，与数值指标同一套语义。
+// 注意与 valueExpr 的区别 —— 后者对布尔返回 `<> 0.0`（布尔），不能直接喂给 SUM。
+func rollupValueExpr(key string) (string, error) {
+	m, ok := tsdb.LookupMetric(key)
+	if !ok {
+		return "", fmt.Errorf("指标 %q 不在物模型白名单内", key)
+	}
+	return fmt.Sprintf(`json_get("metrics", '%s', 0.0)`, m.Key), nil
+}
+
+// bucketSQLFor 按数据源构造分桶聚合查询（02 §7 路由的落点）。
+func bucketSQLFor(source tsdb.Source, q tsdb.BucketQuery) (string, error) {
+	switch source {
+	case tsdb.SourceRawJSON:
+		return bucketSQL(tsdb.PlanJSON, q)
+	case tsdb.SourceRawWide:
+		return bucketSQL(tsdb.PlanWide, q)
+	case tsdb.SourceRollup1m:
+		return rollupBucketSQL(tsdb.Rollup1m, q)
+	case tsdb.SourceRollup1h:
+		return rollupBucketSQL(tsdb.Rollup1h, q)
+	default:
+		return "", fmt.Errorf("未知的数据源 %q", source)
+	}
+}
+
+// rollupBucketSQL 构造预聚合表上的再聚合查询。
+//
+// 关键点：预聚合存的是 sum/max/count，**不是** avg。粗桶要么直接取（1m 桶对 1m 表），
+// 要么把细桶再聚合 —— 而「avg 再平均」是错的，必须 `SUM(sum)/SUM(count)` 才能保证
+// 与直接在原始数据上聚合逐桶相等（capability 探针 P-f 确认 NULLIF 可用）。
+// 同样**刻意不加 LIMIT**：行预算由调用方的桶宽数学保证。
+func rollupBucketSQL(r tsdb.Rollup, q tsdb.BucketQuery) (string, error) {
+	if _, ok := tsdb.LookupMetric(q.Metric); !ok {
+		return "", fmt.Errorf("指标 %q 不在物模型白名单内", q.Metric)
+	}
+	secs := int64(q.Bucket / time.Second)
+	if secs <= 0 {
+		return "", fmt.Errorf("分桶间隔必须 ≥ 1s，得到 %s", q.Bucket)
+	}
+
+	where := fmt.Sprintf(`project_id = $1 AND device_id IN (%s) AND ts > $2 AND "metric" = '%s'`,
+		int64List(q.DeviceIDs), q.Metric)
+	if !q.Until.IsZero() {
+		where += " AND ts <= $3"
+	}
+
+	return fmt.Sprintf(
+		`SELECT date_bin(INTERVAL '%d seconds', ts) AS bucket, device_id, `+
+			`SUM("sum") / NULLIF(SUM("count"), 0), MAX("max"), SUM("count") `+
+			`FROM %s WHERE %s GROUP BY bucket, device_id ORDER BY bucket, device_id`,
+		secs, tsdb.RollupTableName(r), where), nil
+}
+
 func wideColumnType(m tsdb.Metric) (string, error) {
 	switch m.Kind {
 	case tsdb.KindNumber:

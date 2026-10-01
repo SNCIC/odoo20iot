@@ -425,7 +425,7 @@ make b1-bench        # → cmd/tsdb-bench，报告写到 tmp/b1-report.md
 | 2 | 数据规模 | 本次 112 万行；生产 30 天热数据 ~2.4 TB（差 2 个数量级）。长跨度查询延迟会随数据量上升 |
 | 3 | 并发查询 | 本次串行采样。§4.3 要求单租户并发上限 20，需补测并发下的相互影响 |
 | 4 | 真实取值分布下的存储占用 | 见 ③，需按租户样本重测 |
-| 5 | 预聚合表生效后的 Q4 | 本报告未建预聚合表；这是把 A 的 Q4 拉回预算内的**指定解法**，需在 Phase 1 落地后复测 |
+| 5 | ~~预聚合表生效后的 Q4~~ | ✅ **已复测**（2026-10-01）：Q4 形态 P95 **432.7ms → 67.2ms**，详见 [`docs/reports/b1-rollup.md`](./reports/b1-rollup.md) 与 §4.3.2 |
 
 **决策**
 
@@ -554,7 +554,24 @@ VALUES
 | 1 | 并发查询 | 本节为串行采样，§4.3 要求单租户并发上限 20，需补测并发相互影响 |
 | 2 | 多指标投影（≤4） | 当前 `SeriesQuery` 为单指标；`MaxProjectedMetrics=4` 仅为契约常量，多指标端点属后续批次 |
 | 3 | 大窗口实际延迟（如 50 设备 × 90d） | 目前只有桶数学上界（返回 ≤5000 行），未实测 |
-| 4 | 预聚合表路由 | 与本节正交：限行治「明细形态」，预聚合治「多设备 × 长跨度聚合」 |
+| 4 | 预聚合表路由 | 已落地并复测，见 §4.3.2 |
+
+#### 4.3.2 预聚合路由（Phase 1，2026-10-01 · **已落地**）
+
+**一句话**：`QuerySeries` 现按跨度自动选源（`≤6h` 原始 / `6h–30d` 1m / `>30d` 1h）；Q4 形态
+（10 设备 × 24h 窗口，5min 桶）P95 从 **432.7ms**（原始路径）降到 **67.2ms**（1m 预聚合），
+返回同样的 **730 行**，落回 P95<200ms 预算内。
+
+| 项 | 落地 |
+|---|---|
+| 选源 | `tsdb.RouteSource(plan, span)`（纯函数）；**只对 JSON 方案路由**，宽表恒走原始表（聚合已达标） |
+| 结果标注 | `SeriesResult.Source`（`raw_json`/`raw_wide`/`rollup_1m`/`rollup_1h`）；`CapHit` 仍**专指**「明细超 5000」，跨度路由不算 |
+| 桶宽 | 输出桶宽 = `max(AdaptiveBucket(span, devices, 5000), 源粒度)` —— 不得比源更细（1m 表上问不出 1s 曲线） |
+| 明细点查询 | `rangeSQL` 永不指向预聚合表（聚合表没有逐点取值） |
+| 再聚合 | `avg = SUM("sum")/NULLIF(SUM("count"),0)`、`max = MAX("max")`、`count = SUM("count")`，带 `"metric"='<k>'` 过滤 |
+
+物化侧结构见 §7；原始报告 [`docs/reports/b1-rollup.md`](./reports/b1-rollup.md)（含开工探针 P-a…P-f、
+守恒与幂等实测、未验证项）。
 
 ---
 
@@ -673,7 +690,26 @@ resolved   → idle
 
 | 阶段 | 方案 | 说明 |
 |---|---|---|
-| 一期 | **定时聚合任务**：`svc-pipeline` 每 1 min / 1 h 执行 `INSERT INTO telemetry_1m SELECT ... date_bin(...) GROUP BY`，幂等写入预聚合表 | 实现简单、可控、可回放；任务失败可补跑 |
+| 一期 ✅ **已落地** | **定时聚合任务 `cmd/svc-rollup`**：**增量**物化 —— 每轮只处理水位之后**新闭合**的窗口（1m / 1h），执行 `INSERT INTO telemetry_1m SELECT ... date_bin(...) GROUP BY` | 水位落 PG `t_rollup_watermark`（**只在写入成功后推进**）；预聚合表**不设 `append_mode`**，同键重写即覆盖 ⇒ 幂等由表结构保证（实测见 [`docs/reports/b1-rollup.md`](./reports/b1-rollup.md) §3） |
 | 二期 | 评估 GreptimeDB 的流式/持续聚合能力（Flow 引擎） | 需先验证其稳定性与运维复杂度，**不作为一期依赖** |
 
-**查询路由**：查询规划器按时间跨度选择数据源 —— `≤ 6h` 走原始表，`6h–30d` 走 1m 表，`> 30d` 走 1h 表；三张表 schema 对齐，业务侧无感。
+**预聚合表结构**（长表，物模型加指标**零 DDL**）：
+
+```sql
+-- 1m / 1h 同构；刻意不设 append_mode（靠库内覆盖实现幂等）
+CREATE TABLE IF NOT EXISTS telemetry_1m (
+  ts TIMESTAMP TIME INDEX, project_id BIGINT, device_id BIGINT, device_type_id BIGINT,
+  "metric" STRING, "sum" DOUBLE, "max" DOUBLE, "count" BIGINT,
+  PRIMARY KEY (project_id, device_id, "metric")
+) WITH ('ttl' = '35d');   -- 1h 用 '365d'
+```
+
+> **为什么存 `sum/max/count` 而不是 `avg`**：粗桶由细桶再聚合时「对 avg 再平均」是错的，
+> 只有 `SUM(sum)/SUM(count)` 才与直接在原始数据上聚合逐桶相等（守恒测试钉住这一点）。
+> `metric`/`sum`/`max`/`count` 是保留字或易冲突，SQL 中一律加双引号。
+
+**查询路由**：查询规划器（`internal/tsdb.RouteSource`）按时间跨度选择数据源 —— `≤ 6h` 走原始表，
+`6h–30d` 走 1m 表，`> 30d` 走 1h 表；**仅 JSON 方案路由**（宽表聚合已达标，恒走原始表）。
+预聚合表与原始表**列结构不同**（前者是聚合值、后者是 JSON），差异全部封在适配层，业务侧无感。
+跨桶再聚合公式：`avg = SUM("sum") / NULLIF(SUM("count"), 0)`、`max = MAX("max")`、`count = SUM("count")`。
+

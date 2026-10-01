@@ -163,3 +163,77 @@ func TestSeriesQueryNormalize_ExplicitWindowKept(t *testing.T) {
 		t.Errorf("Until 应补为 now，得到 %s", got.Until)
 	}
 }
+
+// TestRouteSource 锁定跨度路由的边界语义（02 §7）。
+func TestRouteSource(t *testing.T) {
+	cases := []struct {
+		name string
+		plan Plan
+		span time.Duration
+		want Source
+	}{
+		{"JSON 单设备 1h", PlanJSON, time.Hour, SourceRawJSON},
+		{"JSON 恰好 6h 仍走原始", PlanJSON, RawMaxSpan, SourceRawJSON},
+		{"JSON 6h+1ns 切 1m", PlanJSON, RawMaxSpan + time.Nanosecond, SourceRollup1m},
+		{"JSON 恰好 30d 仍走 1m", PlanJSON, Rollup1mMaxSpan, SourceRollup1m},
+		{"JSON 30d+1ns 切 1h", PlanJSON, Rollup1mMaxSpan + time.Nanosecond, SourceRollup1h},
+		{"JSON 90d 走 1h", PlanJSON, MaxLookback, SourceRollup1h},
+		{"宽表 1h 走原始", PlanWide, time.Hour, SourceRawWide},
+		{"宽表 90d 仍走原始（不路由）", PlanWide, MaxLookback, SourceRawWide},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := RouteSource(c.plan, c.span); got != c.want {
+				t.Fatalf("期望 %q，得到 %q", c.want, got)
+			}
+		})
+	}
+}
+
+// TestRollupMeta 校验预聚合粒度的表名/宽度/解析。
+func TestRollupMeta(t *testing.T) {
+	if got := RollupTableName(Rollup1m); got != "telemetry_1m" {
+		t.Errorf("1m 表名期望 telemetry_1m，得到 %q", got)
+	}
+	if got := RollupTableName(Rollup1h); got != "telemetry_1h" {
+		t.Errorf("1h 表名期望 telemetry_1h，得到 %q", got)
+	}
+
+	w1m, err := RollupWidth(Rollup1m)
+	if err != nil || w1m != time.Minute {
+		t.Fatalf("1m 宽度期望 1m，得到 %s（err=%v）", w1m, err)
+	}
+	w1h, err := RollupWidth(Rollup1h)
+	if err != nil || w1h != time.Hour {
+		t.Fatalf("1h 宽度期望 1h，得到 %s（err=%v）", w1h, err)
+	}
+
+	if got, err := ParseRollup("1m"); err != nil || got != Rollup1m {
+		t.Fatalf("解析 1m 失败: %q %v", got, err)
+	}
+	if _, err := ParseRollup("5m"); err == nil {
+		t.Fatal("未知粒度必须报错")
+	}
+
+	if got := Rollups(); len(got) != 2 || got[0] != Rollup1m || got[1] != Rollup1h {
+		t.Fatalf("Rollups 顺序/内容不符: %v", got)
+	}
+}
+
+// TestRollupableMetrics 校验可聚合指标集合（P-c 实测布尔可聚合，故含全部指标）。
+func TestRollupableMetrics(t *testing.T) {
+	got := RollupableMetrics()
+	if len(got) != len(BenchMetrics) {
+		t.Fatalf("期望 %d 个可聚合指标，得到 %d", len(BenchMetrics), len(got))
+	}
+	for i, m := range BenchMetrics {
+		if got[i] != m {
+			t.Errorf("第 %d 个指标期望 %+v，得到 %+v", i, m, got[i])
+		}
+	}
+	// 返回值必须是副本（调用方改它不能污染 BenchMetrics）。
+	got[0].Key = "mutated"
+	if BenchMetrics[0].Key == "mutated" {
+		t.Fatal("RollupableMetrics 必须返回副本，不能泄漏内部切片")
+	}
+}

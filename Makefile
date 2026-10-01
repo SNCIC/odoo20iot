@@ -9,6 +9,7 @@ PROJECT_DIR ?= /home/xfusion/projects/odoo20iot
 GO_RUN      ?= docker exec -u $(DEVBOX_USER) $(DEVBOX) bash -lc
 NATS_URL    ?= nats://100.64.0.3:28222
 GREPTIME_DSN ?= postgres://greptime:greptime@100.64.0.3:28403/public
+IOT_PG_DSN   ?= postgres://iot:iot_dev_only_change_me@100.64.0.3:28543/odoo20iot
 
 COMPOSE_DIR := deploy/compose
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -58,6 +59,16 @@ test-nats: ## A2 真实总线验证（要求 NATS 可达；`go test ./...` 默�
 test-tsdb: ## B1 补充项（1）· 明细限行真实库验证（要求 GreptimeDB 可达；⚠️ 会 drop/重建 telemetry）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_GREPTIMEDB_DSN=$(GREPTIME_DSN) IOT_PERF_ASSERT=1 \
 	  go test ./internal/tsdb/greptimedb -run TestQuerySeries -count=1 -v'
+
+.PHONY: test-rollup
+test-rollup: ## B1 补充项（2）· 预聚合真实库验证（⚠️ 会 drop/重建 telemetry 与 telemetry_1m）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_GREPTIMEDB_DSN=$(GREPTIME_DSN) IOT_PERF_ASSERT=1 \
+	  go test ./internal/tsdb/greptimedb -run TestRollup -count=1 -v'
+
+.PHONY: test-rollup-pg
+test-rollup-pg: ## 预聚合水位账本的真实 PG 验证（会建临时库）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_PG_DSN=$(IOT_PG_DSN) \
+	  go test ./internal/rollup -run TestPGStore -count=1 -v'
 
 .PHONY: b1-bench
 b1-bench: ## Phase 0 · B1 时序表模型压测（需要 GreptimeDB 可达，约 3 分钟）

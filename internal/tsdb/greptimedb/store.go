@@ -98,6 +98,50 @@ func (s *Store) DropTable(ctx context.Context, p tsdb.Plan) error {
 	return nil
 }
 
+// EnsureRollupTable 幂等建预聚合表（02 §7）。
+func (s *Store) EnsureRollupTable(ctx context.Context, r tsdb.Rollup) error {
+	ddl, err := CreateRollupTableSQL(r)
+	if err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+		return fmt.Errorf("建预聚合表 %s: %w", tsdb.RollupTableName(r), err)
+	}
+	return nil
+}
+
+// DropRollupTable 删预聚合表（测试/重建用）。
+func (s *Store) DropRollupTable(ctx context.Context, r tsdb.Rollup) error {
+	if _, err := s.pool.Exec(ctx, DropRollupTableSQL(r)); err != nil {
+		return fmt.Errorf("删预聚合表 %s: %w", tsdb.RollupTableName(r), err)
+	}
+	return nil
+}
+
+// RollupWindow 物化一个半开窗口 [start, end)：对每个可聚合指标执行一条 INSERT…SELECT。
+//
+// 幂等性由**表结构**保证：预聚合表不设 append_mode，同 (project_id, device_id, metric, ts)
+// 重写即覆盖（capability_test.go · 探针 P-b 实测），因此「写成功但水位没推进」的重放是安全的。
+// 返回实际执行的 INSERT 条数（GreptimeDB 不回传受影响行数，故不谎报「写入行数」）。
+func (s *Store) RollupWindow(ctx context.Context, r tsdb.Rollup, start, end time.Time) (int, error) {
+	if !start.Before(end) {
+		return 0, fmt.Errorf("预聚合窗口必须 start < end，得到 [%s, %s)", start, end)
+	}
+
+	metrics := tsdb.RollupableMetrics()
+	for _, m := range metrics {
+		sqlText, err := rollupInsertSQL(r, m.Key)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := s.pool.Exec(ctx, sqlText, start.UTC(), end.UTC()); err != nil {
+			return 0, fmt.Errorf("物化 %s 窗口 [%s, %s) 指标 %s: %w",
+				tsdb.RollupTableName(r), start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), m.Key, err)
+		}
+	}
+	return len(metrics), nil
+}
+
 // JSONEncoding 是 JSON 列的写入编码方式。
 //
 // GreptimeDB 1.2.1 在扩展协议下把 JSON 列声明为 bytea，**普通字符串参数会被拒绝**
@@ -289,13 +333,16 @@ func (s *Store) SelectRangeUnprotected(ctx context.Context, p tsdb.Plan, q tsdb.
 
 // SelectBucketsUnprotected 执行**未经保护**的分桶聚合查询（仅压测 / 诊断）。
 func (s *Store) SelectBucketsUnprotected(ctx context.Context, p tsdb.Plan, q tsdb.BucketQuery) ([]tsdb.BucketRow, error) {
-	return s.selectBuckets(ctx, p, q)
+	return s.selectBuckets(ctx, tsdb.SourceOfPlan(p), q)
 }
 
-// QuerySeries 是受保护的曲线查询入口（02 §4.3.1）。
+// QuerySeries 是受保护的曲线查询入口（02 §4.3.1 + §7 跨度路由）。
 //
-// 流程：Normalize 校验 → 廉价探测（只取常量、不解析指标、不排序，超限时尽早终止）
-// → 未超限返回原始明细；超限按自适应桶宽降采样后返回（**绝不静默截断**）。
+// 流程：Normalize 校验 → RouteSource 选源 ——
+//   - **原始源**（≤6h，或宽表）：廉价探测（只取常量、不解析指标、不排序，超限时尽早终止）
+//     → 未超限返回原始明细；超限按自适应桶宽降采样（**绝不静默截断**）。
+//   - **预聚合源**（6h–30d 走 1m，>30d 走 1h）：跳过原始探测（扫原始正是要避开的成本），
+//     直接对预聚合表再聚合，输出桶宽不小于源粒度。
 //
 // 探测刻意不取指标值：实测（1.12M 行表、10 设备 × 1h）「值+ORDER BY」探测 P95 96ms，
 // 而常量探测 P95 20ms —— 探测的职责只是「超没超」，取数和排序是下一步的事。
@@ -305,6 +352,16 @@ func (s *Store) QuerySeries(ctx context.Context, p tsdb.Plan, q tsdb.SeriesQuery
 		return tsdb.SeriesResult{}, err
 	}
 
+	span := nq.Until.Sub(nq.Since)
+	source := tsdb.RouteSource(p, span)
+	if r, ok := tsdb.RollupOfSource(source); ok {
+		return s.querySeriesRollup(ctx, r, source, nq, span)
+	}
+	return s.querySeriesRaw(ctx, p, source, nq)
+}
+
+// querySeriesRaw 在原始表上执行受保护查询。
+func (s *Store) querySeriesRaw(ctx context.Context, p tsdb.Plan, source tsdb.Source, nq tsdb.SeriesQuery) (tsdb.SeriesResult, error) {
 	rq := tsdb.RangeQuery{
 		ProjectID: nq.ProjectID,
 		DeviceIDs: nq.DeviceIDs,
@@ -325,7 +382,7 @@ func (s *Store) QuerySeries(ctx context.Context, p tsdb.Plan, q tsdb.SeriesQuery
 		// 探测与取数之间可能有并发写入（append_mode 允许），取数仍超限就落到降采样，
 		// 保证返回行数上限不被突破。
 		if len(pts) <= nq.Limit {
-			return tsdb.SeriesResult{Granularity: tsdb.GranularityRaw, Points: pts}, nil
+			return tsdb.SeriesResult{Granularity: tsdb.GranularityRaw, Source: source, Points: pts}, nil
 		}
 	}
 
@@ -333,7 +390,7 @@ func (s *Store) QuerySeries(ctx context.Context, p tsdb.Plan, q tsdb.SeriesQuery
 	if err != nil {
 		return tsdb.SeriesResult{}, err
 	}
-	rows, err := s.selectBuckets(ctx, p, tsdb.BucketQuery{
+	rows, err := s.selectBuckets(ctx, source, tsdb.BucketQuery{
 		ProjectID: nq.ProjectID,
 		DeviceIDs: nq.DeviceIDs,
 		Since:     nq.Since,
@@ -352,8 +409,54 @@ func (s *Store) QuerySeries(ctx context.Context, p tsdb.Plan, q tsdb.SeriesQuery
 	}
 	return tsdb.SeriesResult{
 		Granularity: tsdb.GranularityDownsampled,
+		Source:      source,
 		Bucket:      bucket,
 		CapHit:      true,
+		Buckets:     rows,
+	}, nil
+}
+
+// querySeriesRollup 在预聚合表上执行受保护查询。
+//
+// `CapHit` 保持 false：按跨度路由到预聚合表**不是**「明细超上限」，
+// 来源由 `Source` 表达（见 SeriesResult 的注释）。
+func (s *Store) querySeriesRollup(
+	ctx context.Context, r tsdb.Rollup, source tsdb.Source, nq tsdb.SeriesQuery, span time.Duration,
+) (tsdb.SeriesResult, error) {
+	width, err := tsdb.RollupWidth(r)
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+
+	bucket, err := tsdb.AdaptiveBucket(span, len(nq.DeviceIDs), nq.Limit)
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+	// 输出粒度不得比源更细：1m 表上问不出 1s 的曲线。
+	if bucket < width {
+		bucket = width
+	}
+
+	rows, err := s.selectBuckets(ctx, source, tsdb.BucketQuery{
+		ProjectID: nq.ProjectID,
+		DeviceIDs: nq.DeviceIDs,
+		Since:     nq.Since,
+		Until:     nq.Until,
+		Bucket:    bucket,
+		Metric:    nq.Metric,
+	})
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+	if len(rows) > nq.Limit {
+		return tsdb.SeriesResult{}, fmt.Errorf(
+			"预聚合查询返回 %d 行超过上限 %d（桶宽 %s，设备 %d 台）",
+			len(rows), nq.Limit, bucket, len(nq.DeviceIDs))
+	}
+	return tsdb.SeriesResult{
+		Granularity: tsdb.GranularityDownsampled,
+		Source:      source,
+		Bucket:      bucket,
 		Buckets:     rows,
 	}, nil
 }
@@ -427,9 +530,9 @@ func (s *Store) selectRange(ctx context.Context, p tsdb.Plan, q tsdb.RangeQuery,
 	return out, rows.Err()
 }
 
-// selectBuckets 是分桶聚合查询的非导出核心。
-func (s *Store) selectBuckets(ctx context.Context, p tsdb.Plan, q tsdb.BucketQuery) ([]tsdb.BucketRow, error) {
-	sqlText, err := bucketSQL(p, q)
+// selectBuckets 是分桶聚合查询的非导出核心，按数据源构造 SQL（原始表或预聚合表）。
+func (s *Store) selectBuckets(ctx context.Context, source tsdb.Source, q tsdb.BucketQuery) ([]tsdb.BucketRow, error) {
+	sqlText, err := bucketSQLFor(source, q)
 	if err != nil {
 		return nil, err
 	}

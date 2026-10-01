@@ -190,6 +190,119 @@ func TestRangeSQLContent(t *testing.T) {
 	})
 }
 
+// TestCreateRollupTableSQL 锁定预聚合表 DDL 的三个实测细节：
+// **无 `append_mode`**（幂等靠库内覆盖，探针 P-b）、保留字列名加引号（P-e）、TTL 分级。
+func TestCreateRollupTableSQL(t *testing.T) {
+	ddl, err := CreateRollupTableSQL(tsdb.Rollup1m)
+	if err != nil {
+		t.Fatalf("构造 1m DDL 失败: %v", err)
+	}
+	for _, want := range []string{
+		"telemetry_1m", "TIME INDEX", `"metric"`, `"sum"`, `"max"`, `"count"`,
+		`PRIMARY KEY (project_id, device_id, "metric")`, "'ttl' = '35d'",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("1m DDL 缺少 %q:\n%s", want, ddl)
+		}
+	}
+	if strings.Contains(ddl, "append_mode") {
+		t.Errorf("预聚合表**不得**设 append_mode（会使重跑追加而非覆盖）:\n%s", ddl)
+	}
+
+	ddl1h, err := CreateRollupTableSQL(tsdb.Rollup1h)
+	if err != nil {
+		t.Fatalf("构造 1h DDL 失败: %v", err)
+	}
+	if !strings.Contains(ddl1h, "telemetry_1h") || !strings.Contains(ddl1h, "'ttl' = '365d'") {
+		t.Errorf("1h DDL 表名/TTL 不符:\n%s", ddl1h)
+	}
+
+	if _, err := CreateRollupTableSQL("5m"); err == nil {
+		t.Fatal("未知粒度必须报错")
+	}
+}
+
+// TestRollupInsertSQL 锁定 INSERT…SELECT 的形状：半开窗口绑定、单指标、SUM/MAX/COUNT。
+func TestRollupInsertSQL(t *testing.T) {
+	sql, err := rollupInsertSQL(tsdb.Rollup1m, "temperature")
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	for _, want := range []string{
+		"INSERT INTO telemetry_1m", "date_bin(INTERVAL '60 seconds', ts)",
+		"'temperature'", `json_get("metrics", 'temperature', 0.0)`, "SUM(", "MAX(", "COUNT(",
+		"ts >= $1 AND ts < $2", "GROUP BY date_bin(INTERVAL '60 seconds', ts), project_id, device_id, device_type_id",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("缺少 %q:\n%s", want, sql)
+		}
+	}
+
+	sql1h, err := rollupInsertSQL(tsdb.Rollup1h, "humidity")
+	if err != nil {
+		t.Fatalf("构造 1h 失败: %v", err)
+	}
+	if !strings.Contains(sql1h, "telemetry_1h") || !strings.Contains(sql1h, "'3600 seconds'") {
+		t.Errorf("1h INSERT 表名/窗口不符:\n%s", sql1h)
+	}
+
+	if _, err := rollupInsertSQL(tsdb.Rollup1m, "not_a_metric"); err == nil {
+		t.Fatal("白名单外指标必须被拒绝")
+	}
+}
+
+// TestBucketSQLForRollupSource 锁定预聚合源的再聚合公式：
+// avg 必须是 SUM(sum)/SUM(count)（而非对 avg 再平均），并带 metric 过滤、不加 LIMIT。
+func TestBucketSQLForRollupSource(t *testing.T) {
+	sql, err := bucketSQLFor(tsdb.SourceRollup1m, tsdb.BucketQuery{
+		ProjectID: 1, DeviceIDs: []int64{2}, Metric: "temperature", Bucket: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	for _, want := range []string{
+		"telemetry_1m", `SUM("sum") / NULLIF(SUM("count"), 0)`, `MAX("max")`, `SUM("count")`,
+		`"metric" = 'temperature'`, "GROUP BY bucket, device_id",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("缺少 %q:\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "LIMIT") {
+		t.Errorf("再聚合查询不得加 LIMIT:\n%s", sql)
+	}
+	if strings.Contains(sql, "json_get") {
+		t.Errorf("预聚合源不应再解析 JSON:\n%s", sql)
+	}
+
+	// Until 存在时多一个上界占位符。
+	sqlUntil, err := bucketSQLFor(tsdb.SourceRollup1h, tsdb.BucketQuery{
+		ProjectID: 1, DeviceIDs: []int64{2}, Metric: "temperature", Bucket: time.Hour,
+		Until: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	if !strings.Contains(sqlUntil, "telemetry_1h") || !strings.Contains(sqlUntil, "ts <= $3") {
+		t.Errorf("1h + Until 不符:\n%s", sqlUntil)
+	}
+
+	if _, err := bucketSQLFor(tsdb.SourceRollup1m, tsdb.BucketQuery{Metric: "not_a_metric", Bucket: time.Minute}); err == nil {
+		t.Fatal("白名单外指标必须被拒绝")
+	}
+
+	// raw 源应委托给原 bucketSQL（JSON 走 json_get）。
+	raw, err := bucketSQLFor(tsdb.SourceRawJSON, tsdb.BucketQuery{
+		ProjectID: 1, DeviceIDs: []int64{2}, Metric: "temperature", Bucket: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("构造 raw 失败: %v", err)
+	}
+	if !strings.Contains(raw, "telemetry") || !strings.Contains(raw, "json_get") {
+		t.Errorf("raw 源应走原始表 + json_get:\n%s", raw)
+	}
+}
+
 // TestProbeSQLContent 锁定廉价探测查询：
 // **只取常量 1、不出现指标表达式、不排序**（这三点正是它比取数查询快的全部原因）。
 func TestProbeSQLContent(t *testing.T) {
