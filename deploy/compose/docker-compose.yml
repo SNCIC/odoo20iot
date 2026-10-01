@@ -40,7 +40,10 @@ services:
     ports:
       - "100.64.0.3:28543:5432"
     volumes:
-      - pg-data:/var/lib/postgresql/data
+      # PostgreSQL 18+ 官方镜像改变了数据目录约定：
+      #   PGDATA=/var/lib/postgresql/18/docker，挂载点必须是 /var/lib/postgresql。
+      # 若仍挂到 /var/lib/postgresql/data，镜像会判定为「未使用的挂载」并拒绝启动（无限重启）。
+      - pg-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U iot -d odoo20iot"]
       interval: 10s
@@ -95,11 +98,22 @@ services:
     image: greptime/greptimedb:latest
     container_name: iot-greptimedb
     restart: unless-stopped
+    # GreptimeDB standalone 默认只绑定 127.0.0.1，容器内必须显式绑 0.0.0.0，
+    # 否则 Docker 端口发布不可达。注意迷惑性：容器自带健康检查走 loopback 仍然通过，
+    # 表现为「容器 healthy 但外部连不上」。以下是本次实测踩到的坑。
     command:
       - standalone
       - start
       - --data-home
       - /data
+      - --http-addr
+      - 0.0.0.0:4000
+      - --rpc-addr
+      - 0.0.0.0:4001
+      - --mysql-addr
+      - 0.0.0.0:4002
+      - --postgres-addr
+      - 0.0.0.0:4003
     ports:
       - "100.64.0.3:28400:4000"   # HTTP API
       - "100.64.0.3:28401:4001"   # gRPC
