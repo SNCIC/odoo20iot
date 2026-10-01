@@ -87,7 +87,10 @@ func main() {
 	}
 	defer func() { _ = pub.Close() }()
 
-	if err := pub.EnsureStream(strings.Split(*natsSubjects, ","), 1); err != nil {
+	if err := pub.EnsureStream(gateway.StreamSpec{
+		Subjects: strings.Split(*natsSubjects, ","),
+		Replicas: 1,
+	}); err != nil {
 		logger.Fatal("确保遥测 Stream 存在失败", zap.Error(err))
 	}
 
@@ -127,7 +130,10 @@ func main() {
 	if err != nil {
 		logger.Fatal("连接计量上报通道失败", zap.Error(err))
 	}
-	if err := quotaPub.EnsureStream([]string{"iot.quota.>"}, 1); err != nil {
+	if err := quotaPub.EnsureStream(gateway.StreamSpec{
+		Subjects: []string{"iot.quota.>"},
+		Replicas: 1,
+	}); err != nil {
 		logger.Fatal("确保计量 Stream 存在失败", zap.Error(err))
 	}
 	meterReporter, err := metering.NewReporter(metering.ReporterOptions{

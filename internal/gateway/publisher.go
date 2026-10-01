@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -71,31 +72,128 @@ func NewNATSPublisher(url, stream string, opts ...nats.Option) (*NATSPublisher, 
 	return &NATSPublisher{nc: nc, js: js, stream: stream}, nil
 }
 
-// EnsureStream 幂等地保证目标 Stream 存在。
+// 03 §4.2 的遥测 Stream 口径。
+const (
+	// DefaultStreamMaxAge 是事件在 Stream 里的保留时长。
+	DefaultStreamMaxAge = 24 * time.Hour
+	// DefaultStreamMaxMsgsPerSubject 是单 subject 的消息上限（防洪）。
+	DefaultStreamMaxMsgsPerSubject = 1000
+)
+
+// StreamSpec 描述要保证的 Stream 配置。
 //
-// 遥测 Stream 的副本数按租户 RPO 要求设定（§4.4：要求 RPO=0 的租户用 Replicas=3）。
-// 本方法只负责 Phase 0 的可用性，正式的分档配置属于部署期职责。
-func (p *NATSPublisher) EnsureStream(subjects []string, replicas int) error {
-	_, err := p.js.StreamInfo(p.stream)
+// 用结构体而非位置参数：这些字段会随 03 §4.2 的细则增加，位置参数每加一个
+// 就要改一遍全部调用点，也容易把副本数与条数这类同为整型的参数写反。
+type StreamSpec struct {
+	// Subjects 是该 Stream 捕获的 subject（可含通配）。
+	Subjects []string
+	// Replicas 是副本数（§4.4：要求 RPO=0 的租户用 3）。<=0 取 1。
+	Replicas int
+	// MaxAge 是消息保留时长。<=0 取 DefaultStreamMaxAge。
+	MaxAge time.Duration
+	// MaxMsgsPerSubject 是单 subject 的消息上限（防洪）。<=0 取 DefaultStreamMaxMsgsPerSubject。
+	MaxMsgsPerSubject int64
+}
+
+// EnsureStream 幂等地保证目标 Stream 存在，且保留口径与 03 §4.2 一致。
+//
+// ⚠️ 它会对**已存在**的 Stream 做校正。早期实现只在「不存在」时创建，
+// 于是先于本口径建出来的流会一直是**无限保留**（`MaxAge=0`）—— 磁盘随写入
+// 无上限增长，且是「重启即重放」的放大器（保留窗口越长，一次误删消费者的
+// 代价越大，见 §6 坑 42）。校正成更短的 MaxAge 会**立即清掉超期消息**，
+// 这是设计意图（保留窗口就是 24h），但属破坏性动作，故显式记一条日志。
+//
+// 不动既存 Stream 的副本数：副本数是部署期按租户 RPO 决定的，不是本函数的职责。
+func (p *NATSPublisher) EnsureStream(spec StreamSpec) error {
+	if spec.MaxAge <= 0 {
+		spec.MaxAge = DefaultStreamMaxAge
+	}
+	if spec.MaxMsgsPerSubject <= 0 {
+		spec.MaxMsgsPerSubject = DefaultStreamMaxMsgsPerSubject
+	}
+	replicas := spec.Replicas
+	if replicas <= 0 {
+		replicas = 1
+	}
+
+	want := nats.StreamConfig{
+		Name:              p.stream,
+		Subjects:          spec.Subjects,
+		Replicas:          replicas,
+		Storage:           nats.FileStorage,
+		Retention:         nats.LimitsPolicy,
+		Discard:           nats.DiscardNew,
+		MaxAge:            spec.MaxAge,
+		MaxMsgsPerSubject: spec.MaxMsgsPerSubject,
+	}
+
+	got, err := p.js.StreamInfo(p.stream)
 	switch {
 	case err == nil:
-		return nil
+		return p.reconcileStream(got, &want)
 	case errors.Is(err, nats.ErrStreamNotFound):
 	default:
 		return fmt.Errorf("查询 Stream %q: %w", p.stream, err)
 	}
 
-	_, err = p.js.AddStream(&nats.StreamConfig{
-		Name:      p.stream,
-		Subjects:  subjects,
-		Replicas:  replicas,
-		Storage:   nats.FileStorage,
-		Retention: nats.LimitsPolicy,
-	})
-	if err != nil {
+	if _, err := p.js.AddStream(&want); err != nil {
 		return fmt.Errorf("创建 Stream %q: %w", p.stream, err)
 	}
 	return nil
+}
+
+// reconcileStream 把既存 Stream 校正到期望口径；已一致则什么都不做。
+//
+// 只改保留相关字段（subjects / MaxAge / MaxMsgsPerSubject / Discard），
+// 在 `got.Config` 上原地改而不是整体替换 —— 否则会把部署期设的其它字段
+// （副本数、去重窗口、存储后端等）一并抹回本函数的默认值。
+func (p *NATSPublisher) reconcileStream(got *nats.StreamInfo, want *nats.StreamConfig) error {
+	cur := got.Config
+	if sameStringSet(cur.Subjects, want.Subjects) &&
+		cur.MaxAge == want.MaxAge &&
+		cur.MaxMsgsPerSubject == want.MaxMsgsPerSubject &&
+		cur.Discard == want.Discard {
+		return nil
+	}
+
+	slog.Warn("Stream 保留口径与 03 §4.2 不一致，正在校正",
+		"stream", p.stream,
+		"old_max_age", cur.MaxAge, "new_max_age", want.MaxAge,
+		"old_max_msgs_per_subject", cur.MaxMsgsPerSubject,
+		"new_max_msgs_per_subject", want.MaxMsgsPerSubject,
+		"note", "缩短 MaxAge 会立即删除超期消息")
+
+	cur.Subjects = want.Subjects
+	cur.MaxAge = want.MaxAge
+	cur.MaxMsgsPerSubject = want.MaxMsgsPerSubject
+	cur.Discard = want.Discard
+	if _, err := p.js.UpdateStream(&cur); err != nil {
+		return fmt.Errorf("校正 Stream %q 配置: %w", p.stream, err)
+	}
+	return nil
+}
+
+// sameStringSet 判断两个字符串集合是否相等（顺序无关、忽略重复）。
+//
+// 用集合而不是切片比较：NATS 返回 subjects 的顺序不保证与写入一致，
+// 直接 `slices.Equal` 会把「内容相同、顺序不同」误判成漂移，每次都重建一次配置。
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		set[s] = struct{}{}
+	}
+	if len(set) != len(a) {
+		return false
+	}
+	for _, s := range b {
+		if _, ok := set[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Publish 同步等待 PublishAck。

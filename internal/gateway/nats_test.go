@@ -48,7 +48,7 @@ func TestA2_RealNATS_PubackAfterPersist(t *testing.T) {
 	}
 	defer pub.Close()
 
-	if err := pub.EnsureStream([]string{a2Captured}, 1); err != nil {
+	if err := pub.EnsureStream(StreamSpec{Subjects: []string{a2Captured}, Replicas: 1}); err != nil {
 		t.Fatalf("确保 Stream 存在失败: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestA2_RealNATS_SubjectNotInStream_NoPuback(t *testing.T) {
 	}
 	defer pub.Close()
 
-	if err := pub.EnsureStream([]string{a2Captured}, 1); err != nil {
+	if err := pub.EnsureStream(StreamSpec{Subjects: []string{a2Captured}, Replicas: 1}); err != nil {
 		t.Fatalf("确保 Stream 存在失败: %v", err)
 	}
 
@@ -207,5 +207,75 @@ func prepareA2Stream(t *testing.T, url string) (nats.JetStreamContext, func()) {
 	return js, func() {
 		_ = js.DeleteStream(a2Stream)
 		nc.Close()
+	}
+}
+
+// TestEnsureStreamReconcilesRetention 锁住一个**项目级缺陷**的修复。
+//
+// 缺陷：EnsureStream 原先只在 Stream「不存在」时创建，于是**先于 03 §4.2 口径**
+// 建出来的流会一直是**无限保留**（`MaxAge=0`）—— 磁盘随写入无上限增长，
+// 同时也是「重启即重放」的放大器（保留窗口越长，一次误删消费者的代价越大）。
+func TestEnsureStreamReconcilesRetention(t *testing.T) {
+	url := natsURL(t)
+	js, cleanup := prepareA2Stream(t, url)
+	defer cleanup()
+
+	// 造一个「旧口径」的流：既没有 MaxAge，也没有 MaxMsgsPerSubject。
+	if _, err := js.AddStream(&nats.StreamConfig{
+		Name: a2Stream, Subjects: []string{a2Captured}, Storage: nats.FileStorage,
+	}); err != nil {
+		t.Fatalf("建旧口径 Stream: %v", err)
+	}
+
+	pub, err := NewNATSPublisher(url, a2Stream)
+	if err != nil {
+		t.Fatalf("构造 NATSPublisher: %v", err)
+	}
+	defer pub.Close()
+
+	spec := StreamSpec{Subjects: []string{a2Captured}, Replicas: 1}
+	if err := pub.EnsureStream(spec); err != nil {
+		t.Fatalf("EnsureStream: %v", err)
+	}
+
+	info, err := js.StreamInfo(a2Stream)
+	if err != nil {
+		t.Fatalf("StreamInfo: %v", err)
+	}
+	if info.Config.MaxAge != DefaultStreamMaxAge {
+		t.Fatalf("MaxAge 应被校正为 %s，得 %s —— 无限保留会让磁盘无上限增长",
+			DefaultStreamMaxAge, info.Config.MaxAge)
+	}
+	if info.Config.MaxMsgsPerSubject != DefaultStreamMaxMsgsPerSubject {
+		t.Fatalf("MaxMsgsPerSubject 应被校正为 %d，得 %d",
+			DefaultStreamMaxMsgsPerSubject, info.Config.MaxMsgsPerSubject)
+	}
+
+	// 幂等：口径已一致时再调一次不应报错、也不应改动。
+	if err := pub.EnsureStream(spec); err != nil {
+		t.Fatalf("二次 EnsureStream 应幂等: %v", err)
+	}
+}
+
+// TestSameStringSet 覆盖 subjects 比较的边界。
+//
+// 顺序不同**不算**漂移：NATS 返回 subjects 的顺序不保证与写入一致，
+// 若按切片逐位比较，每次启动都会误判成漂移并重建一次配置。
+func TestSameStringSet(t *testing.T) {
+	cases := []struct {
+		a, b []string
+		want bool
+	}{
+		{nil, nil, true},
+		{[]string{"a"}, []string{"a"}, true},
+		{[]string{"a", "b"}, []string{"b", "a"}, true},
+		{[]string{"a"}, []string{"b"}, false},
+		{[]string{"a"}, []string{"a", "b"}, false},
+		{[]string{"a", "a"}, []string{"a"}, false},
+	}
+	for _, c := range cases {
+		if got := sameStringSet(c.a, c.b); got != c.want {
+			t.Errorf("sameStringSet(%v, %v) = %v，期望 %v", c.a, c.b, got, c.want)
+		}
 	}
 }
