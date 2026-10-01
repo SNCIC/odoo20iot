@@ -60,6 +60,11 @@ b1-bench: ## Phase 0 · B1 时序表模型压测（需要 GreptimeDB 可达，�
 	  -writers 8 -query-iters 30 -value-model correlated \
 	  -report tmp/b1-report.md'
 
+.PHONY: c1-bench
+c1-bench: ## Phase 0 · C1 规则条件引擎：P99 验收 + 求值基准
+	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_PERF_ASSERT=1 go test ./internal/rules -run TestPerf -count=1 -v'
+	$(GO_RUN) 'cd $(PROJECT_DIR) && go test ./internal/rules -run XXX -bench . -benchtime 300000x'
+
 .PHONY: run-gateway
 run-gateway: ## 前台运行网关（连开发栈 NATS）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/iot-gateway \

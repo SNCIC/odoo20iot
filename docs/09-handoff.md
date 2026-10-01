@@ -7,12 +7,12 @@
 
 ## 1. 一句话现状
 
-**Phase 0（技术验证）进行中**：环境已就绪、骨架已跑通、开发栈已起来（四个中间件全部 healthy）。
-**两个决策点已通过**：
+**Phase 0（技术验证）三个 P0 决策点全部通过**：
 - **A2（QoS1 PUBACK 时机）** —— ADR-001 的定制点成立，**不必回退 EMQX**（`03` §4.4.1）；
-- **B1（GreptimeDB JSON vs 宽表）** —— JSON 方案写入达标 3.8×，**维持 JSON 为默认，不切宽表**（`02` §4.1.1）。
+- **B1（GreptimeDB JSON vs 宽表）** —— JSON 方案写入达标 3.8×，**维持 JSON 为默认，不切宽表**（`02` §4.1.1）；
+- **C1（`expr` 条件引擎）** —— 编译期校验与 P99 均达标，但**校验必须自建 AST 层**（`04` §1.2.1）。
 
-下一个要打的是 **C1（`expr` 条件引擎）**。
+下一步进入 **Phase 1（骨架落地）**：A1 设备认证、A3 集群路由、D2/D3 Odoo 集成骨架。
 
 ---
 
@@ -64,6 +64,7 @@
 | `nats-io/nats.go` | `v1.54.0` | 纯 Go，无 cgo（ADR-010） |
 | `jackc/pgx/v5` | `v5.11.0` | 访问 GreptimeDB 的 PostgreSQL wire 端点；纯 Go。**注意 `Ping()` 与 simple protocol 都不可用**，见 §6 坑 19 |
 | GreptimeDB | **`1.2.1`**（compose 里是 `:latest`，**上生产前必须锁版本**） | JSON 能力边界按 1.2.1 实测，见 `02` §4.1.1 ④ |
+| `expr-lang/expr` | `v1.17.8` | 规则条件 DSL。**热路径必须用 `rules.Runner` 复用 VM**，否则 P99 骑线（`04` §1.2.1 ⑤） |
 
 ### 2.4 端口规划（全部避开宿主已占用）
 
@@ -161,6 +162,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 3 | 开发栈四件套运行中 | 全部 `healthy`；**从 devbox 侧**逐项验证：GreptimeDB HTTP(28400) + PG-wire(28403) + 我们的 PG(28543) + NATS(28224) + Redis(28637) |
 | 4 | 代码质量门禁通过 | `go build ./...`、`go vet ./...`、`go test ./...` 全绿 |
 | 5 | Odoo 现状审计勘误 | `07-odoo-integration.md` §2.5 / §2.6 已按**服务器实际配置**重写（原审计基于已废弃的 Windows 旧布局快照，8 项里 5 项误判） |
+| 8 | **C1 · 规则条件引擎（P0）** | **通过**。`internal/rules` 实现编译期校验（AST + 物模型类型表）、41 个白名单函数、编译缓存与 `Runner`。实测求值 **P50 0.60~0.81 µs / P99 0.98~1.74 µs**（验收线 2 µs，6 轮；余量 1.15~2.04×，**生产机型需复测**）；编译缓存命中 121 ns / 0 分配。核心发现：**`expr.Env` 的类型化环境覆盖不了小写物模型键**，校验必须自建（`04` §1.2.1） |
 | 7 | **B1 · 时序表模型（P0）** | **通过**。`cmd/tsdb-bench` 在 GreptimeDB 1.2.1 上对比 A（JSON）/ B（宽表）：写入 19.1 万 / 16.1 万 points/s（验收线 5 万，内联字面量路径 64.0 万）；查询单设备全部达标，多设备明细两方案**都**超线 → 结论「维持 JSON 默认」。含**前置一致性校验**（两方案 3599 点逐点相等）。结论与边界 `02` §4.1.1；原始报告 `docs/reports/b1-tsdb-bench.md` |
 | 6 | **A2 · QoS1 PUBACK 时机（P0）** | **通过**。`mochi-mqtt` v2.7.9 可在「等待 NATS `PublishAck` 后再回 PUBACK」下工作：`OnPublish` 返回 `packets.ErrRejectPacket` 阻止自动 PUBACK，业务侧 `cl.WritePacket(ack)` 显式确认。实测往返 **0.52 ~ 1.12 ms**（5 次采样，中位 ≈ 0.92 ms）。结论与边界见 `03-ingestion.md` §4.4.1；代码 `internal/gateway`；用例 `a2_test.go`（含**崩溃注入**与**对照实验**）、`nats_test.go`（真实 JetStream，PUBACK 后消息可读回） |
 
@@ -174,7 +176,9 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 |---|---|---|
 | ~~P0~~ | ~~A2 · QoS1 PUBACK 时机~~ | ✅ **已完成**（见 §4 第 6 项） |
 | ~~P0~~ | ~~B1 · GreptimeDB JSON vs 宽表~~ | ✅ **已完成**（见 §4 第 7 项） |
-| **P0** | **C1 · `expr` 条件引擎** | 编译期类型校验 + 求值 P99 ≤ 2 µs。**下一个打这个** |
+| ~~P0~~ | ~~C1 · `expr` 条件引擎~~ | ✅ **已完成**（见 §4 第 8 项） |
+| **P1** | **A1 · 设备认证 Hook** | **当前网关放行全部连接**（`gateway.New` 里显式标注）。三档认证（ADR-008）未实现。**下一批的第一项** |
+| P1 | 规则索引与窗口算子 | C1 只覆盖了「表达式」；拓扑匹配过滤、`window.*` 的窗口算子、DAG 编排、动作分发均未实现（`04` §1.2.1 ⑧） |
 | P0 | B1 补充项（1） | **明细查询限行**必须落地（`02` §4.3.1）：实测多设备 3.6 万行明细 P95 达 247/211 ms，两方案都超线 |
 | P0 | B1 补充项（2） | **预聚合表从「可选优化」升为必做**：多设备 × 长跨度聚合在 JSON 下已骑在 SLO 线（198~213 ms），宽表 91 ms |
 | P1 | B1 补充项（3） | 上生产前按 **3 副本集群 + NVMe** 重测写入吞吐；宽表开启前用**租户真实样本**重测存储占用 |
@@ -203,6 +207,10 @@ docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
 # B1 时序表模型压测（约 3 分钟；会 drop/重建 telemetry* 表）
 #   建议先 docker restart iot-greptimedb：连续压测会留下 compaction backlog
 make b1-bench
+
+# C1 规则条件引擎：P99 验收 + 求值基准
+make c1-bench
+# 等价于：IOT_PERF_ASSERT=1 go test ./internal/rules -run TestPerf -count=1 -v
 
 # 本地起网关（冒烟）
 make run-gateway              # → MQTT 127.0.0.1:11883，HTTP 127.0.0.1:18080（/healthz /metrics）
@@ -256,6 +264,13 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 | 22 | **小数据集压测会给出相反结论** | 4200 行的冒烟跑出「JSON 比宽表慢 3 倍」，112 万行时变成「JSON 快 4 倍」——预热开销主导 | 压测必须跑到稳态；本次全量 3 轮写入吞吐复现性 ±3% |
 | 23 | **取值生成器会翻转存储结论** | 周期序列下 A/B 存储比 3.31×，随机/自相关下 0.96× | 压测必须声明取值模型（`-value-model`），存储维度不能只看一次 |
 | 24 | 连续压测把 GreptimeDB 拖入 compaction backlog | 连跑 4 轮后单轮写入从 28s 涨到 5min+（CPU 560%） | 压测前 `docker restart iot-greptimedb`，并先 drop 无关表 |
+| 25 | **`expr.Env(结构体)` 的字段名大小写敏感** | 物模型键是小写（`msg.temperature`），Go 字段必须导出（`Msg`）→ `unknown name msg`；`reflect.StructOf` 直接拒绝小写字段名 | 环境用 `map[string]any`（小写键），**字段校验自己做**（`04` §1.2.1） |
+| 26 | **`map[string]any` 环境下 expr 不做任何校验** | `msg.typo > 60`、`msg.temperature > 'abc'`、`msg.running && msg.temperature` 全部编译通过 | 编译期校验必须是自建的 AST 层，不能寄托在库上 |
+| 27 | **`expr.DisableAllBuiltins()` 挡不住谓词** | `all/filter/map/none/any/one` 在解析期就变成 `PredicateNode`，绕过 Builtins 表 → 关掉内置后仍编译通过 | 白名单必须在 AST 层再拦一次（`PredicateNode`/`PointerNode`） |
+| 28 | expr 区分 `nil` 与 `null` | 文档里的 `prev == null` 编译不过（`null` 是未知标识符） | 统一写 `prev == nil` |
+| 29 | **编译期模板里的 nil 会收窄类型** | 环境模板把 `prev` 写成 `nil` → 检查器把 prev 收窄成 nil 类型 → `prev.temperature` 报 `type nil has no field temperature` | 编译期模板一律给空映射；「prev 可能为空」只在运行时表达 |
+| 30 | **`expr.Run` 的池化开销决定了 P99 是否达标** | 同样表达式：直接用 `expr.Run` P99 = 2.03 µs（超线），改用 `Runner` 复用 VM 后 0.98~1.52 µs | 热路径用 `rules.Runner`；这类预算里常数项就是结论 |
+| 31 | **漏检 `rows.Err()` / 只看 P50 会给出错误结论** | 小规模与单点测量都会骗人（B1 的小数据集、C1 的 P50） | 结论必须看**分布**与**全量**，不看单点或均值 |
 
 ---
 
