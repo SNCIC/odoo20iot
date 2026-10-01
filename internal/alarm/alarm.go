@@ -119,6 +119,10 @@ func (a *Alarm) clone() *Alarm {
 	return &c
 }
 
+// Clone 是给外部（svc-alarm 的缓存层、Store 的调用方）用的安全复制：
+// 调用方拿到的是副本，改它不会污染 Store 里的状态。
+func (a *Alarm) Clone() *Alarm { return a.clone() }
+
 // Trigger 是一次「规则触发」输入（由 svc-rule 的事件驱动通道送来）。
 type Trigger struct {
 	ProjectID    string

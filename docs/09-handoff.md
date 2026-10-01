@@ -21,6 +21,7 @@
 
 **Phase 2 已开工**：**L2 自研 DAG 编排执行器**（04 §1.3 六种节点 + 编译期约束校验 + 三种错误策略）已完成；
 **L3 告警五态 FSM**（04 §2.1-2.2 五态 + 去重/静默/风暴/根因抑制 + 聚合判定 + 告警质量指标）已完成。
+**PG 地基**（`internal/pg` 连接池 + 带校验和的迁移器、`cmd/iot-migrate`、`t_alarm_active` 非分区活跃索引表、`alarm.PGStore`）已完成，并已对开发库 `iot` 应用迁移。
 
 下一步：A4 连接压测待有干净环境后再跑；`odoo-connector` 的主数据拉取与死信；告警引擎的 PG `Store` 实现与 `svc-alarm` / 通知通道；Odoo 侧 S1/S3 集成场景端到端。
 
@@ -72,6 +73,7 @@
 | Odoo 20 | devbox `odoo@odoo20tbb` | 容器内 `127.0.0.1:8070`，Tailscale `100.64.0.3:9070` |
 | `mochi-mqtt/server/v2` | **`v2.7.9`（必须锁版本）** | A2 的挂载点依赖其 `processPublish` 对 `packets.ErrRejectPacket` 的处理（见 `03` §4.4.1 边界 5） |
 | `nats-io/nats.go` | `v1.54.0` | 纯 Go，无 cgo（ADR-010） |
+| **PostgreSQL 18.6** | devbox `postgresql@18`，`127.0.0.1:5432` | 业务库 `iot`（角色 `xfusion`）。**Unix socket 走 peer 认证**（`host=/var/run/postgresql`）；TCP 口是 `scram-sha-256` 需密码，开发用 socket 故不引入新凭据 |
 | `jackc/pgx/v5` | `v5.11.0` | 访问 GreptimeDB 的 PostgreSQL wire 端点；纯 Go。**注意 `Ping()` 与 simple protocol 都不可用**，见 §6 坑 19 |
 | GreptimeDB | **`1.2.1`**（compose 里是 `:latest`，**上生产前必须锁版本**） | JSON 能力边界按 1.2.1 实测，见 `02` §4.1.1 ④ |
 | `expr-lang/expr` | `v1.17.8` | 规则条件 DSL。**热路径必须用 `rules.Runner` 复用 VM**，否则 P99 骑线（`04` §1.2.1 ⑤） |
@@ -189,6 +191,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 15 | **`odoo-connector` 编排层 + 事件入口 + 定时对账（P1 · 07 §4.3 / §4.4）** | **完成（骨架 + 真实 Odoo 实测）**。`internal/connector`：令牌桶限流（20 req/s）+ 有界排队准入（在途 8 / 队列 1000，超出拒绝并告警）+ 熔断（`gobreaker`；连续 10 次失败**或**失败率 > 50% 且样本 ≥ 20 → 打开 60s；**401/403 立即跳闸**；**业务 4xx 不计入**）+ 退避重试（1s/3s/9s，最多 3 次；**仅 5xx/429/网络错误**，且**超时仅在携带幂等键时重试**）+ 错误码映射（§4.3.2 八码）+ 幂等占位（§4.3.1 第 2 步，Redis Lua 原子「查—比—写」；**占位不可用则降级放行**，权威账本仍在 Odoo `edge.idempotency`）+ 超时（连接 3s / 读 15s）。**`cmd/odoo-connector`** 骨架：`/healthz` + `/readyz`（真打 Odoo）+ `/metrics`。**实测**：对真实 Odoo 用无效凭据 → `/readyz` 返回 `AUTH_REQUIRED`、随即触发 P1 熔断、再次返回 `CIRCUIT_OPEN` 且不再触达 Odoo。**顺带修一处信息泄露**：`odoo.APIError` 现在剥离 Odoo 返回的 Python traceback（技术方案 p.7 明令禁止外泄）。**事件入口已完成（§4.4）**。**C-1**：消费 Odoo Outbox 投递到 Redis Stream `odoo:outbox` 的事件（消费组 `odoo-connector`），翻译为 `iot.odoo.{model}` 发布到 NATS `IOT_ODOO`。**「至少一次」由两件事共同成立**：XACK 只在发布成功之后 **+** 未确认消息由 `XAUTOCLAIM` 接管重投 —— 只做前者不做后者，失败消息会永远沉在 PEL 里，语义是「零次」而非「至少一次」。**C-2**：`POST /webhook/odoo`（Bearer 鉴权，**无令牌即不注册该路由**；请求体上限 1 MiB），按 `(model, id, write_date)` 去重，去重器故障时**放行**（重复比丢失轻，下游按 `event_id` 还能去）。**实测端到端**：XADD 一条 Outbox 事件 + POST 一次 webhook → NATS 收到 `iot.odoo.stock_move` / `iot.odoo.maintenance_equipment`，消费组待确认为 0；同一 webhook 重投返回 `duplicate:true` 且不重复发布；未授权返回 401。**查出并修掉两个真实缺陷**：① 漏了 PEL 重投（见上）；② `XReadGroup` 传 `Block: 0` 被 go-redis 下发为 **`BLOCK 0`＝永久阻塞**，会把消费循环挂死（已译为负值＝非阻塞，并有回归用例）。**Odoo 侧 cron 投递已接通**：`sn_edge_integration` 新增 `data/edge_outbox_cron.xml`（每分钟）与 `edge.outbox` 的投递逻辑 —— **先 XADD 成功才置 delivered**；失败按 5/15/60/300/900/1800/3600 秒退避，连续 10 次进**死信**；**Redis 整体不可达则整轮失败、不消耗 attempts**（逐条失败会让一次宕机把整批事件推成死信，反而丢数据）。依赖 python 包 `redis`（已装入 `odoo20` venv 8.1.0，并写入 manifest 的 `external_dependencies`）；地址与流名走系统参数 `edge.outbox.redis_url` / `edge.outbox.stream`。**实测**（odoo shell，含真实 cron 路径 `method_direct_trigger()`）：正常投递 → `delivered`；走真实 cron → `delivered` 且事件入 Redis；Redis 不可达 → 抛错且 `attempts` 保持 0；单条失败（WRONGTYPE）→ `attempts=1` + 退避 + `last_error` 记真实原因；连续 10 次 → `state=dead`。**全链路已打通**：Odoo 业务 → Outbox → cron → Redis Streams → connector → NATS `IOT_ODOO`（`messages:1`、`lag:0`、PEL 0）。**又查出两处 Odoo 20 API 变更**：① `ir.config_parameter` 的 `get_param`/`set_param` 已被类型化访问器 `get_str`/`set_str` 等取代（沿用旧名会在 **cron 运行时**才 `AttributeError`，属性面板上看不出来）；② `ir.cron` 不再有独立 `code` 字段，需经 `ir_actions_server_id` 委托 `ir.actions.server`。**定时对账已完成（§4.4）**：`Reconciler` 每 15 min 跑两路扫描 —— ① 补投 Odoo `edge.outbox` 的非终态行（domain 带宽限窗口，**退避中的行不算遗漏**；死信也补投并标记需人工排查）；② 比对 C-2 水位差并补投（水位是 `(write_date, id)` **二元组**，只用时间戳会漏掉同秒写入的多条记录；**首次对账只建基线**，否则会把全表历史当遗漏一次打爆下游）；**连续两轮仍有遗漏才告警**（单轮很可能是抖动）。补投**沿用原 `event_id`**，原事件若其实已到达，由下游去重 —— 换个新 id 就等于承认必然重复。水位由 webhook 推进、对账比对，两侧共用 Redis，并在 Lua 里保证**只进不退**（水位被拉回去会重复处理一整段）。**实测**（真实 Odoo/Redis/NATS，3s 间隔加速）：首轮建基线；造一条卡住的 Outbox 行 → `对账①：补投遗漏的 Outbox 事件`；改一条 `res.partner` 但**不发 webhook** → `对账②：补投水位差`（这正是 C-2 会静默丢事件的场景）；连续多轮未收敛 → ERROR 告警并提示检查 `max_cron_threads`。**顺带修一个我自己的调用 bug**：`-log-json false` 因 Go flag 的布尔语义导致**其后所有参数被静默丢弃**（不报错的配置错误），已改为 `-log-format text|json`。**遗留**：主数据增量拉取与游标（Redis+PG）、死信 `t_dlq` + 按 `entity_type` 聚合告警、对账第 ③ 项（未绑定待办，依赖尚未建立的 `t_external_ref`） |
 | 16 | **L2 · 自研 DAG 编排执行器（P1 · 04 §1.3）** | **完成（Phase 2 第一批）**。`internal/dag`：六种节点（condition / action / delay / parallel / branch / end）全实现；**编译期强制校验**按 04 §1.3 的约束表逐条落地 —— 节点数 ≤32、深度 ≤8、环检测（Kahn 拓扑序，同时给出稳定遍历序）、单节点超时 ≤5s、delay ≤5min、并行 ≤5、**动作白名单**、**变量引用仅 `$path.to.value` 且禁止拼接**；并沿用 `rules.CompileError` 的取向**一次报全所有问题**（04 §1.6「保存即阻断」）。**condition 复用 L1 的 expr**（`rules.Compiler` 编译 + `rules.Runner` 求值），不另建表达式引擎 —— 这是 04 §1.3「禁止第二套编排」的落点。执行侧：整体 30s / 单节点 5s 两级超时**分开上报**（单节点慢不该被误报成整个 DAG 被中断）、三种 `error_policy`（drop / retry / dlq）、指数与固定退避、不幂等动作重试告警、变量解析失败**不消耗重试**（配置错误重试无意义）。动作注册表要求执行体是编译进二进制的 Go 函数（「新增动作 = 写 Go 代码 + 注册 + 上线」）。**38 个用例全过**。**如实留白三处文档缺口**（已在代码注释与本表标注）：① `action` 的 `next` 在 04 §1.5 示例中未给，本实现取「缺省即链到此为止」；② `branch` 的 `cases[]` 未定义字段名，取 `{expr, next}`；③ **不支持 join（多分支汇聚）** —— 04 §1.3 只定义了并发度、没定义汇聚语义（全等？任一？），凭空定一个会与用户预期不一致，故编译期对「分支可达同一节点」给出**警告**（重复执行对 `notify.send` 这类不幂等动作就是重复通知）。**遗留**：`window.*` 窗口算子（滑动/滚动窗口由 svc-rule 维护）、规则索引与拓扑匹配过滤、`error_policy=dlq` 的 DLQ 落库、样例试跑（3 组输入校验输出与耗时 <5ms）、灰度与原子生效（NATS `iot.ctrl.rule_reload.{project}` + 版本防御） |
 | 17 | **L3 · 告警五态 FSM + 去重/聚合/抑制（P1 · 04 §2.1-2.2）** | **完成（Phase 2 第二批）**。`internal/alarm` 是**纯状态机**（不做 IO：落库走 `Store` 抽象、通知由调用方按 `Decision` 执行），故状态迁移可确定性穷举。**五态 FSM**：`idle→detected→confirmed→active→resolved→idle`，时序参数随规则的 `timing`（`detect_window_s`/`suppress_s`/`auto_close_s`，缺省 60s/10min/5min）；**推进双通道**（`Observe` 事件驱动 + `Tick` 定时扫描）共享同一套 advance 逻辑 —— 两条路径各写一套是最难查的分裂。**去重**：`sha1` 键保证「同一设备同一规则只允许一个活跃告警」；**抑制**：`active` 期间重复触发只更新 `last_ts`、静默窗口只记录不通知、风暴熔断（`>500/1min`，**区分「刚跨阈值」与「熔断中」**，否则第 501 条之后每条都会再发一次风暴通知，在风暴里再制造风暴）、根因抑制（父告警活跃则子告警自动抑制）；**聚合**：按「同 `device_type` 下**不同设备**数」判定（同一台刷 10 次不算 10 台，否则一台设备抖动会被误判成批量故障）；**乐观锁**按 04 §2.5 用 CAS（`Update(expected)` + 重读重试 3 次），冲突耗尽则上抛而不是静默吞掉。**告警质量指标**（§2.2.1 要求业务口径而非只有技术指标）：有效告警占比 / 工单转化率 / 合并率 / 风暴次数 / 确认时长。**21 个用例全过（含 `-race`）**。**如实留白四处**：① 批量告警**实体**与通知合并路径（需 `t_alarm` 批量字段，本批只做判定与计数）；② §2.2.1 要的是确认时长**中位数**，本包只维护和与计数故给均值，中位数需从 PG 算；③ 键为 `sha1(p+d+r)` 的文档字面写法本实现加了 `0x00` 分隔（裸拼接会让 `("a","bc","d")` 与 `("ab","c","d")` 撞键 → 不同设备的告警互相压制，见代码注释）；④ 04 §2.1 的 ASCII 图与同节表对 `active` 恢复的去向**互相矛盾**，本实现取表（`active+恢复→resolved`，否则 `resolved` 与 `auto_close_s` 都成死代码）。**遗留**：PG `Store` 实现与启动重建、多副本 `dedup_key` 分片、`svc-alarm` 服务入口与 5s 扫描循环、三条通知通道（svc-notify）与未确认升级（30min/2h） |
+| 18 | **PG 地基（P1 · 02 §3 / 04 §2.5）** | **完成**。新增 `internal/pg`：连接池（走 Unix socket 的 peer 认证，**开发环境不引入新凭据**；用 `Ping` 真做连通性检查 —— 真 PG 上它可用，与 §6 坑 19 那条 GreptimeDB 限制不是一回事）+ **迁移执行器**（`schema_migrations` 版本表 + **校验和** + 每个迁移单独事务 + `pg_advisory_lock` 串行化）。新增 `cmd/iot-migrate`（迁移是**部署动作**，不藏进某个服务的启动流程；`-check` 有待应用迁移则非零退出，可做 CI 门禁）+ `internal/pg/pgtest`（跨包共用的「建临时库 → 跑迁移 → 删库」基建，避免各写一遍各错一遍）。**首个迁移 `0001_alarm_active`**：`t_alarm_active` 是**非分区表**，`PRIMARY KEY (dedup_key)` 提供**跨时间的全局唯一** —— 文档里的 `t_alarm` 按 `first_ts` RANGE 分区，而 02 §3.4 自己写明「分区表上的唯一索引只保证**分区内**唯一」，落它上面跨月重叠就会放过第二条，而 04 §2.2 要求「同一设备同一规则只允许一个活跃告警」。表上还有 `ck_alarm_state`（五态白名单，**刻意不含 idle**：idle 由「行不存在」表达）与 `ck_alarm_ts_order`（时间倒挂会让报表出现「确认时长为负」，倒查不到写入点）。`internal/alarm.PGStore` 实现 `Store`：CAS 落在 `WHERE dedup_key=$1 AND state=$2` + `RowsAffected`（即 04 §2.5 的乐观锁）；`Active()` **显式 `ORDER BY state_ts`** 让扫描顺序可复现（无序 Store 会让同一轮里父/子告警的求值顺序不确定）；`casUpdate` **不碰身份字段** —— 写脏了会让告警在无人察觉时改挂到另一台设备。**真库实测**：`internal/pg` 6 例（含并发迁移被 advisory lock 串行化、校验和漂移被检出、两条 CHECK 真拦得住）、`alarm` 的 7 例 PGStore（含 8 并发 `Observe` 收敛为一行、CAS 拒绝陈旧写、**换个引擎实例仍能从 PG 接着推进**＝04 §2.5 的「启动时重建」、timing 的 JSONB 往返、`GetByID` 支撑跨重启的根因抑制）。**⚠️ 过程中查出一次「假通过」**：`pgxpool.Config.ConnString()` 会**原样返回最初传入的字符串**，改完 `ConnConfig.Database` 再取它拿不到新库名 —— 我的「临时库」DSN 一直等于基准 DSN，6 个用例全打在 `iot` 上、**第一次还全绿**，第二次才因残留数据暴露。已加「连上后核对 `current_database()`，不符即当场失败」的自检（见 §6 坑 37/38）。**如实留白**：`t_alarm`（分区记录表）与主数据表（`t_device`/`t_alarm_rule`）未建 —— 它的 `device_id`/`rule_id` 是 BIGINT 代理键，而那些表还不存在，现在建一张谁也合法写不进去的表没有意义；`svc-alarm` 入口与 5s 扫描循环、多副本 `dedup_key` 分片未实现 |
 
 ---
 
@@ -215,7 +218,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | ~~P0~~ | ~~A5 · 计量埋点原型~~ | ✅ **已完成（原型）**（见 §4 第 13 项）。遗留：每分钟落 PG（按 `(metric, ts_minute)` 幂等）+ 每小时对账、配额限流与分级预警、其余三类指标（设备数/存储量/API 调用数） |
 | ~~P1~~ | ~~D2 / D3~~ | ✅ **已完成（骨架 + 安装验证 + 已推送）**（见 §4 第 14 项）。**遗留**：D3 的完整实现（facade / 其余 IoT 路由 / cron 投递 / 视图 / `tests/` / `EXTENSIONS.md`）、S1/S3 集成场景端到端 |
 | P1 | `odoo-connector` 补充项 | **编排层 + 两条事件入口 + Odoo 侧 cron 投递 + 15min 定时对账均已完成并实测**（见 §4 第 15 项）。**遗留**：主数据增量拉取与游标（Redis+PG）、死信 `t_dlq` + 聚合告警、对账第 ③ 项（依赖尚未建立的 `t_external_ref`） |
-| P1 | 告警引擎补充项 | **五态 FSM + 去重/聚合/抑制已完成**（见 §4 第 17 项）。**遗留**：PG `Store` 实现与启动重建（04 §2.5）、多副本 `dedup_key` 分片与分布式锁、`svc-alarm` 服务入口与 5s 扫描循环、三条通知通道（webhook/邮件/短信，`svc-notify`）与未确认升级（30min 通知上级 / 2h P1 升级）、批量告警实体与通知合并路径 |
+| P1 | 告警引擎补充项 | **五态 FSM + 去重/聚合/抑制 + PG `Store` 均已完成**（见 §4 第 17、18 项）。**遗留**：多副本 `dedup_key` 分片与分布式锁、`svc-alarm` 服务入口与 5s 扫描循环、三条通知通道（webhook/邮件/短信，`svc-notify`）与未确认升级（30min 通知上级 / 2h P1 升级）、批量告警实体与通知合并路径 |
 | P2 | 文档收尾 | 把「IoT 平台部署位置」的决策补进 `07` §11.2（**已定：宿主 Docker Compose**） |
 | P2 | 日志口径统一 | 网关层用 `log/slog`（mochi-mqtt 的 Hook 签名即 slog），`cmd/iot-gateway` 仍用 zap，二者应合并为一条流水线（见 `main.go:newSlogLogger`） |
 
@@ -260,6 +263,14 @@ docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
 # 计量用量聚合 svc-quota（消费 iot.quota.usage → Redis 计数器 quota:{pid}:{metric}:{yyyymmdd}）
 docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
   go run ./cmd/svc-quota -nats-url nats://100.64.0.3:28222 -redis-url redis://100.64.0.3:28637/0'
+
+# 业务库迁移（iot @ devbox 127.0.0.1:5432，Unix socket peer 认证，无需密码）
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && go run ./cmd/iot-migrate -check'
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && go run ./cmd/iot-migrate'
+
+# 打真 PG 的用例必须显式给 DSN，否则会 Skip（不是「通过」）
+docker exec -u xfusion -e IOT_PG_DSN='postgres:///iot?host=/var/run/postgresql' devbox bash -lc \
+  'cd /home/xfusion/projects/odoo20iot && go test ./internal/pg/... ./internal/alarm -count=1'
 
 # Odoo 连接器（07 §4.3 编排层 + §4.4 事件入口与对账；API Key 与令牌由 Vault/环境变量注入，切勿写进命令行历史）
 docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
@@ -345,6 +356,8 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 | 34 | **「缓存命中率高」≠「认证容量够」** | L1 只省 157ns 的目录查询，省不掉 116ms 的 Argon2（占 0.00016%） | 容量必须按 KDF 成本算；别用命中率论证容量 |
 | 35 | 限流与安全计数的混淆 | 把「网关过载」计入凭据失败窗口，重连风暴会把**全部正常设备**拉黑 | 过载/后端不可用必须单列：不计失败、不进黑名单、返回可重试语义 |
 | 36 | **告警扫描（`Tick`）的遍历顺序不定** | 同一轮里父告警与子告警的求值顺序随机 —— 「父告警本轮才被关闭」时子告警仍被判为「被抑制」；**断言若依赖顺序就会偶发失败** | 判定要么做成顺序无关，要么扫两轮（本实现：`Tick` 遇乐观锁冲突**不重试**，测试合并两轮决策再断言） |
+| 37 | **`pgxpool.Config.ConnString()` 原样返回最初传入的字符串** | 改完 `ConnConfig.Database` 之后再调它，拿到的还是**旧库名** —— 「换一个临时库跑测试」静默变成「连回基准库」，**而且用例还会通过** | 别用 `ConnString()` 取 DSN；用结构化的 `pg.OpenWithConfig` + 改好的 `ConnConfig`，并在连上后核对 `current_database()` |
+| 38 | **测试基建失效时，用例会「假通过」而不是失败** | 上面那条让整套 PG 用例都打在基准库上，**第一次跑全绿**；第二次才因残留数据失败 —— 若只跑一次就提交，就会以为「这条路径测过了」 | 隔离与前置条件要**自检**（连上核对库名、断言前置状态），不能靠约定；真库用例未配置时**显式 Skip** 而不是静默通过 |
 
 ---
 
