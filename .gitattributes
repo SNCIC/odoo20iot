@@ -1,0 +1,14 @@
+# 仓库统一使用 LF：代码在 Windows 上编写、在 Linux 上编译运行，
+# 若不固定换行符，shell 脚本与 Makefile 会在 Linux 侧因 CRLF 失败。
+* text=auto eol=lf
+
+# 二进制资源不做转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.gz  binary
+*.tgz binary
+*.zip binary

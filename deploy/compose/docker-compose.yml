@@ -1,0 +1,120 @@
+# odoo20iot 开发栈（Phase 0 最小集）
+#
+# 范围：只跑 IoT 平台依赖的中间件。
+#       Odoo 20 不在此栈内 —— 它由 devbox 容器提供，本栈通过
+#       http://100.64.0.3:9070 访问（devbox 内为 127.0.0.1:8070）。
+#
+# 端口：全部落在 28xxx 段，避开宿主已占用端口：
+#       80/443 dify-nginx · 3001 grafana · 3002 uptime-kuma · 5678 n8n
+#       8060 mon-alert-wecom · 9090 prometheus · 9093 alertmanager
+#       9069/9070/9072/9073 devbox Odoo · 9910/9920 cc-connect · 2222 devbox ssh
+#
+# 监听地址统一绑定 Tailscale IP 100.64.0.3，沿用 devbox 的安全基线
+# （局域网 192.168.127.163 上不暴露）。副作用：Tailscale 未启动时本栈无法启动。
+#
+# MinIO 未纳入本阶段：Phase 0 无对象存储需求（归档 / OTA 在 Phase 3），
+# 且 MinIO 上游镜像许可与分发策略有变更，届时单独评估（ADR-010）。
+
+name: odoo20iot
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: iot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: iot
+      POSTGRES_PASSWORD: iot_dev_only_change_me
+      POSTGRES_DB: odoo20iot
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+      TZ: UTC
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      # 审计与对账依赖时间序，统一 UTC 存储
+      - -c
+      - timezone=UTC
+    ports:
+      - "100.64.0.3:28543:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iot -d odoo20iot"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: iot-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - ""
+    ports:
+      - "100.64.0.3:28637:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  nats:
+    image: nats:2-alpine
+    container_name: iot-nats
+    restart: unless-stopped
+    command:
+      - --jetstream
+      - --store_dir
+      - /data
+      - --http_port
+      - "8222"
+      - --name
+      - iot-nats-1
+    ports:
+      - "100.64.0.3:28222:4222"
+      - "100.64.0.3:28224:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  greptimedb:
+    image: greptime/greptimedb:latest
+    container_name: iot-greptimedb
+    restart: unless-stopped
+    command:
+      - standalone
+      - start
+      - --data-home
+      - /data
+    ports:
+      - "100.64.0.3:28400:4000"   # HTTP API
+      - "100.64.0.3:28401:4001"   # gRPC
+      - "100.64.0.3:28403:4003"   # PostgreSQL wire（首选：纯 Go pgx，无 cgo，见 ADR-010）
+    volumes:
+      - greptime-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  pg-data:
+  redis-data:
+  nats-data:
+  greptime-data:

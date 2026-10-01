@@ -1,0 +1,32 @@
+# ---- 凭据与本地配置：绝不可入库 ----
+odoo20.conf
+*.local.yml
+*.local.yaml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# ---- 构建产物 ----
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# ---- 运行时数据 ----
+/data/
+/tmp/
+*.log
+
+# ---- Go ----
+/vendor/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
