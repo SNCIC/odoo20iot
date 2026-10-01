@@ -29,26 +29,28 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/natsjs"
 	"github.com/SNCIC/odoo20iot/internal/pipeline"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 	"github.com/SNCIC/odoo20iot/internal/tsdb/greptimedb"
 )
 
 type config struct {
-	natsURL       string
-	redisURL      string
-	stream        string
-	subject       string
-	durable       string
-	dsn           string
-	batchSize     int
-	batchWait     time.Duration
-	fetchBatch    int
-	concurrency   int
-	maxAckPending int
-	ackWait       time.Duration
-	shutdownWait  time.Duration
-	logJSON       bool
+	natsURL          string
+	redisURL         string
+	stream           string
+	subject          string
+	durable          string
+	dsn              string
+	batchSize        int
+	batchWait        time.Duration
+	fetchBatch       int
+	concurrency      int
+	maxAckPending    int
+	ackWait          time.Duration
+	consumerInactive time.Duration
+	shutdownWait     time.Duration
+	logJSON          bool
 }
 
 func main() {
@@ -73,6 +75,8 @@ func parseFlags() config {
 	flag.IntVar(&cfg.concurrency, "concurrency", 512, "单批并发处理的消息数（吞吐 ≈ concurrency / batch-wait）")
 	flag.IntVar(&cfg.maxAckPending, "max-ack-pending", 2000, "在途未确认上限（03 §4.3：≥ 2 × batch-size）")
 	flag.DurationVar(&cfg.ackWait, "ack-wait", 30*time.Second, "总线等待 ACK 的上限（03 §4.3：30s）")
+	flag.DurationVar(&cfg.consumerInactive, "consumer-inactive", 24*time.Hour,
+		"消费者空闲回收阈值（须 ≥ 流保留时长，见 internal/natsjs）")
 	flag.DurationVar(&cfg.shutdownWait, "shutdown-wait", 10*time.Second, "优雅退出时 flush 剩余数据的上限")
 	flag.BoolVar(&cfg.logJSON, "log-json", true, "日志输出为 JSON")
 	flag.Parse()
@@ -149,22 +153,26 @@ func run(cfg config) error {
 	handler := pipeline.NewHandler(parser, batcher, pipeline.NewRedisIdempotency(rdb), metrics, logger)
 
 	// 5) 消费：durable pull consumer + 手动 ACK。
-	sub, err := js.PullSubscribe(cfg.subject, cfg.durable,
-		nats.BindStream(cfg.stream),
-		nats.ManualAck(),
-		nats.AckWait(cfg.ackWait),
-		nats.MaxAckPending(cfg.maxAckPending),
-		nats.MaxDeliver(-1), // 永不放弃：宁可重投也不能丢
-	)
+	//
+	// ⚠️ 必须走 natsjs.Subscribe，且退出时**不要** Unsubscribe：对 JetStream 订阅
+	// 调用它会**删除消费者**，重启后从头投递 —— 流里全是历史遥测，等于白跑一遍
+	// 全天数据（两阶段幂等能兜住重复入库，但会带来额外写压力）。见 §6 坑 42/43。
+	sub, err := natsjs.Subscribe(js, natsjs.Options{
+		Subject:       cfg.subject,
+		Durable:       cfg.durable,
+		Stream:        cfg.stream,
+		AckWait:       cfg.ackWait,
+		Inactive:      cfg.consumerInactive,
+		MaxAckPending: cfg.maxAckPending,
+	})
 	if err != nil {
-		return fmt.Errorf("订阅 %s（stream=%s）: %w", cfg.subject, cfg.stream, err)
+		return err
 	}
-	defer func() { _ = sub.Unsubscribe() }()
 
 	logger.Info("svc-pipeline 已就绪",
 		"subject", cfg.subject, "stream", cfg.stream, "durable", cfg.durable,
 		"batch_size", cfg.batchSize, "batch_wait", cfg.batchWait,
-		"max_ack_pending", cfg.maxAckPending,
+		"max_ack_pending", cfg.maxAckPending, "consumer_inactive", cfg.consumerInactive,
 		"version", buildinfo.Version, "commit", buildinfo.Commit)
 
 	consumeLoop(ctx, sub, handler, cfg, logger)
@@ -188,7 +196,7 @@ func run(cfg config) error {
 }
 
 // consumeLoop 是消费主循环：拉取 → 入批 → 等落库 → 确认。
-func consumeLoop(ctx context.Context, sub *nats.Subscription, h *pipeline.Handler, cfg config, logger *slog.Logger) {
+func consumeLoop(ctx context.Context, sub *natsjs.Subscription, h *pipeline.Handler, cfg config, logger *slog.Logger) {
 	for {
 		if ctx.Err() != nil {
 			return

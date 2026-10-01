@@ -185,7 +185,7 @@ func run(cfg config) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	var sub *nats.Subscription
+	var sub *natsjs.Subscription
 	if cfg.triggerSubject != "" {
 		// ⚠️ 退出时**不要** Unsubscribe：对 JetStream 订阅调用它会**删除消费者**，
 		// 重启后新建的消费者从头投递 —— 流保留 24h，等于每次重启重放全天的事件。
@@ -268,7 +268,7 @@ func scanLoop(ctx context.Context, app *agent, cfg config, logger *slog.Logger) 
 }
 
 // triggerLoop 是事件驱动通道（04 §2.1）：消费规则触发，保证时效。
-func triggerLoop(ctx context.Context, sub *nats.Subscription, app *agent, cfg config, logger *slog.Logger) error {
+func triggerLoop(ctx context.Context, sub *natsjs.Subscription, app *agent, cfg config, logger *slog.Logger) error {
 	for {
 		if ctx.Err() != nil {
 			return nil

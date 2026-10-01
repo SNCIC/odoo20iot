@@ -29,19 +29,21 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/natsjs"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
 type config struct {
-	natsURL    string
-	redisURL   string
-	stream     string
-	subject    string
-	durable    string
-	counterTTL time.Duration
-	fetchBatch int
-	ackWait    time.Duration
-	logJSON    bool
+	natsURL          string
+	redisURL         string
+	stream           string
+	subject          string
+	durable          string
+	counterTTL       time.Duration
+	fetchBatch       int
+	ackWait          time.Duration
+	consumerInactive time.Duration
+	logJSON          bool
 }
 
 func main() {
@@ -62,6 +64,8 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.counterTTL, "counter-ttl", quota.DefaultCounterTTL, "计数器保留时长（02 §5.2：7d）")
 	flag.IntVar(&cfg.fetchBatch, "fetch-batch", 256, "单次拉取的消息数")
 	flag.DurationVar(&cfg.ackWait, "ack-wait", 30*time.Second, "总线等待 ACK 的上限")
+	flag.DurationVar(&cfg.consumerInactive, "consumer-inactive", 24*time.Hour,
+		"消费者空闲回收阈值（须 ≥ 流保留时长，见 internal/natsjs）")
 	flag.BoolVar(&cfg.logJSON, "log-json", true, "日志输出为 JSON")
 	flag.Parse()
 	return cfg
@@ -108,20 +112,24 @@ func run(cfg config) error {
 	agg := quota.NewAggregator(quota.NewRedisCounter(rdb, cfg.counterTTL), metrics, logger)
 
 	// 4) 消费。
-	sub, err := js.PullSubscribe(cfg.subject, cfg.durable,
-		nats.BindStream(cfg.stream),
-		nats.ManualAck(),
-		nats.AckWait(cfg.ackWait),
-		nats.MaxDeliver(-1),
-	)
+	//
+	// ⚠️ 必须走 natsjs.Subscribe，且退出时**不要** Unsubscribe：对 JetStream 订阅
+	// 调用它会**删除消费者**，重启后从头投递 —— 流里全是历史计量上报，等于把用量
+	// 重放一遍再累加，计数器被多算（见 internal/natsjs 的说明与 §6 坑 42/43）。
+	sub, err := natsjs.Subscribe(js, natsjs.Options{
+		Subject:  cfg.subject,
+		Durable:  cfg.durable,
+		Stream:   cfg.stream,
+		AckWait:  cfg.ackWait,
+		Inactive: cfg.consumerInactive,
+	})
 	if err != nil {
-		return fmt.Errorf("订阅 %s（stream=%s）: %w", cfg.subject, cfg.stream, err)
+		return err
 	}
-	defer func() { _ = sub.Unsubscribe() }()
 
 	logger.Info("svc-quota 已就绪",
 		"subject", cfg.subject, "stream", cfg.stream, "durable", cfg.durable,
-		"counter_ttl", cfg.counterTTL,
+		"counter_ttl", cfg.counterTTL, "consumer_inactive", cfg.consumerInactive,
 		"version", buildinfo.Version, "commit", buildinfo.Commit)
 
 	consumeLoop(ctx, sub, agg, cfg, logger)
@@ -137,7 +145,7 @@ func run(cfg config) error {
 // nakDelay 是可重试错误的退避重投间隔。
 const nakDelay = 500 * time.Millisecond
 
-func consumeLoop(ctx context.Context, sub *nats.Subscription, agg *quota.Aggregator, cfg config, logger *slog.Logger) {
+func consumeLoop(ctx context.Context, sub *natsjs.Subscription, agg *quota.Aggregator, cfg config, logger *slog.Logger) {
 	for {
 		if ctx.Err() != nil {
 			return

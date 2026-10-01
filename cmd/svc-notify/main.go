@@ -408,7 +408,7 @@ type notifier struct {
 	logger     *slog.Logger
 }
 
-func consumeLoop(ctx context.Context, sub *nats.Subscription, app *notifier, cfg config, logger *slog.Logger) error {
+func consumeLoop(ctx context.Context, sub *natsjs.Subscription, app *notifier, cfg config, logger *slog.Logger) error {
 	for {
 		if ctx.Err() != nil {
 			return nil

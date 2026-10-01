@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/SNCIC/odoo20iot/internal/natsjs"
 )
 
 // Local 是集群节点对**本地 broker** 的依赖。
@@ -44,6 +46,10 @@ type Options struct {
 	// AckWait 是路由消息的确认超时。**它决定了「节点被 kill」后多久重投**，
 	// 因此测试要把「恢复」放在这个窗口之后，才能证明重投真的发生。
 	AckWait time.Duration
+
+	// RouteRetention 是路由消费者的空闲回收阈值，取值应与路由流的 MaxAge 一致。
+	// 不设会被 NATS 默认的 5 分钟回收 → 重启重放整个保留窗口（见 internal/natsjs）。
+	RouteRetention time.Duration
 
 	// Cursor 保存离线队列的投递游标（按设备）。生产用 Redis。
 	Cursor CursorStore
@@ -123,6 +129,9 @@ func New(ctx context.Context, opts Options, locator Locator) (*Node, error) {
 	if opts.AckWait <= 0 {
 		opts.AckWait = 5 * time.Second
 	}
+	if opts.RouteRetention <= 0 {
+		opts.RouteRetention = DefaultRouteRetention
+	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -159,7 +168,7 @@ func (n *Node) ensureStreams() error {
 		Subjects:  []string{n.opts.RoutePrefix + ".>"},
 		Storage:   nats.FileStorage,
 		Retention: nats.LimitsPolicy,
-		MaxAge:    time.Hour, // 路由消息只需存活到被消费或重投
+		MaxAge:    DefaultRouteRetention, // 路由消息只需存活到被消费或重投
 		Replicas:  1,
 	}
 	if _, err := n.js.StreamInfo(route.Name); errors.Is(err, nats.ErrStreamNotFound) {
@@ -192,6 +201,10 @@ func (n *Node) ensureStreams() error {
 const (
 	DefaultOfflineTTL          = 24 * time.Hour
 	DefaultOfflineMaxPerDevice = 1000
+
+	// DefaultRouteRetention 是路由流的保留时长，同时作为路由消费者的空闲回收阈值。
+	// 两者必须一致：消费者空闲阈值若短于流保留，停机超过阈值就会触发全量重放。
+	DefaultRouteRetention = time.Hour
 )
 
 // Metrics 返回计数器。
@@ -271,19 +284,25 @@ func (n *Node) consumeLoop(ctx context.Context) {
 	durable := "gw-route-" + n.opts.ID
 	subject := n.RouteSubject(n.opts.ID)
 
-	sub, err := n.js.PullSubscribe(subject, durable,
-		nats.BindStream(n.opts.RouteStream),
-		nats.ManualAck(),
-		nats.AckWait(n.opts.AckWait),
-		nats.MaxDeliver(-1), // 永不放弃：宁可重投也不能丢
-	)
+	// ⚠️ 必须走 natsjs.Subscribe，且退出时**不要** Unsubscribe：对 JetStream 订阅
+	// 调用它会**删除消费者**，节点一重启就按 DeliverAll 重放整个路由流，把历史
+	// 路由消息再注入一遍本地 broker（接收端去重缓存随进程重启清空，挡不住）。
+	// 见 internal/natsjs 与 §6 坑 42/43。
+	sub, err := natsjs.Subscribe(n.js, natsjs.Options{
+		Subject:  subject,
+		Durable:  durable,
+		Stream:   n.opts.RouteStream,
+		AckWait:  n.opts.AckWait,
+		Inactive: n.opts.RouteRetention,
+	})
 	if err != nil {
 		n.logger.Error("订阅路由通道失败", "node", n.opts.ID, "subject", subject, "error", err)
 		return
 	}
-	defer func() { _ = sub.Unsubscribe() }()
 
-	n.logger.Info("路由消费已就绪", "node", n.opts.ID, "subject", subject, "durable", durable)
+	n.logger.Info("路由消费已就绪",
+		"node", n.opts.ID, "subject", subject, "durable", durable,
+		"retention", n.opts.RouteRetention)
 
 	for {
 		if ctx.Err() != nil {
@@ -462,6 +481,9 @@ func (n *Node) ReplayOffline(ctx context.Context, deviceKey string, deliver func
 	}
 
 	subject := n.OfflineSubject(deviceKey)
+	// 这里是**临时消费者**（durable 为空）+ 显式起始序号 + AckNone，与上面的路由
+	// 消费者相反：它每次调用现建现删，Unsubscribe 是**正确**的清理动作（否则会
+	// 泄漏临时消费者）。它不重放，因为起点由 Redis 游标给出，而不是 DeliverAll。
 	sub, err := n.js.PullSubscribe(subject, "",
 		nats.BindStream(n.opts.OfflineStream),
 		nats.StartSequence(from+1),
