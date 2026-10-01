@@ -354,10 +354,61 @@ func (s *Store) QuerySeries(ctx context.Context, p tsdb.Plan, q tsdb.SeriesQuery
 
 	span := nq.Until.Sub(nq.Since)
 	source := tsdb.RouteSource(p, span)
+	if nq.Bucket > 0 {
+		return s.querySeriesAggregated(ctx, source, nq, span)
+	}
 	if r, ok := tsdb.RollupOfSource(source); ok {
 		return s.querySeriesRollup(ctx, r, source, nq, span)
 	}
 	return s.querySeriesRaw(ctx, p, source, nq)
+}
+
+// querySeriesAggregated 处理**调用方显式要求分桶**的查询（SeriesQuery.Bucket > 0）。
+//
+// 生效桶宽 = max(用户桶宽, AdaptiveBucket(行预算下限))，预聚合源再抬到不低于源粒度：
+// 用户说「5m 桶」不等于「可以返回 50 万行」，行数上限仍然优先。
+func (s *Store) querySeriesAggregated(
+	ctx context.Context, source tsdb.Source, nq tsdb.SeriesQuery, span time.Duration,
+) (tsdb.SeriesResult, error) {
+	bucket, err := tsdb.AdaptiveBucket(span, len(nq.DeviceIDs), nq.Limit)
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+	if nq.Bucket > bucket {
+		bucket = nq.Bucket
+	}
+	if r, ok := tsdb.RollupOfSource(source); ok {
+		width, err := tsdb.RollupWidth(r)
+		if err != nil {
+			return tsdb.SeriesResult{}, err
+		}
+		if bucket < width {
+			bucket = width
+		}
+	}
+
+	rows, err := s.selectBuckets(ctx, source, tsdb.BucketQuery{
+		ProjectID: nq.ProjectID,
+		DeviceIDs: nq.DeviceIDs,
+		Since:     nq.Since,
+		Until:     nq.Until,
+		Bucket:    bucket,
+		Metric:    nq.Metric,
+	})
+	if err != nil {
+		return tsdb.SeriesResult{}, err
+	}
+	if len(rows) > nq.Limit {
+		return tsdb.SeriesResult{}, fmt.Errorf(
+			"分桶聚合返回 %d 行超过上限 %d（桶宽 %s，设备 %d 台）",
+			len(rows), nq.Limit, bucket, len(nq.DeviceIDs))
+	}
+	return tsdb.SeriesResult{
+		Granularity: tsdb.GranularityAggregated,
+		Source:      source,
+		Bucket:      bucket,
+		Buckets:     rows,
+	}, nil
 }
 
 // querySeriesRaw 在原始表上执行受保护查询。

@@ -181,12 +181,47 @@ Platform
 ### 3.3 关键表结构摘要
 
 ```sql
+-- 租户 / 项目（tenant = project_id）
+CREATE TABLE t_project (
+  id              BIGINT PRIMARY KEY,
+  project_key     TEXT   NOT NULL,
+  name            TEXT   NOT NULL,
+  status          TEXT   NOT NULL DEFAULT 'active',   -- active|suspended|archived
+  odoo_company_id BIGINT NOT NULL DEFAULT 0,          -- 由 t_external_ref 映射；0 = 未绑定 Odoo
+  timezone        TEXT   NOT NULL DEFAULT 'UTC',
+  config          JSONB  NOT NULL DEFAULT '{}'::jsonb,
+  version         BIGINT NOT NULL DEFAULT 1,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at      TIMESTAMPTZ,
+  CONSTRAINT uk_project_key UNIQUE (project_key),
+  CONSTRAINT ck_project_status CHECK (status IN ('active','suspended','archived'))
+);
+
+-- 设备类型。物模型**内联**在 JSONB 上（不单独建 t_thing_model：没有按版本消费它的读者）
+CREATE TABLE t_device_type (
+  id                  BIGINT PRIMARY KEY,
+  project_id          BIGINT NOT NULL REFERENCES t_project(id) ON DELETE RESTRICT,
+  type_key            TEXT   NOT NULL,
+  name                TEXT   NOT NULL,
+  category            TEXT   NOT NULL DEFAULT '',
+  thing_model         JSONB  NOT NULL DEFAULT '{}'::jsonb,
+  thing_model_version INT    NOT NULL DEFAULT 1,
+  version             BIGINT NOT NULL DEFAULT 1,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at          TIMESTAMPTZ,
+  CONSTRAINT uk_device_type_key UNIQUE (project_id, type_key),
+  -- 给 t_device 的复合外键用：让「设备挂到别的租户的类型上」在 DB 层就不可能
+  CONSTRAINT uk_device_type_project_id UNIQUE (project_id, id)
+);
+
 -- 设备台账
 CREATE TABLE t_device (
-  id              BIGINT PRIMARY KEY,
+  id              BIGINT NOT NULL,               -- 雪花 ID（当前实现为序列，见 §3.5 遗留）
   project_id      BIGINT NOT NULL,
   device_type_id  BIGINT NOT NULL,
-  device_key      TEXT   NOT NULL,          -- 端侧唯一标识, 全局唯一
+  device_key      TEXT   NOT NULL,          -- 端侧唯一标识, 租户内唯一
   name            TEXT   NOT NULL,
   secret_hash     TEXT   NOT NULL,          -- Argon2id, 禁止明文
   secret_version  INT    NOT NULL DEFAULT 1,
@@ -201,14 +236,29 @@ CREATE TABLE t_device (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   deleted_at      TIMESTAMPTZ,
-  -- ⚠️ PG 分区表的唯一约束必须包含分区键：UNIQUE(device_key) 单独写会建表即报错
-  CONSTRAINT uk_device_key UNIQUE (project_id, device_key)
+  -- ⚠️ 勘误：原文写 `id BIGINT PRIMARY KEY` 与 `PARTITION BY HASH (project_id)` 并存 ——
+  --    这在 PG 里**是非法 DDL**（分区表的唯一/PK 必须含全部分区键列，见 §3.4 的三条规则）。
+  --    正文规则写对了、示例写错了，以本行为准。
+  CONSTRAINT pk_device PRIMARY KEY (id, project_id),
+  -- ⚠️ 分区表的唯一约束必须包含分区键：UNIQUE(device_key) 单独写会建表即报错
+  CONSTRAINT uk_device_key UNIQUE (project_id, device_key),
+  CONSTRAINT ck_device_auth CHECK (auth_mode IN ('project','per_device','mtls')),
+  CONSTRAINT ck_device_status CHECK (status IN ('inactive','active','disabled')),
+  -- 复合外键：设备与设备类型必须同租户（单列 FK 挡不住跨租户挂载）
+  CONSTRAINT fk_device_type FOREIGN KEY (project_id, device_type_id)
+      REFERENCES t_device_type(project_id, id) ON DELETE RESTRICT
 ) PARTITION BY HASH (project_id);
 CREATE TABLE t_device_p0 PARTITION OF t_device FOR VALUES WITH (MODULUS 16, REMAINDER 0);
--- ... p1..p15
+-- ... p1..p15（实现里显式写了 16 个分区）
 CREATE INDEX idx_device_project_type ON t_device(project_id, device_type_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_device_project_status ON t_device(project_id, status) WHERE deleted_at IS NULL;
 CREATE INDEX idx_device_tags ON t_device USING GIN (tags jsonb_path_ops);
-ALTER TABLE t_device ENABLE ROW LEVEL SECURITY;
+-- ⚠️ **本批未启用 RLS**（与 §3.1 的约定有出入，属遗留）：§3.1 要求
+--    `ENABLE ROW LEVEL SECURITY` + 策略 `project_id = current_setting('app.project_id')`，
+--    但仓库里没有任何 `SET LOCAL app.project_id` 的连接池管线；只 ENABLE 而不建策略
+--    = **默认拒绝所有行**，会直接打死读路径。故隔离改由应用层强制
+--    （catalog 每个查询首参 project_id；tsdb.SeriesQuery.Normalize 拒绝 ProjectID<=0）。
+--    见 §3.5 与 `09-handoff §5.1` 遗留。
 
 -- 命令记录（按月分区）—— 只存记录，不承担幂等约束
 CREATE TABLE t_command (
@@ -306,6 +356,26 @@ CREATE TABLE t_audit_log (
 | **跨分区/跨时间的全局唯一必须用独立非分区表** | 统一由 `t_idem_registry`（非分区）承担幂等约束 | — |
 
 > **设计后果**：`t_command` / `t_integration_log` 等分区表**只承担记录与查询职责**，不再承担幂等约束。所有幂等判定统一查 `t_idem_registry`（IoT 侧）与 `edge_idempotency`（Odoo 侧，见 07 §4.3.1）。
+
+### 3.5 控制面主数据最小集（Phase 1 落地范围）
+
+**已建**（迁移 `0006_control_plane_master_data.sql`）：`t_project`、`t_device_type`、`t_device`
+（16 路 HASH 分区 + 复合外键 + 三个 CHECK）。**其余 §3.2 的表仍未建**（`t_user`/`t_role`/
+`t_api_token`/`t_thing_model`/`t_alarm_rule`/`t_external_ref`/`t_idem_registry` …），见 `09-handoff §5.1`。
+
+**与本文其他小节的有意偏离**（都是一次性的、已在迁移注释里说明理由）：
+
+| 项 | 约定 | 本批做法 | 理由 |
+|---|---|---|---|
+| 主键 | `id BIGINT PRIMARY KEY` | `t_device` 改 `(id, project_id)` | 分区表的唯一/PK 必须含全部分区键列（§3.4）；原示例是非法 DDL |
+| RLS | 所有租户表 `ENABLE ROW LEVEL SECURITY` | **不启用** | 无 `SET LOCAL app.project_id` 管线；只 ENABLE 不建策略 = 默认拒绝所有行 → 打死读路径。隔离改由应用层强制（见下） |
+| ID | 雪花 ID | 序列（`nextval`） | 开发期够用；雪花生成器记遗留 |
+| 物模型 | 独立 `t_thing_model` 表 | `t_device_type.thing_model JSONB` 内联 | 没有按版本消费它的读者，建表即假系统 |
+
+**租户隔离当前靠应用层**（**不是** RLS，属遗留）：`internal/catalog` 的每个查询都以 `project_id`
+为首参、不提供「按资源 id 查」的入口；`internal/tsdb.SeriesQuery.Normalize` 拒绝 `ProjectID<=0`；
+查询 API 拒绝请求里出现的 `project_id` 参数（只认令牌里的 `tenant` 声明）。
+所有租户表都遵循 §3.1 的公共列约定（`id, project_id, created_at, updated_at, version, deleted_at`）。
 
 ---
 
@@ -569,9 +639,10 @@ VALUES
 | 桶宽 | 输出桶宽 = `max(AdaptiveBucket(span, devices, 5000), 源粒度)` —— 不得比源更细（1m 表上问不出 1s 曲线） |
 | 明细点查询 | `rangeSQL` 永不指向预聚合表（聚合表没有逐点取值） |
 | 再聚合 | `avg = SUM("sum")/NULLIF(SUM("count"),0)`、`max = MAX("max")`、`count = SUM("count")`，带 `"metric"='<k>'` 过滤 |
+| 显式分桶 | 调用方可指定桶宽（`SeriesQuery.Bucket`，HTTP 上即 `?bucket=5m`）：返回 `Granularity=aggregated`；生效桶宽仍为 `max(Bucket, AdaptiveBucket(...))` —— **用户说「5m 桶」不等于「可以突破 5000 行上限」**。`Bucket` 为零值时行为与「未超限返回原始明细」完全一致 |
 
 物化侧结构见 §7；原始报告 [`docs/reports/b1-rollup.md`](./reports/b1-rollup.md)（含开工探针 P-a…P-f、
-守恒与幂等实测、未验证项）。
+守恒与幂等实测、未验证项）。只读查询服务的 HTTP 契约与验收见 [`docs/reports/query-svc.md`](./reports/query-svc.md)。
 
 ---
 

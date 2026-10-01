@@ -70,6 +70,30 @@ test-rollup-pg: ## 预聚合水位账本的真实 PG 验证（会建临时库）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_PG_DSN=$(IOT_PG_DSN) \
 	  go test ./internal/rollup -run TestPGStore -count=1 -v'
 
+.PHONY: test-catalog
+test-catalog: ## 控制面主数据（catalog）真实 PG 验证（会建临时库）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_PG_DSN=$(IOT_PG_DSN) \
+	  go test ./internal/catalog -run TestPGStore -count=1 -v'
+
+.PHONY: test-query
+test-query: ## 查询服务单元测试（不依赖真实库）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && go test ./internal/querysvc ./internal/apiauth -count=1'
+
+.PHONY: test-query-e2e
+test-query-e2e: ## 查询服务端到端（真实 PG + 真实 GreptimeDB；⚠️ 会 drop/重建 telemetry）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_PG_DSN=$(IOT_PG_DSN) IOT_GREPTIMEDB_DSN=$(GREPTIME_DSN) \
+	  go test ./internal/querysvc -run TestE2E -count=1 -v'
+
+.PHONY: seed-dev
+seed-dev: ## 写入开发种子（租户 / 设备类型 / 设备）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/iot-seed -pg-dsn $(IOT_PG_DSN) \
+	  -devices 3 -out tmp/iot-seed-creds.json'
+
+.PHONY: run-svc-query
+run-svc-query: ## 前台运行查询服务（dev 静态令牌；仅绑本机）
+	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/svc-query -pg-dsn $(IOT_PG_DSN) \
+	  -auth-mode dev -dev-token devtoken -dev-project-id 1 -log-format text'
+
 .PHONY: b1-bench
 b1-bench: ## Phase 0 · B1 时序表模型压测（需要 GreptimeDB 可达，约 3 分钟）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/tsdb-bench -plan all \

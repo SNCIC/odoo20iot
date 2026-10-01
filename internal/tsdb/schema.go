@@ -248,8 +248,10 @@ type Granularity string
 const (
 	// GranularityRaw 表示逐点明细。
 	GranularityRaw Granularity = "raw"
-	// GranularityDownsampled 表示命中行数上限后按时间桶聚合的结果。
+	// GranularityDownsampled 表示**命中行数上限后自动**按时间桶聚合的结果。
 	GranularityDownsampled Granularity = "downsampled"
+	// GranularityAggregated 表示**调用方显式要求**分桶聚合的结果（见 SeriesQuery.Bucket）。
+	GranularityAggregated Granularity = "aggregated"
 )
 
 // Source 标注一次查询实际从哪张表取数（02 §7 的跨度路由）。
@@ -331,6 +333,12 @@ type SeriesQuery struct {
 	Until     time.Time // 零值 = now
 	Metric    string    // 物模型白名单内的单指标
 	Limit     int       // 0 = MaxDetailRows；不允许超过 MaxDetailRows
+	// Bucket > 0 时**显式要求分桶聚合**（返回 GranularityAggregated）；
+	// 0 表示沿用自适应行为：未超限返回原始明细，超限才自动降采样。
+	//
+	// 实际生效的桶宽是 max(Bucket, AdaptiveBucket(...))：用户指定的桶宽不得细于
+	// 行数预算所允许的下限，否则返回行数会突破上限（见 QuerySeries）。
+	Bucket time.Duration
 }
 
 // SeriesResult 携带粒度元数据。
@@ -376,7 +384,8 @@ func (q SeriesQuery) Normalize(now time.Time) (SeriesQuery, error) {
 	if !q.Since.Before(q.Until) {
 		return SeriesQuery{}, &PolicyError{"range", "Since 必须早于 Until"}
 	}
-	if span := q.Until.Sub(q.Since); span > MaxLookback {
+	span := q.Until.Sub(q.Since)
+	if span > MaxLookback {
 		return SeriesQuery{}, &PolicyError{"lookback", fmt.Sprintf("回溯 %s 超过上限 %s，请走异步导出", span, MaxLookback)}
 	}
 
@@ -385,6 +394,18 @@ func (q SeriesQuery) Normalize(now time.Time) (SeriesQuery, error) {
 	}
 	if q.Limit < 0 || q.Limit > MaxDetailRows {
 		return SeriesQuery{}, &PolicyError{"limit", fmt.Sprintf("行数上限 %d 非法，允许区间 [1, %d]", q.Limit, MaxDetailRows)}
+	}
+
+	if q.Bucket < 0 {
+		return SeriesQuery{}, &PolicyError{"bucket", fmt.Sprintf("桶宽不能为负，得到 %s", q.Bucket)}
+	}
+	if q.Bucket > 0 {
+		if q.Bucket < MinBucketWidth {
+			return SeriesQuery{}, &PolicyError{"bucket", fmt.Sprintf("桶宽 %s 小于下限 %s", q.Bucket, MinBucketWidth)}
+		}
+		if q.Bucket > span {
+			return SeriesQuery{}, &PolicyError{"bucket", fmt.Sprintf("桶宽 %s 大于查询跨度 %s", q.Bucket, span)}
+		}
 	}
 	return q, nil
 }

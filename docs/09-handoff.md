@@ -213,6 +213,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 21 | **「重启即重放」剩余 3 处（P1 · §5.1 原第 27 行）** | **完成**。`cmd/svc-pipeline` / `cmd/svc-quota` / `internal/cluster` 的路由消费者原先各自 `js.PullSubscribe(...)` 且 `defer sub.Unsubscribe()` —— 退出即**删掉消费者**，重启按 `DeliverAll` 重放整个保留窗口。三处统一改走 `internal/natsjs.Subscribe`：`svc-quota` 新增 `-consumer-inactive`（默认 24h）、`svc-pipeline` 新增同名列并透传 `MaxAckPending`（`natsjs.Options` 新增该字段）、`cluster.Options` 新增 `RouteRetention`（默认 1h，与路由流 `MaxAge` 用**同一个常量** `DefaultRouteRetention`，避免两处各自漂移）。⚠️ `internal/cluster.ReplayOffline` 的临时消费者（durable 为空 + `StartSequence` + `AckNone`）**刻意保留 `Unsubscribe`** —— 它现建现删、起点由 Redis 游标给出而非 `DeliverAll`，删掉才是正确清理；已就地加注释，防止后续被"统一"掉。**结构性防复发**：`natsjs.Subscribe` 的返回值由 `*nats.Subscription` 收窄为 `*natsjs.Subscription`（**只暴露 `Fetch`**）—— 调用方拿不到 `Unsubscribe`，这是坑 47「把规避方式做成可复用的东西」的落点；5 个调用点同步调整，`TestUnsubscribeDeletesDurableAndReplays` 改为**直接用原生 `js.PullSubscribe`** 演示坑本身（正因为收窄后就踩不到了）。**真 NATS 演练**（独立 stream/subject/durable/redis-key，不碰任何真实状态）：发布 5 条计量上报 → 计数器 `=5`；SIGTERM 停止后消费者**仍在**（`delivered=5 pending=0 ack_floor=5`，进度未丢）；重启后计数器**仍为 5**（未重放）。**对照**（复现缺陷）：停止后删掉消费者（等价旧的 `Unsubscribe`）→ 重启后计数器变成 **10**，重复计数被复现并由本修复消除。门禁 `gofmt` / `go build` / `go vet` / `go test` 全绿 |
 | 23 | **B1 补充项（1）· 明细查询限行 + 自适应降采样（P0 · 02 §4.3.1）** | **完成**。`internal/tsdb` 新增契约：`MaxDetailRows=5000` 等保护常量、`SeriesQuery.Normalize`（project_id>0 / 设备 ≤50 / 指标白名单 / 回溯 ≤90d / Limit ∈[1,5000]）、纯函数 `AdaptiveBucket(span, devices, cap)`（在「设备数 × 桶数 ≤ cap」下取最小可读桶宽，阶梯 1s…24h）。适配层 `QuerySeries`：Normalize → **廉价探测** `SELECT 1 ... LIMIT cap+1`（只取常量、不解析指标、不排序，超限时尽早终止）→ 未超限返回原始明细；超限按桶宽降采样返回并标注 `Granularity`/`Bucket`/`CapHit`，**绝不静默截断**（聚合若仍超限则直接报错）。裸查询改名为 `SelectRangeUnprotected`/`SelectBucketsUnprotected`（仅压测/诊断），业务侧唯一读入口是 `QuerySeries`。**实测**（`make b1-bench` §5.2，2026-10-01）：Q3 形态（10 设备 × 1h ≈ 3.6 万行）返回 **35990 → 3610** 行，P95 **257.4 → 152.4ms（JSON）/ 224.3 → 106.7ms（宽表）**，双双落回 P95<200ms 预算内；探测成本从「取指标值 + ORDER BY」的 **95.7ms** 降到 **20.4ms**（1.12M 行表实测）。集成测试 `internal/tsdb/greptimedb/query_test.go`（`IOT_GREPTIMEDB_DSN` + `IOT_PERF_ASSERT` 门控，`make test-tsdb`）。结论与边界 `02` §4.3.1.1；原始报告 `docs/reports/b1-detail-limit.md`。**遗留**：并发上限（20）、慢查询降级（>3s）、多指标端点（≤4）、大窗口（如 50 设备 × 90d）延迟实测 |
 | 24 | **B1 补充项（2）· 预聚合表 + 跨度路由（P0 · 02 §7）** | **完成**。**开工探针**（`internal/tsdb/greptimedb/capability_test.go`，临时表，6 项全过·无回退）：`INSERT…SELECT`+绑定参数可用、**非 append 表同键重写=覆盖**（幂等由表结构保证）、`json_get` 对 JSON 布尔返回 1（布尔可聚合）、rollup 表接受 TTL、`metric` 是保留字（须加引号）、全 NULL 分组写出 `sum=NULL,count=0` 行且 `NULLIF` 可用。**契约**：`Rollup`（1m/1h）、`Source`、纯函数 `RouteSource`（≤6h 原始 / 6h–30d 1m / >30d 1h，**只对 JSON 方案路由**），`SeriesResult.Source`。**表结构**：`telemetry_1m/1h` 长表 `(ts, project_id, device_id, device_type_id, "metric", "sum", "max", "count")`，**不设 append_mode**，物模型加指标零 DDL。**物化**：`Store.RollupWindow` 每指标一条 `INSERT…SELECT`；`cmd/svc-rollup` 增量调度（单飞 PG 咨询锁，失败不致命），水位落 PG `t_rollup_watermark`（迁移 `0005`，`GREATEST` 只进不退，**只在写入成功后推进**）。**路由**：`QuerySeries` 按源选表，agg 源再聚合 `SUM("sum")/NULLIF(SUM("count"),0)`（跨桶无损），输出桶宽不低于源粒度。**实测**（`make test-rollup`，2026-10-01）：10 设备 × 6h × 1Hz（21.6 万行）上 **守恒**（数值+布尔指标的 sum/max/count 与原始聚合逐项相等，1e-9）、**幂等**（重跑行数/取值不变）、**Q4 形态 P95 432.7 → 67.2ms**（同返回 730 行）；`make test-rollup-pg` 覆盖水位账本。结论与边界 `02` §4.3.2 / §7；原始报告 `docs/reports/b1-rollup.md`。**遗留**：1h（>30d）路径未单独压测、迟到数据超 `lag` 不回修、首次水位只回看 24h（更早需 `-backfill-since`）、多副本调度未压测、宽表方案未物化 |
+| 25 | **读侧查询 API `svc-query` + 控制面主数据最小集（P1 · 02 §3 / §4.3）** | **完成**。**迁移 `0006`**：`t_project` / `t_device_type` / `t_device`（PK 修正为 **`(id, project_id)`** —— 原文 `id PRIMARY KEY` + `PARTITION BY HASH(project_id)` 在 PG 里是非法 DDL；16 个显式分区；复合外键 `(project_id, device_type_id)` 在 DB 层挡跨租户挂类型；**刻意不启用 RLS**，理由与替代方案见 `02 §3.5`）。**主数据**：`internal/catalog`（契约 + `PGStore` + `MemStore` + Argon2id 摘要编解码，复用 `internal/auth`）。**种子**：`cmd/iot-seed`（幂等；仅新建或 `-rotate` 时生成凭据；凭据落 `tmp/` 0600）。**认证**：`internal/apiauth` —— JWT 自写验签（ES256/RS256、`iss` 允许列表、`aud`、**强制 `tenant`**、`jti` 查 Redis 吊销且依赖故障 **fail-closed 503**）、JWKS（HTTP/本地文件）、开发静态令牌（常量时间比较 + **只允许绑回环**，启动与每次认证打 WARN）。**查询服务**：`internal/querysvc` + `cmd/svc-query`（默认 `127.0.0.1:18094`），`GET /api/v1/devices`、`GET /api/v1/series`（每租户并发上限 20 + 有界排队、慢查询 >3s 记指标+WARN、稳定错误码）。**时序读路径增量**：`SeriesQuery.Bucket` 显式分桶 → `Granularity=aggregated`（零值=原行为，既有 tsdb 用例原样通过）。**实测**：`make test-catalog` 7/7（含外键挡跨租户、RLS 未启用断言）、`make test-query` 全绿（含 `-race`；JWT 各失败形态、限流器队列、handler 全状态码）、`make test-query-e2e` 真 PG + 真 GreptimeDB 端到端通过；真实二进制 curl 走查见报告。**遗留**：RLS、最新值（Redis Write-Through）、历史导出、多指标投影、Odoo 设备同步、按类型物模型校验、慢查询自动降级、每租户速率限制/读写池分离、**前端**（当前唯一"界面"是 GreptimeDB dashboard）。结论与契约 `02 §3.5` / §4.3.2、`05 §3.3`；报告 `docs/reports/query-svc.md` |
 
 ---
 
@@ -232,6 +233,9 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | ~~P0~~ | ~~B1 补充项（1）~~ | ✅ **已完成**：明细查询限行 + 自适应降采样已落地（见 §4 第 23 项）。Q3 形态经 `QuerySeries` 后 P95 257→152ms（JSON）/ 224→107ms（宽表），双双达标 |
 | ~~P0~~ | ~~B1 补充项（2）~~ | ✅ **已完成**：预聚合表 + 跨度路由已落地（见 §4 第 24 项）。Q4 形态 P95 432.7ms → 67.2ms，落回预算内 |
 | P1 | B1 补充项（3） | 上生产前按 **3 副本集群 + NVMe** 重测写入吞吐；宽表开启前用**租户真实样本**重测存储占用 |
+| ~~P1~~ | ~~读侧查询 API `svc-query` + 控制面主数据最小集~~ | ✅ **已完成**（见 §4 第 25 项）。**仍缺**：RLS、最新值（Redis Write-Through）、历史导出、多指标投影、Odoo 设备同步、按类型物模型校验、慢查询自动降级、每租户速率限制、**前端** |
+| P1 | 控制面其余主数据表 | 迁移 `0006` 只建了 `t_project`/`t_device_type`/`t_device`。`t_user`/`t_role`/`t_api_token`/`t_alarm_rule`/`t_external_ref`/`t_idem_registry` 等仍缺，卡住「通知策略」「批量告警」「connector 对账第③项」 |
+| P1 | **RLS（租户行级隔离）** | `02 §3.1` 要求所有租户表 `ENABLE ROW LEVEL SECURITY` + `SET LOCAL app.project_id`；当前**未启用**，隔离只在应用层。要落地需先建连接池侧的 `SET LOCAL` 管线 |
 | ~~P1~~ | ~~A3 补充项~~ | ✅ **已完成**：Redis Locator/Cursor 跨节点端到端已实测（`redis_test.go`，`IOT_NATS_URL`+`IOT_REDIS_URL` 触发） |
 | ~~P0~~ | ~~svc-pipeline（物模型解析 + GreptimeDB 写入 + 幂等）~~ | ✅ **已完成（MVP）**（见 §4 第 12 项）。**遗留**：`raw_parsers` 二进制解析沙箱、32 分片静态绑定消费、Redis 最新值 Write-Through、`normalized` 转发、DLQ 与毒消息落 `event(parse_error)` |
 | P1 | A4 | **压测工具已完成三个阶段**（`cmd/mqtt-bench`：阶段 1 建连/保持/资源采样/泄漏趋势判定，阶段 2 QoS1 发布路径，阶段 3 背靠背吞吐 + 接入确认延迟 P50/P95/P99 + SLO 判定；引入 `eclipse/paho.mqtt.golang` v1.5.1）。**5 万连接 24h 正式实测待跑**：需先起网关，且压测客户端**须分机部署**（同机跑会把工具开销算进网关）。冒烟：10 连接背靠背 → 13585 msg/s、P99 = 2ms、SLO ✅；200 连接 + 1s 周期发布 → 2098 条全成功 |
@@ -279,6 +283,27 @@ make test-rollup-pg
 docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
   go run ./cmd/svc-rollup -log-format text -interval 30s'
 # 健康与指标：curl -s http://127.0.0.1:18093/readyz ; curl -s http://127.0.0.1:18093/metrics
+
+# 控制面主数据 + 只读查询 API
+make test-catalog      # 真 PG（临时库）：分区/约束/upsert 幂等/分页/归属
+make test-query        # 单测：JWT 各失败形态、限流器、handler 状态码（不依赖真实库）
+make test-query-e2e    # 端到端：真 PG + 真 GreptimeDB（⚠️ 会 drop/重建 telemetry）
+make seed-dev          # 写开发种子（租户/设备类型/3 台设备，凭据落 tmp/iot-seed-creds.json）
+make run-svc-query     # 前台起服务（dev 静态令牌，仅绑 127.0.0.1:18094）
+
+# 手动走查（服务起来后）
+#   注意：这些端口的服务绑在各有其 127.0.0.1，需在 devbox 内 curl
+curl -s http://127.0.0.1:18094/readyz
+curl -s -H 'Authorization: Bearer devtoken' 'http://127.0.0.1:18094/api/v1/devices?limit=2'
+curl -s -H 'Authorization: Bearer devtoken' \
+  'http://127.0.0.1:18094/api/v1/series?device_ids=1001&metric=temperature&since=2026-10-01T00:00:00Z&until=2026-10-01T01:00:00Z'
+curl -s -H 'Authorization: Bearer devtoken' \
+  'http://127.0.0.1:18094/api/v1/series?device_ids=1001&metric=temperature&bucket=5m&since=2026-10-01T00:00:00Z&until=2026-10-01T01:00:00Z'
+curl -s -H 'Authorization: Bearer devtoken' 'http://127.0.0.1:18094/api/v1/devices?project_id=999'   # 400 TENANT_NOT_ALLOWED
+curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:18094/api/v1/devices'                     # 401
+# 生产模式（需要签发方与 JWKS；当前签发方 Odoo OIDC / svc-auth 都还没建）
+#   -auth-mode jwt -jwt-issuer https://auth.example.com -jwt-jwks-url https://auth.example.com/.well-known/jwks.json \
+#   -redis-url redis://100.64.0.3:28637/0
 
 # C1 规则条件引擎：P99 验收 + 求值基准
 make c1-bench

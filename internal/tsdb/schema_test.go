@@ -164,6 +164,53 @@ func TestSeriesQueryNormalize_ExplicitWindowKept(t *testing.T) {
 	}
 }
 
+// TestSeriesQueryNormalize_Bucket 校验显式分桶的守卫，并确认零值=现有行为不变。
+func TestSeriesQueryNormalize_Bucket(t *testing.T) {
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	base := SeriesQuery{
+		ProjectID: 1, DeviceIDs: []int64{2}, Metric: "temperature",
+		Since: now.Add(-time.Hour), Until: now,
+	}
+
+	t.Run("零值不受影响", func(t *testing.T) {
+		got, err := base.Normalize(now)
+		if err != nil {
+			t.Fatalf("不应报错: %v", err)
+		}
+		if got.Bucket != 0 {
+			t.Fatalf("Bucket 应保持 0，得到 %s", got.Bucket)
+		}
+	})
+
+	t.Run("合法桶宽放行", func(t *testing.T) {
+		q := base
+		q.Bucket = time.Minute
+		got, err := q.Normalize(now)
+		if err != nil {
+			t.Fatalf("1m 桶在 1h 跨度内应放行: %v", err)
+		}
+		if got.Bucket != time.Minute {
+			t.Fatalf("桶宽被改写为 %s", got.Bucket)
+		}
+	})
+
+	t.Run("非法桶宽报 bucket", func(t *testing.T) {
+		for name, bucket := range map[string]time.Duration{
+			"为负":   -time.Minute,
+			"小于下限": 500 * time.Millisecond,
+			"大于跨度": 2 * time.Hour,
+		} {
+			q := base
+			q.Bucket = bucket
+			_, err := q.Normalize(now)
+			var pe *PolicyError
+			if !errors.As(err, &pe) || pe.Rule != "bucket" {
+				t.Errorf("%s：期望 *PolicyError{bucket}，得到 %v", name, err)
+			}
+		}
+	})
+}
+
 // TestRouteSource 锁定跨度路由的边界语义（02 §7）。
 func TestRouteSource(t *testing.T) {
 	cases := []struct {
