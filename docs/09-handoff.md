@@ -158,6 +158,12 @@ ssh xfusion-163 "docker exec -u xfusion devbox bash -lc 'go version'"
 
 **服务器上没有任何内容依赖本地副本** —— 全部已入库并推送到 GitHub。
 
+> ⚠️ 这条断言本身出过一次偏差（2026-10-01 接管时发现）：`origin/main` 实际停在 `cc86e81`（A1），
+> 而本地已领先 **6 个 commit**（Phase 0 收尾 + Phase 2 一~五批），即「已全部推送」当时**不成立**。
+> 已于接管当日补推，现远端为 `85610dc`。
+> **教训**：这类断言不能靠印象维护 —— 它每次都会被写文档时的乐观情绪带偏。
+> 判断应以 `git log --oneline origin/main..HEAD`（应为空）或 `git ls-remote origin main` 为准，而不是历史叙述。
+
 **目标工作方式**：IDE 工作区直接指向服务器目录 `/home/xfusion/projects/odoo20iot`，
 此后不存在第二份副本。
 
@@ -183,7 +189,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | # | 项 | 证据 |
 |---|---|---|
 | 1 | Go 1.27.1 装入 devbox | `go version` → `go1.27.1 linux/amd64`；模块下载实测通过 goproxy.cn |
-| 2 | 仓库建立并推送 | commit `0a54067` → `8057ad5` → `2a0382a`，`git ls-remote origin main` = `2a0382a` |
+| 2 | 仓库建立并推送 | 初始 `0a54067` → `8057ad5` → `2a0382a`；**2026-10-01 接管时补推**了未推的 6 个 commit（`cc86e81..dec28f0`），当前远端 `main = 85610dc`（`git log origin/main..HEAD` 为空） |
 | 3 | 开发栈四件套运行中 | 全部 `healthy`；**从 devbox 侧**逐项验证：GreptimeDB HTTP(28400) + PG-wire(28403) + 我们的 PG(28543) + NATS(28224) + Redis(28637) |
 | 4 | 代码质量门禁通过 | `go build ./...`、`go vet ./...`、`go test ./...` 全绿 |
 | 5 | Odoo 现状审计勘误 | `07-odoo-integration.md` §2.5 / §2.6 已按**服务器实际配置**重写（原审计基于已废弃的 Windows 旧布局快照，8 项里 5 项误判） |
