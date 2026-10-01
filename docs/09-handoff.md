@@ -132,8 +132,15 @@ ssh xfusion-163 "docker exec -u xfusion devbox bash -lc 'go version'"
 
 ### 3.4 换行符
 
-仓库用 `.gitattributes` 固定 **LF**。任何在 Windows 侧产生、经 CRLF 转换的文件，
-提交前必须用 `go fmt` 或 `git checkout -- .` 归一化。
+仓库用 `.gitattributes` 固定 **LF**。任何在 Windows 侧产生、经 CRLF 转换的文件，提交前必须归一化：
+
+```bash
+# 归一化全部被跟踪文件，并刷新 stat 缓存（git add -A 不会产生任何暂存内容）
+git ls-files | xargs sed -i 's/\r//' && git add -A
+```
+
+> **注意**：`git checkout -- .` **清不掉** CRLF —— 因为 git 对 `text=auto` 文件的内容比较是归一化的，
+> 它认为工作区"没有变化"，于是根本不重写文件。
 
 ---
 
@@ -207,6 +214,7 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 | 8 | CRLF / LF | Linux 侧脚本、Makefile 异常 | `.gitattributes` 固定 LF |
 | 9 | `max_cron_threads = 0` | `edge_outbox` 的 cron 投递**根本不执行** | 开发库故意关闭 cron；**集成测试前必须临时调起**，否则会把环境问题误判成代码 bug |
 | 10 | 拿废弃快照当现状 | Odoo 配置审计 8 项里 **5 项误判** | Windows 的 `odoo20.conf` 属 2026-09-21 前的旧布局；**一切以服务器实际配置为准** |
+| 11 | 归一化换行符后 `git status` 仍报 M | `cmp` 字节一致、`git hash-object` 与索引 SHA 相同、`git diff --summary` 为空，**但 status 显示 3 个文件被修改** | `git update-index --refresh` **只比 stat 不比内容**，清不掉；执行 `git add -A` 刷新索引即可（不产生暂存内容）。根因：bind mount 下 `sed -i` 的 mtime 与索引 stat 缓存不匹配 |
 
 ---
 
