@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"testing"
@@ -77,8 +78,23 @@ func TestA2_RealNATS_PubackAfterPersist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PUBACK 已回但消息读不回，说明确认早于持久化: %v", err)
 	}
-	if string(msg.Data) != string(payload) {
-		t.Fatalf("载荷不一致：期望 %s，得到 %s", payload, msg.Data)
+	// 断言「原始遥测载荷在信封里」，而不是与它字节相等：
+	// 网关会把遥测包进统一信封（project_id / device_key / payload…，见 03 §4），
+	// 字节相等的写法在信封落地那天就过期了 —— 而这条用例默认被跳过
+	//（需要 IOT_NATS_URL），于是它悄悄红着也没人发现。这类「环境门控的用例」
+	// 最容易腐烂：不跑就不会红，不红就没人修。
+	var env struct {
+		DeviceKey string          `json:"device_key"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(msg.Data, &env); err != nil {
+		t.Fatalf("NATS 载荷不是合法的信封 JSON: %v（原文 %s）", err, msg.Data)
+	}
+	if env.DeviceKey != "dev-nats" {
+		t.Fatalf("信封里的 device_key 不对：期望 dev-nats，得到 %q", env.DeviceKey)
+	}
+	if string(env.Payload) != string(payload) {
+		t.Fatalf("信封里的原始载荷不一致：期望 %s，得到 %s", payload, env.Payload)
 	}
 
 	if got := metrics.PersistedTotal.Load(); got != 1 {

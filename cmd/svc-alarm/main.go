@@ -41,6 +41,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/alarm"
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/natsjs"
 	"github.com/SNCIC/odoo20iot/internal/pg"
 )
 
@@ -63,7 +64,7 @@ type config struct {
 	ackWait        time.Duration
 	fetchBatch     int
 	readyProbe     time.Duration
-	logJSON        bool
+	logFormat      string
 }
 
 func main() {
@@ -88,21 +89,31 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.ackWait, "ack-wait", 30*time.Second, "总线等待 ACK 的上限")
 	flag.IntVar(&cfg.fetchBatch, "fetch-batch", 256, "单次拉取的消息数")
 	flag.DurationVar(&cfg.readyProbe, "ready-probe", 3*time.Second, "就绪探测超时")
-	flag.BoolVar(&cfg.logJSON, "log-json", true, "日志输出为 JSON")
+	// ⚠️ 用字符串开关而不是 `-log-json` 布尔开关：布尔开关一旦写成
+	// `-log-json false`，Go 的 flag 会把 `false` 当成**位置参数**并从那里
+	// 停止解析 —— 其后所有参数（包括出站白名单这类安全配置）全部被
+	// 静默丢弃，而服务照常启动。本项目已经踩过两次（见 09 §6）。
+	flag.StringVar(&cfg.logFormat, "log-format", "json", "日志格式：json 或 text")
 	flag.Parse()
 	return cfg
 }
 
-func newLogger(json bool) *slog.Logger {
+// newLogger 按 `-log-format` 建日志器。
+//
+// ⚠️ 用字符串开关而不是 `-log-json` 布尔开关：布尔开关一旦被写成
+// `-log-json false`，Go 的 flag 会把 `false` 当成**位置参数**并从这里
+// 停止解析 —— 其后所有参数（包括出站白名单这种安全配置）全部被静默丢弃，
+// 而服务照常启动。这个坑本项目已经踩过一次（见 09 §6）。
+func newLogger(format string) *slog.Logger {
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
-	if json {
-		return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+	if strings.EqualFold(format, "text") {
+		return slog.New(slog.NewTextHandler(os.Stderr, opts))
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, opts))
+	return slog.New(slog.NewJSONHandler(os.Stderr, opts))
 }
 
 func run(cfg config) error {
-	logger := newLogger(cfg.logJSON)
+	logger := newLogger(cfg.logFormat)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -176,13 +187,19 @@ func run(cfg config) error {
 
 	var sub *nats.Subscription
 	if cfg.triggerSubject != "" {
-		sub, err = js.PullSubscribe(cfg.triggerSubject, cfg.triggerDurable,
-			nats.BindStream(cfg.triggerStream), nats.ManualAck(),
-			nats.AckWait(cfg.ackWait), nats.MaxDeliver(-1))
+		// ⚠️ 退出时**不要** Unsubscribe：对 JetStream 订阅调用它会**删除消费者**，
+		// 重启后新建的消费者从头投递 —— 流保留 24h，等于每次重启重放全天的事件。
+		// 消费者是服务端状态，交给 nc.Close() 就行。
+		sub, err = natsjs.Subscribe(js, natsjs.Options{
+			Subject:  cfg.triggerSubject,
+			Durable:  cfg.triggerDurable,
+			Stream:   cfg.triggerStream,
+			AckWait:  cfg.ackWait,
+			Inactive: cfg.eventRetention,
+		})
 		if err != nil {
-			return fmt.Errorf("订阅 %s（stream=%s）: %w", cfg.triggerSubject, cfg.triggerStream, err)
+			return err
 		}
-		defer func() { _ = sub.Unsubscribe() }()
 	}
 
 	logger.Info("svc-alarm 已就绪",

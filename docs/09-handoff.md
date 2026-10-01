@@ -23,6 +23,7 @@
 **L3 告警五态 FSM**（04 §2.1-2.2 五态 + 去重/静默/风暴/根因抑制 + 聚合判定 + 告警质量指标）已完成。
 **PG 地基**（`internal/pg` 连接池 + 带校验和的迁移器、`cmd/iot-migrate`、`t_alarm_active` 非分区活跃索引表、`alarm.PGStore`）已完成，并已对业务库 `odoo20iot` 应用迁移；
 **`svc-alarm` 服务**（双通道推进 + 5s 扫描 + PG 咨询锁互斥 + 至少一次发布）已完成，并对真 PG + 真 NATS 跑通端到端。
+**`svc-notify` 三通道通知**（Webhook / 邮件 / 短信 + SSRF 防护 + 降级 + 重试阶梯 + 死信 `t_dlq`）已完成，并对真 NATS 跑通端到端。
 
 下一步：A4 连接压测待有干净环境后再跑；`odoo-connector` 的主数据拉取与死信；告警引擎的 PG `Store` 实现与 `svc-alarm` / 通知通道；Odoo 侧 S1/S3 集成场景端到端。
 
@@ -73,6 +74,7 @@
 | Docker / Compose | 宿主 29.8.1 / v5.5.1 | 镜像源已配国内镜像（daocloud / 1panel） |
 | Odoo 20 | devbox `odoo@odoo20tbb` | 容器内 `127.0.0.1:8070`，Tailscale `100.64.0.3:9070` |
 | `mochi-mqtt/server/v2` | **`v2.7.9`（必须锁版本）** | A2 的挂载点依赖其 `processPublish` 对 `packets.ErrRejectPacket` 的处理（见 `03` §4.4.1 边界 5） |
+| **NATS 消费者** | 统一走 `internal/natsjs.Subscribe` | 退出时**不要** `sub.Unsubscribe()`（对 JetStream 订阅它会删掉消费者 → 重启重放）；必须显式设 `InactiveThreshold`（默认空闲回收 5 分钟）。见 §6 坑 42/43 |
 | `nats-io/nats.go` | `v1.54.0` | 纯 Go，无 cgo（ADR-010） |
 | **PostgreSQL 18.6** | 项目栈 `iot-postgres`（宿主容器），`100.64.0.3:28543` | **业务库 `odoo20iot`**，角色 `iot`（凭据见 `deploy/compose/docker-compose.yml`）。⚠️ devbox 内的 `postgresql@18`（`127.0.0.1:5432`）是 **Odoo 的库实例**（`odoo20`/`erp_dev`），**不要混用** —— 见 §6 坑 39 |
 | `jackc/pgx/v5` | `v5.11.0` | 访问 GreptimeDB 的 PostgreSQL wire 端点；纯 Go。**注意 `Ping()` 与 simple protocol 都不可用**，见 §6 坑 19 |
@@ -194,6 +196,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 17 | **L3 · 告警五态 FSM + 去重/聚合/抑制（P1 · 04 §2.1-2.2）** | **完成（Phase 2 第二批）**。`internal/alarm` 是**纯状态机**（不做 IO：落库走 `Store` 抽象、通知由调用方按 `Decision` 执行），故状态迁移可确定性穷举。**五态 FSM**：`idle→detected→confirmed→active→resolved→idle`，时序参数随规则的 `timing`（`detect_window_s`/`suppress_s`/`auto_close_s`，缺省 60s/10min/5min）；**推进双通道**（`Observe` 事件驱动 + `Tick` 定时扫描）共享同一套 advance 逻辑 —— 两条路径各写一套是最难查的分裂。**去重**：`sha1` 键保证「同一设备同一规则只允许一个活跃告警」；**抑制**：`active` 期间重复触发只更新 `last_ts`、静默窗口只记录不通知、风暴熔断（`>500/1min`，**区分「刚跨阈值」与「熔断中」**，否则第 501 条之后每条都会再发一次风暴通知，在风暴里再制造风暴）、根因抑制（父告警活跃则子告警自动抑制）；**聚合**：按「同 `device_type` 下**不同设备**数」判定（同一台刷 10 次不算 10 台，否则一台设备抖动会被误判成批量故障）；**乐观锁**按 04 §2.5 用 CAS（`Update(expected)` + 重读重试 3 次），冲突耗尽则上抛而不是静默吞掉。**告警质量指标**（§2.2.1 要求业务口径而非只有技术指标）：有效告警占比 / 工单转化率 / 合并率 / 风暴次数 / 确认时长。**21 个用例全过（含 `-race`）**。**如实留白四处**：① 批量告警**实体**与通知合并路径（需 `t_alarm` 批量字段，本批只做判定与计数）；② §2.2.1 要的是确认时长**中位数**，本包只维护和与计数故给均值，中位数需从 PG 算；③ 键为 `sha1(p+d+r)` 的文档字面写法本实现加了 `0x00` 分隔（裸拼接会让 `("a","bc","d")` 与 `("ab","c","d")` 撞键 → 不同设备的告警互相压制，见代码注释）；④ 04 §2.1 的 ASCII 图与同节表对 `active` 恢复的去向**互相矛盾**，本实现取表（`active+恢复→resolved`，否则 `resolved` 与 `auto_close_s` 都成死代码）。**遗留**：PG `Store` 实现与启动重建、多副本 `dedup_key` 分片、`svc-alarm` 服务入口与 5s 扫描循环、三条通知通道（svc-notify）与未确认升级（30min/2h） |
 | 18 | **PG 地基（P1 · 02 §3 / 04 §2.5）** | **完成**。新增 `internal/pg`：连接池（走 Unix socket 的 peer 认证，**开发环境不引入新凭据**；用 `Ping` 真做连通性检查 —— 真 PG 上它可用，与 §6 坑 19 那条 GreptimeDB 限制不是一回事）+ **迁移执行器**（`schema_migrations` 版本表 + **校验和** + 每个迁移单独事务 + `pg_advisory_lock` 串行化）。新增 `cmd/iot-migrate`（迁移是**部署动作**，不藏进某个服务的启动流程；`-check` 有待应用迁移则非零退出，可做 CI 门禁）+ `internal/pg/pgtest`（跨包共用的「建临时库 → 跑迁移 → 删库」基建，避免各写一遍各错一遍）。**首个迁移 `0001_alarm_active`**：`t_alarm_active` 是**非分区表**，`PRIMARY KEY (dedup_key)` 提供**跨时间的全局唯一** —— 文档里的 `t_alarm` 按 `first_ts` RANGE 分区，而 02 §3.4 自己写明「分区表上的唯一索引只保证**分区内**唯一」，落它上面跨月重叠就会放过第二条，而 04 §2.2 要求「同一设备同一规则只允许一个活跃告警」。表上还有 `ck_alarm_state`（五态白名单，**刻意不含 idle**：idle 由「行不存在」表达）与 `ck_alarm_ts_order`（时间倒挂会让报表出现「确认时长为负」，倒查不到写入点）。`internal/alarm.PGStore` 实现 `Store`：CAS 落在 `WHERE dedup_key=$1 AND state=$2` + `RowsAffected`（即 04 §2.5 的乐观锁）；`Active()` **显式 `ORDER BY state_ts`** 让扫描顺序可复现（无序 Store 会让同一轮里父/子告警的求值顺序不确定）；`casUpdate` **不碰身份字段** —— 写脏了会让告警在无人察觉时改挂到另一台设备。**真库实测**：`internal/pg` 6 例（含并发迁移被 advisory lock 串行化、校验和漂移被检出、两条 CHECK 真拦得住）、`alarm` 的 7 例 PGStore（含 8 并发 `Observe` 收敛为一行、CAS 拒绝陈旧写、**换个引擎实例仍能从 PG 接着推进**＝04 §2.5 的「启动时重建」、timing 的 JSONB 往返、`GetByID` 支撑跨重启的根因抑制）。**⚠️ 过程中查出一次「假通过」**：`pgxpool.Config.ConnString()` 会**原样返回最初传入的字符串**，改完 `ConnConfig.Database` 再取它拿不到新库名 —— 我的「临时库」DSN 一直等于基准 DSN，6 个用例全打在 `iot` 上、**第一次还全绿**，第二次才因残留数据暴露。已加「连上后核对 `current_database()`，不符即当场失败」的自检（见 §6 坑 37/38）。**如实留白**：`t_alarm`（分区记录表）与主数据表（`t_device`/`t_alarm_rule`）未建 —— 它的 `device_id`/`rule_id` 是 BIGINT 代理键，而那些表还不存在，现在建一张谁也合法写不进去的表没有意义；`svc-alarm` 入口与 5s 扫描循环、多副本 `dedup_key` 分片未实现 |
 | 19 | **`svc-alarm` 服务（P1 · 04 §2）** | **完成（骨架 + 真实栈端到端）**。`cmd/svc-alarm` 把引擎接成可运行服务：**双通道推进**（`Observe` 消费 `iot.rule.alarm` 保时效 + 每 5s 定时扫描兜底，04 §2.1）、**扫描互斥**用 PG 咨询锁（`pg_try_advisory_lock`，**会话级**故持有专用连接 —— 用 `pool.Exec` 会让取锁与解锁落到不同连接上，表现为「锁取到了永远放不掉」且**没有任何报错**）、`/healthz` + `/readyz`（真查 PG **并检查迁移是否已应用** —— schema 落后时服务「能连上库」但每轮扫描都失败，而 readyz 报健康是最误导人的状态）+ `/metrics`（**业务口径与服务健康并排**，直接落 §2.2.1 的要求）。**发布做成至少一次**：`Tick` 把状态推到 `active` 后若 NATS 发布失败，这条告警**永远不会再发**（状态已是 active，之后的重复触发都被抑制），工单会静默丢失；故新增迁移 `0003` 的 `published_at`，**发布成功才写标记**，每轮扫描按 `published_at IS NULL` 补发，重复由下游 S3 的幂等键与 10min 合并窗口兜住。**端到端实测**（真 PG + 真 NATS，1s 扫描加速）：发一条 `iot.rule.alarm` → 2s 观察期 → 扫描推进到 `active` → 发布 `iot.alarm.p_e2e` → JetStream `IOT_ALARM` `messages=1`、`/metrics` 的 `alarm_events_published_total=1`、`alarm_avg_confirm_delay_seconds=2`（**观察期确实生效**，不是落默认 60s）、`published_at` 已落库；测试数据与流已清理。**查出并修一处静默失效**：`wildcardOf("iot.rule")` 原会生成 `iot.rule.>`，而**它匹配不到 `iot.rule` 本身** —— 流的 subjects 不含实际要发布的 subject 时，发布静默失败（或报一个看不出原因的 `no response from stream`）。**⚠️ 过程中发现我用错了数据库**：业务库一直建在 devbox 内那个**与 Odoo 共用**的 `postgresql@18`（`odoo20`/`erp_dev` 在里面），而它本该是本项目栈独立的 `iot-postgres`（`100.64.0.3:28543` / 库 `odoo20iot`）；已改默认 DSN、迁移打到正确的库、删除误建的库（见 §6 坑 39）。**如实留白**：通知策略解析与模板渲染（§2.3 第 1、2 步，需 `t_alarm_rule.notify`）、未确认升级（30min → 上级 / 2h → P1）、`dedup_key` 哈希分片（§2.5）、静默窗口的配置源（`Silences` 恒为空集，语义是「没有窗口」而非「静默全部」） |
+| 20 | **`svc-notify` 三通道通知（P1 · 04 §2.3）** | **完成**。`internal/notify`：**三条通道**（Webhook / 邮件 / 短信 —— 04 §2.3 列了四档含语音，而 06 的 Phase 2 验收项写的是「Webhook / 邮件 / 短信，3 通道」，语音如实留白）+ **SSRF 出站防护**（白名单 + 禁内网段 + **DNS 固定解析**防 rebinding；统一出口代理未部署，故四项做了三项，差异写明在包注释里）+ **分发器**（按优先级 + 降级、**重试阶梯 500ms/2s/8s**、永久失败不重试、**部分投递**作为第三种结果）+ **模板渲染**（`text/template` + `levelZh`/`timeFmt` 过滤器）+ **通道健康降级**（失败率 > 30% 直接跳过并切下一通道；文档写的是「只对短信生效」，这里做成通用 —— Webhook 网关整体挂掉比短信拥塞更常见）+ **死信**（迁移 0004 的 `t_dlq`：按月分区 + 幂等建分区函数）。`cmd/svc-notify` 消费 `iot.alarm.>`，暴露 `/healthz` + `/readyz`（真查 PG 与迁移）+ `/metrics`。**查出并修四处真实缺陷**：① **`sub.Unsubscribe()` 会删掉 JetStream 消费者** —— 服务每次退出都删、每次启动都新建，于是重启即**重放整个保留窗口**（流保留 24h，等于每次重启把全天告警重发一遍）。实测：不发任何新事件、仅优雅重启，服务重放了已确认的事件（`received` 从 0 变 1）；修法是退出只关连接 + 显式 `InactiveThreshold`（NATS 2.10+ 对 durable 消费者有**默认 5 分钟空闲回收**，一次周末停机同样触发重放）。已抽成 `internal/natsjs` 并加**含反证的回归用例**。② SSRF 网段表里的 `::ffff:0:0/96` 被 Go 规范化成 **`0.0.0.0/0`＝匹配全部 IPv4**，所有 webhook 都会被拦掉（正是用例抓住的）。③ **2xx 里藏业务错误码**：钉钉/企微/飞书与短信厂商在 token 失效、机器人被移出群、模板未报备时**仍返回 HTTP 200**，只判状态码会把它们记成投递成功（通知静默丢失，而指标上一切正常）。**端到端实测**（真 NATS + 本地接收端）：正常投递 → 接收端收到带 `Host` 头与结构化字段的 POST、`levelZh` 把 `critical` 渲染成「严重」、`payload` 带上取值快照；把接收端改成 `{"errcode":310000}` → **重试 4 次**（1 + 3 阶梯）→ 落 `t_dlq`（`attempts=4`、带 trace_id）→ 记 ERROR。**如实留白**：通知策略来自配置文件（`t_alarm_rule.notify` 未建）、通知组未展开成收件人（依赖 `t_user`/`t_role`）、未确认升级（30min/2h，依赖 svc-alarm 的一手数据）、统一出口代理、策略热加载、DLQ 重放工具与 7 天保留。**⚠️ 同款缺陷仍在另外 3 处**（`svc-pipeline` / `svc-quota` / `internal/cluster`），其中 **`svc-quota` 会重复计数** —— 见 §5.1 |
 
 ---
 
@@ -221,6 +224,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | ~~P1~~ | ~~D2 / D3~~ | ✅ **已完成（骨架 + 安装验证 + 已推送）**（见 §4 第 14 项）。**遗留**：D3 的完整实现（facade / 其余 IoT 路由 / cron 投递 / 视图 / `tests/` / `EXTENSIONS.md`）、S1/S3 集成场景端到端 |
 | P1 | `odoo-connector` 补充项 | **编排层 + 两条事件入口 + Odoo 侧 cron 投递 + 15min 定时对账均已完成并实测**（见 §4 第 15 项）。**遗留**：主数据增量拉取与游标（Redis+PG）、死信 `t_dlq` + 聚合告警、对账第 ③ 项（依赖尚未建立的 `t_external_ref`） |
 | P1 | 告警引擎补充项 | **五态 FSM + 去重/聚合/抑制 + PG `Store` + `svc-alarm` 服务（双通道 + 5s 扫描 + 至少一次发布）均已完成**（见 §4 第 17、18、19 项）。**遗留**：三条通知通道（webhook/邮件/短信，`svc-notify`）与未确认升级（30min 通知上级 / 2h P1 升级）、通知策略解析与模板渲染（需 `t_alarm_rule.notify`）、`dedup_key` 哈希分片、静默窗口的配置源、批量告警实体与通知合并路径 |
+| P1 | **「重启即重放」缺陷的另外 3 处** | `svc-pipeline` / `svc-quota` / `internal/cluster/node.go` 仍在退出时 `sub.Unsubscribe()`（**会删掉消费者**）→ 重启重放整个保留窗口。**`svc-quota` 是重复计数**（`INCRBY quota:*` 被重放多次，用量会被多算）；`svc-pipeline` 是重复入库（有两阶段幂等兜底，但白跑一遍且有额外写压力）。修法已备好：改用 `internal/natsjs.Subscribe` 并去掉 `Unsubscribe`（见 §6 坑 42/43） |
 | P2 | 文档收尾 | 把「IoT 平台部署位置」的决策补进 `07` §11.2（**已定：宿主 Docker Compose**） |
 | P2 | 日志口径统一 | 网关层用 `log/slog`（mochi-mqtt 的 Hook 签名即 slog），`cmd/iot-gateway` 仍用 zap，二者应合并为一条流水线（见 `main.go:newSlogLogger`） |
 
@@ -273,6 +277,12 @@ docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && g
 # 打真 PG 的用例必须显式给 DSN，否则会 Skip（不是「通过」）
 docker exec -u xfusion -e IOT_PG_DSN='postgres://iot:iot_dev_only_change_me@100.64.0.3:28543/odoo20iot' \
   devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && go test ./internal/pg/... ./internal/alarm -count=1'
+
+# 通知服务（04 §2.3 三通道；出站白名单**必填**，为空则拒绝启动）
+docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
+  go run ./cmd/svc-notify -log-format text -egress-allow "*.dingtalk.com,hooks.example.com" \
+  -default-webhook-to "https://oapi.dingtalk.com/robot/send?access_token=xxx"'
+# 探活：curl -sS 127.0.0.1:18093/healthz ；就绪：/readyz ；指标：/metrics ；死信量：/metrics/dlq
 
 # 告警服务（04 §2 双通道 + 5s 扫描；迁移必须先应用，否则启动即拒绝）
 docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && go run ./cmd/svc-alarm -log-json false'
@@ -368,6 +378,12 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 | 39 | **同一个 devbox 里有两个 PostgreSQL，很容易连错** | devbox 内的 `postgresql@18`（`127.0.0.1:5432`）是 **Odoo 的库实例**（`odoo20`/`erp_dev`）；业务库是项目栈里独立的 `iot-postgres` 容器（`100.64.0.3:28543` / 库 `odoo20iot`）。连错**不会报错** —— 建表、迁移、查询全都成功，只是表长在了 Odoo 的实例上 | 用 `pg.DefaultDSN`（已指向项目栈）；写死 DSN 时先 `SELECT current_database()` 确认 |
 | 40 | **`foo.bar.>` 匹配不到 `foo.bar` 本身** | 用「去掉最后一段 + `>`」从 subject 派生流的 subjects 时，若 subject 只有两段（如 `iot.rule`），派生出的通配**不覆盖原 subject** —— 流里不含实际要发布的 subject，发布静默失败或报 `no response from stream` | 不足三段时原样返回；或直接对着 `jsz` 确认流的 subjects 含目标 subject |
 | 41 | **`pkill -f "某个字符串"` 会杀掉执行它的 shell 自己** | 命令行走在 `bash -lc` 里，整个命令行文本包含那个字符串，于是 `pkill -f` 把自己也匹配上了 —— 表现为「命令执行到一半突然没了下文」 | 按**进程名**杀：`pkill -x svc-alarm`（`-f` 匹配全命令行，`-x` 匹配精确名字） |
+| 42 | **对 JetStream 订阅调 `sub.Unsubscribe()` 会删掉消费者** | 服务每次退出都删、每次启动都新建，于是**重启即重放整个保留窗口** —— 流保留 24h，等于每次重启把全天事件重发一遍（通知服务＝通知风暴，`svc-quota`＝用量重复计数）。而且**完全不报错**，只在行为上体现 | 退出时只关连接，**不要** `Unsubscribe`（消费者是服务端状态）；统一用 `internal/natsjs.Subscribe` |
+| 43 | **NATS 2.10+ 对 durable 消费者有默认的空闲回收（5 分钟）** | 服务停机超过 5 分钟消费者被自动删除，于是「一个周末的发布」变成一次全量重放 —— 与坑 42 的表象完全一样，但成因不同，只看代码看不出来 | 显式设 `InactiveThreshold`（取流的保留时长）；比它更久的空闲本来也没东西可补 |
+| 44 | **`::ffff:0:0/96` 会被 Go 规范化成 `0.0.0.0/0`** | 写进「禁止访问的网段」表里就等于**拦掉全部 IPv4**（所有 webhook 都发不出去），而错误信息只说「命中禁止访问的地址段」 | 网段表里不要列 IPv4 映射段；改为把地址 `To4()` 归一成 4 字节再判，`::ffff:10.0.0.1` 自然落到 `10/8` 规则上 |
+| 45 | **IM 机器人与短信网关「HTTP 200 + 业务错误码」** | 钉钉/企微返回 `{"errcode":310000,"errmsg":"token is not exist"}`、飞书用 `code`、短信厂商同理。只判 HTTP 状态码会把 token 失效、机器人被移出群、模板未报备全部记成**投递成功** —— 通知静默丢失而指标一切正常 | 2xx 也要解析响应体里的码值；判成**可重试**（限流重试就能过，判错方向不对称） |
+| 46 | **环境门控的用例会腐烂** | 需要 `IOT_NATS_URL` / `IOT_PG_DSN` 才跑的用例默认被跳过，于是断言过期了也没人发现 —— 本次补上环境变量后立刻暴露一条（`gateway` 的载荷断言在「遥测包进信封」那天就过期了） | 定期带环境变量跑一遍全量；断言写成「**结构包含**」而非「字节相等」，减少随实现演进过期 |
+| 47 | **记进文档的坑，仍会在新代码里重犯** | `-log-json false` 的位置参数陷阱（§6 坑）在 `odoo-connector` 修过一次，本次 `svc-alarm` / `svc-notify` 又踩了一遍：其后所有参数（含出站白名单）被静默丢弃 | 别只在「坑清单」里记，要把规避方式做成**可复用的东西**（`-log-format` 的约定、`internal/natsjs`），让下一个人不需要先读到那条坑 |
 
 ---
 
