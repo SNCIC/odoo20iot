@@ -94,22 +94,24 @@ type Policy struct {
 	AllowProjectMode bool
 
 	// 失败计数与黑名单（03 §2.1「更严限流」与「紧急封禁」）。
-	FailWindow         time.Duration
-	FailLimitPerDevice int
-	FailLimitPerIP     int
-	BlacklistTTL       time.Duration
+	FailWindow             time.Duration
+	FailLimitPerDevice     int
+	FailLimitPerIP         int
+	FailLimitPerProjectKey int
+	BlacklistTTL           time.Duration
 }
 
 // DefaultPolicy 给出保守的默认值。
 func DefaultPolicy() Policy {
 	return Policy{
-		MaxConcurrentVerify: 8,
-		VerifyQueueTimeout:  2 * time.Second,
-		AllowProjectMode:    false,
-		FailWindow:          time.Minute,
-		FailLimitPerDevice:  10,
-		FailLimitPerIP:      30,
-		BlacklistTTL:        10 * time.Minute,
+		MaxConcurrentVerify:    8,
+		VerifyQueueTimeout:     2 * time.Second,
+		AllowProjectMode:       false,
+		FailWindow:             time.Minute,
+		FailLimitPerDevice:     10,
+		FailLimitPerIP:         30,
+		FailLimitPerProjectKey: 20,
+		BlacklistTTL:           10 * time.Minute,
 	}
 }
 
@@ -206,7 +208,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, req Request) (*Result,
 	if req.ClientID == "" {
 		return a.reject(ReasonBadRequest, errors.New("clientID 为空"))
 	}
-	if a.isBlacklisted(req.ClientID, req.RemoteIP) {
+	if a.isBlacklisted(req.ClientID, req.RemoteIP, 0) {
 		return a.reject(ReasonBlacklisted, nil)
 	}
 
@@ -217,10 +219,10 @@ func (a *Authenticator) Authenticate(ctx context.Context, req Request) (*Result,
 		return a.reject(ReasonDirectoryDown, err)
 	}
 	if id == nil {
-		return a.rejectFor(ReasonUnknownDevice, nil, req.ClientID, req.RemoteIP)
+		return a.rejectFor(ReasonUnknownDevice, nil, req.ClientID, req.RemoteIP, 0)
 	}
 	if id.Revoked {
-		return a.rejectFor(ReasonRevoked, nil, req.ClientID, req.RemoteIP)
+		return a.rejectFor(ReasonRevoked, nil, req.ClientID, req.RemoteIP, 0)
 	}
 	if !id.Mode.Valid() {
 		return a.reject(ReasonInternal, fmt.Errorf("设备 %s 的 auth_mode 非法: %q", id.DeviceKey, id.Mode))
@@ -232,29 +234,36 @@ func (a *Authenticator) Authenticate(ctx context.Context, req Request) (*Result,
 			// 默认拒绝 A 档：它必须被显式开启（ADR-008 决策反转）。
 			return a.reject(ReasonModeMismatch, errors.New("项目级凭据（A 档）未在本网关开启"))
 		}
+		if a.isBlacklisted(req.ClientID, req.RemoteIP, id.ProjectID) {
+			return a.reject(ReasonBlacklisted, nil)
+		}
 		if err := a.verifyProject(ctx, id, req); err != nil {
-			return a.rejectFor(ReasonBadCredential, err, req.ClientID, req.RemoteIP)
+			return a.rejectFor(classifyVerifyErr(err), err, req.ClientID, req.RemoteIP, id.ProjectID)
 		}
 
 	case ModePerDevice:
 		if req.ClientID != req.Username || req.Username != id.DeviceKey {
 			// 03 §2.1：clientID == username == device_key 的强校验阻止跨设备冒用。
 			return a.rejectFor(ReasonBadCredential,
-				fmt.Errorf("clientID/username/device_key 不一致"), req.ClientID, req.RemoteIP)
+				fmt.Errorf("clientID/username/device_key 不一致"), req.ClientID, req.RemoteIP, 0)
 		}
 		if err := a.verifyArgon2(ctx, id.Secret, req.Password); err != nil {
-			return a.rejectFor(classifyVerifyErr(err), err, req.ClientID, req.RemoteIP)
+			return a.rejectFor(classifyVerifyErr(err), err, req.ClientID, req.RemoteIP, 0)
 		}
 
 	case ModeMTLS:
 		if !req.TLSVerified || req.TLSCommonName != id.DeviceKey {
 			return a.rejectFor(ReasonBadCredential,
 				fmt.Errorf("mTLS 证书未校验或 CN(%q) 与 device_key(%q) 不一致", req.TLSCommonName, id.DeviceKey),
-				req.ClientID, req.RemoteIP)
+				req.ClientID, req.RemoteIP, 0)
 		}
 	}
 
-	a.clearFailures(req.ClientID, req.RemoteIP)
+	projectID := int64(0)
+	if id.Mode == ModeProject {
+		projectID = id.ProjectID
+	}
+	a.clearFailures(req.ClientID, req.RemoteIP, projectID)
 	a.metrics.Success.Add(1)
 
 	return &Result{
@@ -338,12 +347,12 @@ func (a *Authenticator) reject(r Reason, err error) (*Result, error) {
 }
 
 // rejectFor 在计数失败的同时维护失败窗口与黑名单。
-func (a *Authenticator) rejectFor(r Reason, err error, clientID, ip string) (*Result, error) {
+func (a *Authenticator) rejectFor(r Reason, err error, clientID, ip string, projectID int64) (*Result, error) {
 	a.metrics.countFailure(r)
 
 	// 过载与后端不可用**不计入**失败窗口：它们与设备行为无关。
 	if r != ReasonOverloaded && r != ReasonDirectoryDown {
-		a.recordFailure(clientID, ip)
+		a.recordFailure(clientID, ip, projectID)
 	}
 	return nil, fail(r, err)
 }
@@ -356,7 +365,7 @@ func (a *Authenticator) rejectFor(r Reason, err error, clientID, ip string) (*Re
 // 一个防滥用的机制自己变成内存泄漏点，是典型的安全设计反面教材。
 const maxFailCounters = 50_000
 
-func (a *Authenticator) recordFailure(clientID, ip string) {
+func (a *Authenticator) recordFailure(clientID, ip string, projectID int64) {
 	now := a.now()
 
 	a.mu.Lock()
@@ -369,6 +378,9 @@ func (a *Authenticator) recordFailure(clientID, ip string) {
 	}
 	if ip != "" && a.bumpLocked("ip:"+ip, now, a.policy.FailLimitPerIP) {
 		a.blacklist["ip:"+ip] = now.Add(a.policy.BlacklistTTL)
+	}
+	if projectID > 0 && a.bumpLocked(fmt.Sprintf("project:%d", projectID), now, a.policy.FailLimitPerProjectKey) {
+		a.blacklist[fmt.Sprintf("project:%d", projectID)] = now.Add(a.policy.BlacklistTTL)
 	}
 }
 
@@ -404,7 +416,7 @@ func (a *Authenticator) bumpLocked(key string, now time.Time, limit int) bool {
 
 // clearFailures 在认证成功后清空该设备的窗口计数，
 // 避免「偶发失败累积到阈值」误伤正常设备。
-func (a *Authenticator) clearFailures(clientID, ip string) {
+func (a *Authenticator) clearFailures(clientID, ip string, projectID int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -412,9 +424,12 @@ func (a *Authenticator) clearFailures(clientID, ip string) {
 	if ip != "" {
 		delete(a.failCounts, "ip:"+ip)
 	}
+	if projectID > 0 {
+		delete(a.failCounts, fmt.Sprintf("project:%d", projectID))
+	}
 }
 
-func (a *Authenticator) isBlacklisted(clientID, ip string) bool {
+func (a *Authenticator) isBlacklisted(clientID, ip string, projectID int64) bool {
 	now := a.now()
 
 	a.mu.Lock()
@@ -424,6 +439,9 @@ func (a *Authenticator) isBlacklisted(clientID, ip string) bool {
 		return true
 	}
 	if ip != "" && a.blacklistedLocked("ip:"+ip, now) {
+		return true
+	}
+	if projectID > 0 && a.blacklistedLocked(fmt.Sprintf("project:%d", projectID), now) {
 		return true
 	}
 	return false

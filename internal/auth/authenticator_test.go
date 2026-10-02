@@ -132,6 +132,50 @@ func TestAuthenticate_项目级默认关闭(t *testing.T) {
 	}
 }
 
+func TestAuthenticate_项目级失败跨设备聚合(t *testing.T) {
+	makeProjectDevice := func(key string) *Identity {
+		id := mustDevice(t, key, "", ModeProject)
+		id.ProjectTokenHash = HashToken("access-token")
+		salt, err := NewSalt()
+		if err != nil {
+			t.Fatalf("生成项目密钥盐失败: %v", err)
+		}
+		id.ProjectKey = HashSecret("project-key", testParams, salt)
+		return id
+	}
+
+	idA := makeProjectDevice("dev-A")
+	idB := makeProjectDevice("dev-B")
+	byKey := map[string]*Identity{"dev-A": idA, "dev-B": idB}
+	policy := DefaultPolicy()
+	policy.AllowProjectMode = true
+	policy.FailLimitPerDevice = 100
+	policy.FailLimitPerIP = 100
+	policy.FailLimitPerProjectKey = 2
+	a := NewAuthenticator(DirectoryFunc(func(_ context.Context, key string) (*Identity, error) {
+		return byKey[key], nil
+	}), policy, new(Metrics))
+
+	bad := func(clientID, ip string) {
+		t.Helper()
+		_, err := a.Authenticate(context.Background(), Request{
+			ClientID: clientID, Username: "access-token", Password: "wrong", RemoteIP: ip,
+		})
+		if reasonOf(t, err) != ReasonBadCredential {
+			t.Fatalf("项目级失败第 %s 次应为 bad_credential，得到 %v", clientID, err)
+		}
+	}
+
+	bad("dev-A", "10.0.0.1")
+	bad("dev-B", "10.0.0.2")
+	_, err := a.Authenticate(context.Background(), Request{
+		ClientID: "dev-A", Username: "access-token", Password: "wrong", RemoteIP: "10.0.0.3",
+	})
+	if reasonOf(t, err) != ReasonBlacklisted {
+		t.Fatalf("同一项目达到阈值后应跨设备封禁，得到 %v", err)
+	}
+}
+
 // TestAuthenticate_mTLS 覆盖 C 档：CN 必须与 device_key 一致且证书已验证。
 func TestAuthenticate_mTLS(t *testing.T) {
 	id := mustDevice(t, "dev-A", "", ModeMTLS)

@@ -103,6 +103,20 @@ func (d *FileDirectory) Size() int {
 	return d.loaded
 }
 
+// ProjectModeDeviceCount 返回配置中使用 A 档项目级凭据的设备数。
+func (d *FileDirectory) ProjectModeDeviceCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	count := 0
+	for _, id := range d.byKey {
+		if id.Mode == ModeProject {
+			count++
+		}
+	}
+	return count
+}
+
 // Reload 重新加载文件（控制面轮换凭据后调用）。
 func (d *FileDirectory) Reload() error {
 	next, err := LoadFile(d.path)

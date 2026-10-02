@@ -259,6 +259,9 @@ func buildAuthenticator(source, file string, pool *pgxpool.Pool, anonymous, allo
 	var dir auth.Directory
 	var size int
 	if source == "pg" {
+		if allowProjectMode {
+			return nil, fmt.Errorf("auth-source=pg 当前不支持 A 档 ProjectKey，请关闭 -allow-project-mode 或补齐项目级凭据字段")
+		}
 		if pool == nil {
 			return nil, fmt.Errorf("auth-source=pg 需要业务库连接")
 		}
@@ -273,6 +276,12 @@ func buildAuthenticator(source, file string, pool *pgxpool.Pool, anonymous, allo
 			return nil, fmt.Errorf("%w\n提示：用 -gen-auth-file=%s 生成一份演示凭据，或改用 auth-source=pg", err, file)
 		}
 		dir, size = fileDir, fileDir.Size()
+		if allowProjectMode {
+			projectDevices := fileDir.ProjectModeDeviceCount()
+			if projectDevices > 1000 {
+				return nil, fmt.Errorf("A 档设备数 %d 超过 1000，禁止开启项目级凭据", projectDevices)
+			}
+		}
 	}
 
 	policy := auth.DefaultPolicy()
