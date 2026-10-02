@@ -32,12 +32,17 @@ type Store interface {
 	Active(ctx context.Context, states ...State) ([]*Alarm, error)
 }
 
+type EscalationClaimer interface {
+	ClaimEscalation(ctx context.Context, dedupKey string, stage int) (bool, error)
+}
+
 // MemStore 是内存实现（测试与单机运行）。
 type MemStore struct {
-	mu    sync.Mutex
-	byKey map[string]*Alarm
-	byID  map[string]string // id → dedupKey
-	seq   int64
+	mu         sync.Mutex
+	byKey      map[string]*Alarm
+	byID       map[string]string // id → dedupKey
+	seq        int64
+	escalation map[string]int
 	// CASConflicts 记录冲突次数，供测试断言「并发写入确实被乐观锁挡住」。
 	CASConflicts int64
 }
@@ -46,7 +51,19 @@ var _ Store = (*MemStore)(nil)
 
 // NewMemStore 构造内存存储。
 func NewMemStore() *MemStore {
-	return &MemStore{byKey: make(map[string]*Alarm), byID: make(map[string]string)}
+	return &MemStore{byKey: make(map[string]*Alarm), byID: make(map[string]string), escalation: make(map[string]int)}
+}
+
+func (m *MemStore) ClaimEscalation(_ context.Context, dedupKey string, stage int) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.byKey[dedupKey]
+	if !ok || a.State != StateActive || stage <= m.escalation[dedupKey] {
+		return false, nil
+	}
+	m.escalation[dedupKey] = stage
+	a.EscalationStage = stage
+	return true, nil
 }
 
 // Get 实现 Store。

@@ -68,6 +68,35 @@ func (s *memPublishStore) UnpublishedActive(context.Context) ([]*alarm.Alarm, er
 	return append([]*alarm.Alarm(nil), s.pending...), nil
 }
 
+func (s *memPublishStore) Active(_ context.Context, states ...alarm.State) ([]*alarm.Alarm, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := map[alarm.State]bool{}
+	for _, state := range states {
+		want[state] = true
+	}
+	var out []*alarm.Alarm
+	for _, item := range s.pending {
+		if len(want) > 0 && !want[item.State] {
+			continue
+		}
+		out = append(out, item.Clone())
+	}
+	return out, nil
+}
+
+func (s *memPublishStore) ClaimEscalation(_ context.Context, key string, stage int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range s.pending {
+		if item.DedupKey == key && item.EscalationStage < stage {
+			item.EscalationStage = stage
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func newFakeAgent() (*agent, *fakePublisher, *memPublishStore) {
 	pub := &fakePublisher{}
 	store := &memPublishStore{published: map[string]time.Time{}}
@@ -79,6 +108,28 @@ func newFakeAgent() (*agent, *fakePublisher, *memPublishStore) {
 		logger:  quiet(),
 		now:     func() time.Time { return time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC) },
 	}, pub, store
+}
+
+func TestEscalateUnconfirmedClaimsStageAndPublishes(t *testing.T) {
+	agent, pub, store := newFakeAgent()
+	current := sampleAlarm("alarm-1", "dk1")
+	current.NotifiedTS = agent.now().Add(-31 * time.Minute)
+	store.pending = []*alarm.Alarm{current}
+	agent.notifyEscalationAfter = 30 * time.Minute
+	agent.p1EscalationAfter = 2 * time.Hour
+
+	if err := agent.escalateUnconfirmed(context.Background()); err != nil {
+		t.Fatalf("升级扫描失败: %v", err)
+	}
+	if pub.count() != 1 || pub.subjects[0] != "iot.alarm.escalation.p1" {
+		t.Fatalf("首次升级应发布 escalation subject，得到 subjects=%v", pub.subjects)
+	}
+	if err := agent.escalateUnconfirmed(context.Background()); err != nil {
+		t.Fatalf("重复升级扫描失败: %v", err)
+	}
+	if pub.count() != 1 {
+		t.Fatalf("同一升级阶段不应重复发布，得到 %d 条", pub.count())
+	}
 }
 
 func sampleAlarm(id, dedup string) *alarm.Alarm {

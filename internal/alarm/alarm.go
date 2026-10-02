@@ -97,7 +97,8 @@ type Alarm struct {
 	ClosedTS    time.Time
 
 	// NotifyCount 通知次数（聚合时累加，04 §2.2）。
-	NotifyCount int
+	NotifyCount     int
+	EscalationStage int
 	// FlapCount 抖动次数：resolved 期间再次触发。
 	FlapCount int
 
@@ -184,8 +185,9 @@ type Decision struct {
 	// Notify 为 true 时调用方应发出通知（只有 ActionNotified / ActionBatched 会置位）。
 	Notify bool
 	// Escalate 为 true 时需 P1 升级（风暴熔断，04 §2.2）。
-	Escalate bool
-	Reason   string
+	Escalate        bool
+	EscalationStage int
+	Reason          string
 }
 
 // DedupKey 计算去重键（04 §2.2）：同一设备同一规则只允许一个活跃告警。

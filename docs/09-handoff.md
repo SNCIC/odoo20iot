@@ -35,6 +35,8 @@
 
 **升级通知增量（2026-10-02）**：`svc-notify` 识别告警事件的 `escalated=true`，通知策略可配置 `escalated_recipients` 按通道替换普通收件人；未配置时保持原收件人，兼容现有策略。未确认超时升级仍待 `svc-alarm` 提供确认状态。
 
+**未确认升级增量（2026-10-02）**：`svc-alarm` 扫描 `active` 告警的 `notified_ts`，默认 30 分钟发布阶段 1 上级通知，默认 2 小时发布阶段 2 P1 通知；`t_alarm_active.escalation_stage` 通过迁移 `0015_alarm_escalation` 持久化，并用条件更新原子抢占，重启和多副本不会重复升级。策略支持 `ack_escalated_recipients`（阶段 1）与 `escalated_recipients`（阶段 2）。当前仍没有控制台人工确认 API，确认后抑制升级的闭环是后续工作。
+
 下一步：A4 连接压测待有干净环境后再跑；Odoo 侧 S1/S3 集成场景端到端；
 B1 的明细查询限行与预聚合表（P0 性能项）。
 

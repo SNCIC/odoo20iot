@@ -31,6 +31,12 @@ type publisher interface {
 type publishStore interface {
 	MarkPublished(ctx context.Context, dedupKey string, at time.Time) error
 	UnpublishedActive(ctx context.Context) ([]*alarm.Alarm, error)
+	Active(ctx context.Context, states ...alarm.State) ([]*alarm.Alarm, error)
+}
+
+type escalationClaimer interface {
+	ClaimEscalation(ctx context.Context, dedupKey string, stage int) (bool, error)
+	Active(ctx context.Context, states ...alarm.State) ([]*alarm.Alarm, error)
 }
 
 // counters 是本服务的运行计数。
@@ -51,15 +57,17 @@ type counters struct {
 
 // agent 把引擎、存储与发布器接成一个可运行的推进循环。
 type agent struct {
-	engine  *alarm.Engine
-	store   publishStore
-	pool    *pgxpool.Pool
-	pub     publisher
-	lockKey int64
-	metrics *alarm.Metrics
-	counts  *counters
-	logger  *slog.Logger
-	now     func() time.Time
+	engine                *alarm.Engine
+	store                 publishStore
+	pool                  *pgxpool.Pool
+	pub                   publisher
+	lockKey               int64
+	metrics               *alarm.Metrics
+	counts                *counters
+	logger                *slog.Logger
+	now                   func() time.Time
+	notifyEscalationAfter time.Duration
+	p1EscalationAfter     time.Duration
 }
 
 // scanOnce 执行一轮扫描：抢锁 → Tick → 分发 → 补发。
@@ -90,12 +98,54 @@ func (a *agent) scanOnce(ctx context.Context) error {
 		return fmt.Errorf("扫描推进: %w", err)
 	}
 	a.dispatch(ctx, ds)
+	if err := a.escalateUnconfirmed(ctx); err != nil {
+		a.counts.ScanErrors.Add(1)
+		return err
+	}
 
 	// 补发：把「已 active 但事件没发出去」的捞回来。
 	// 没有这一步，一次 NATS 抖动就会静默丢掉那批工单。
 	if err := a.republish(ctx); err != nil {
 		a.counts.ScanErrors.Add(1)
 		return err
+	}
+	return nil
+}
+
+func (a *agent) escalateUnconfirmed(ctx context.Context) error {
+	claimer, ok := a.store.(escalationClaimer)
+	if !ok {
+		return nil
+	}
+	alarms, err := a.store.Active(ctx, alarm.StateActive)
+	if err != nil {
+		return fmt.Errorf("查询未确认告警: %w", err)
+	}
+	now := a.now()
+	for _, current := range alarms {
+		if current == nil || current.NotifiedTS.IsZero() {
+			continue
+		}
+		stage := 0
+		if now.Sub(current.NotifiedTS) >= a.p1EscalationAfter {
+			stage = 2
+		} else if now.Sub(current.NotifiedTS) >= a.notifyEscalationAfter {
+			stage = 1
+		}
+		if stage == 0 {
+			continue
+		}
+		claimed, err := claimer.ClaimEscalation(ctx, current.DedupKey, stage)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			continue
+		}
+		d := alarm.Decision{Alarm: current, Action: alarm.ActionNotified, Notify: true,
+			Escalate: stage >= 1, EscalationStage: stage,
+			Reason: fmt.Sprintf("未确认超过 %s，升级阶段 %d", now.Sub(current.NotifiedTS).Round(time.Second), stage)}
+		a.publishDecision(ctx, d)
 	}
 	return nil
 }
@@ -147,6 +197,9 @@ func (a *agent) publishDecision(ctx context.Context, d alarm.Decision) bool {
 	}
 
 	subject := alarm.AlarmSubject(ev.ProjectID)
+	if ev.Escalated || ev.EscalationStage > 0 {
+		subject = alarm.AlarmSubjectPrefix + ".escalation." + ev.ProjectID
+	}
 	if err := a.pub.Publish(ctx, subject, data); err != nil {
 		a.counts.PublishErrors.Add(1)
 		// 不在这里重试：这一轮的状态已经落库为 active，扫描不会再产出这条决策。

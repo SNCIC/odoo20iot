@@ -35,20 +35,22 @@ type policyFile struct {
 }
 
 type policySpec struct {
-	Groups              []string            `json:"groups"`
-	Channels            []string            `json:"channels"`
-	Template            string              `json:"template"`
-	Recipients          map[string][]string `json:"recipients"`
-	EscalatedRecipients map[string][]string `json:"escalated_recipients"`
+	Groups                 []string            `json:"groups"`
+	Channels               []string            `json:"channels"`
+	Template               string              `json:"template"`
+	Recipients             map[string][]string `json:"recipients"`
+	EscalatedRecipients    map[string][]string `json:"escalated_recipients"`
+	AckEscalatedRecipients map[string][]string `json:"ack_escalated_recipients"`
 }
 
 func (s policySpec) toPolicy() notify.Policy {
 	return notify.Policy{
-		Groups:              s.Groups,
-		Channels:            s.Channels,
-		Template:            s.Template,
-		Recipients:          s.Recipients,
-		EscalatedRecipients: s.EscalatedRecipients,
+		Groups:                 s.Groups,
+		Channels:               s.Channels,
+		Template:               s.Template,
+		Recipients:             s.Recipients,
+		EscalatedRecipients:    s.EscalatedRecipients,
+		AckEscalatedRecipients: s.AckEscalatedRecipients,
 	}
 }
 

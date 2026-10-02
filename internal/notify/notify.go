@@ -77,6 +77,8 @@ type Policy struct {
 	Recipients map[string][]string
 	// EscalatedRecipients 是升级事件的专用收件人；为空时沿用 Recipients。
 	EscalatedRecipients map[string][]string
+	// AckEscalatedRecipients 是首次未确认升级（阶段 1）的收件人。
+	AckEscalatedRecipients map[string][]string
 }
 
 // Validate 检查策略是否可用。

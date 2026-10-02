@@ -82,3 +82,26 @@ func TestRLSHardeningMigrationCoversIntegrationIssues(t *testing.T) {
 		}
 	}
 }
+
+func TestAlarmEscalationMigrationAddsPersistentStage(t *testing.T) {
+	migs, err := LoadMigrations()
+	if err != nil {
+		t.Fatalf("LoadMigrations: %v", err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.Version == "0015_alarm_escalation" {
+			sql = m.SQL
+			break
+		}
+	}
+	for _, want := range []string{
+		"ADD COLUMN IF NOT EXISTS escalation_stage",
+		"ck_alarm_escalation_stage",
+		"idx_alarm_active_escalation",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("0015 缺少关键升级语句 %q", want)
+		}
+	}
+}

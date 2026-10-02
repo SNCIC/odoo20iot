@@ -525,12 +525,12 @@ utils.math.clamp(v, min, max), utils.json.parse/stringify
 }
 ```
 
-风暴熔断产生的升级事件携带 `escalated=true`。通知策略可额外配置
-`escalated_recipients`，按通道替换普通收件人；未配置时沿用 `recipients`，例如：
+风暴熔断产生的升级事件携带 `escalated=true`。未确认告警的阶段 1（默认 30 分钟）和阶段 2（默认 2 小时）均携带 `escalation_stage`；通知策略可分别配置升级收件人。未配置时沿用 `recipients`，例如：
 
 ```json
 {
   "recipients": { "webhook": ["https://ops.example/hook"] },
+  "ack_escalated_recipients": { "webhook": ["https://leader.example/hook"] },
   "escalated_recipients": { "webhook": ["https://p1.example/hook"] }
 }
 ```

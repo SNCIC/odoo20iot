@@ -52,19 +52,21 @@ const alarmStream = "IOT_ALARM"
 const nakDelay = 500 * time.Millisecond
 
 type config struct {
-	pgDSN          string
-	natsURL        string
-	httpAddr       string
-	scanInterval   time.Duration
-	scanTimeout    time.Duration
-	eventRetention time.Duration
-	triggerSubject string
-	triggerStream  string
-	triggerDurable string
-	ackWait        time.Duration
-	fetchBatch     int
-	readyProbe     time.Duration
-	logFormat      string
+	pgDSN                 string
+	natsURL               string
+	httpAddr              string
+	scanInterval          time.Duration
+	scanTimeout           time.Duration
+	eventRetention        time.Duration
+	triggerSubject        string
+	triggerStream         string
+	triggerDurable        string
+	ackWait               time.Duration
+	fetchBatch            int
+	readyProbe            time.Duration
+	logFormat             string
+	notifyEscalationAfter time.Duration
+	p1EscalationAfter     time.Duration
 }
 
 func main() {
@@ -86,6 +88,8 @@ func parseFlags() config {
 	flag.StringVar(&cfg.triggerSubject, "trigger-subject", alarm.TriggerSubject, "规则触发 subject；置空则只做定时扫描")
 	flag.StringVar(&cfg.triggerStream, "trigger-stream", "IOT_RULE", "规则触发的流名")
 	flag.StringVar(&cfg.triggerDurable, "trigger-durable", "svc-alarm", "durable consumer 名")
+	flag.DurationVar(&cfg.notifyEscalationAfter, "notify-escalation-after", 30*time.Minute, "未确认告警首次升级等待时间")
+	flag.DurationVar(&cfg.p1EscalationAfter, "p1-escalation-after", 2*time.Hour, "未确认告警 P1 升级等待时间")
 	flag.DurationVar(&cfg.ackWait, "ack-wait", 30*time.Second, "总线等待 ACK 的上限")
 	flag.IntVar(&cfg.fetchBatch, "fetch-batch", 256, "单次拉取的消息数")
 	flag.DurationVar(&cfg.readyProbe, "ready-probe", 3*time.Second, "就绪探测超时")
@@ -173,15 +177,17 @@ func run(cfg config) error {
 		return err
 	}
 	app := &agent{
-		engine:  engine,
-		store:   store,
-		pool:    pool,
-		pub:     &natsPublisher{js: js},
-		lockKey: pg.AdvisoryKey("svc-alarm:scan"),
-		metrics: metrics,
-		counts:  counts,
-		logger:  logger,
-		now:     time.Now,
+		engine:                engine,
+		store:                 store,
+		pool:                  pool,
+		pub:                   &natsPublisher{js: js},
+		lockKey:               pg.AdvisoryKey("svc-alarm:scan"),
+		metrics:               metrics,
+		counts:                counts,
+		logger:                logger,
+		now:                   time.Now,
+		notifyEscalationAfter: cfg.notifyEscalationAfter,
+		p1EscalationAfter:     cfg.p1EscalationAfter,
 	}
 
 	srv := &http.Server{

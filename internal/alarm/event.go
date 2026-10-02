@@ -51,10 +51,11 @@ type Event struct {
 	ConfirmedTS time.Time `json:"confirmed_ts"`
 	NotifiedTS  time.Time `json:"notified_ts"`
 
-	NotifyCount int    `json:"notify_count"`
-	BatchID     string `json:"batch_id,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	Escalated   bool   `json:"escalated,omitempty"`
+	NotifyCount     int    `json:"notify_count"`
+	BatchID         string `json:"batch_id,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	Escalated       bool   `json:"escalated,omitempty"`
+	EscalationStage int    `json:"escalation_stage,omitempty"`
 
 	// MetricSnapshot 是触发时的取值快照（07 §6 S3 的 iot_metric_snapshot）。
 	MetricSnapshot json.RawMessage `json:"metric_snapshot,omitempty"`
@@ -72,24 +73,25 @@ func NewEvent(d Decision) (Event, bool) {
 	}
 	a := d.Alarm
 	return Event{
-		AlarmID:        a.ID,
-		DedupKey:       a.DedupKey,
-		ProjectID:      a.ProjectID,
-		DeviceID:       a.DeviceID,
-		DeviceTypeID:   a.DeviceTypeID,
-		RuleID:         a.RuleID,
-		RuleName:       a.RuleName,
-		Level:          a.Level,
-		State:          a.State,
-		Action:         d.Action,
-		FirstTS:        a.FirstTS,
-		LastTS:         a.LastTS,
-		ConfirmedTS:    a.ConfirmedTS,
-		NotifiedTS:     a.NotifiedTS,
-		NotifyCount:    a.NotifyCount,
-		BatchID:        a.BatchID,
-		Reason:         d.Reason,
-		Escalated:      d.Escalate,
-		MetricSnapshot: normalizeValue(a.TriggerValue),
+		AlarmID:         a.ID,
+		DedupKey:        a.DedupKey,
+		ProjectID:       a.ProjectID,
+		DeviceID:        a.DeviceID,
+		DeviceTypeID:    a.DeviceTypeID,
+		RuleID:          a.RuleID,
+		RuleName:        a.RuleName,
+		Level:           a.Level,
+		State:           a.State,
+		Action:          d.Action,
+		FirstTS:         a.FirstTS,
+		LastTS:          a.LastTS,
+		ConfirmedTS:     a.ConfirmedTS,
+		NotifiedTS:      a.NotifiedTS,
+		NotifyCount:     a.NotifyCount,
+		BatchID:         a.BatchID,
+		Reason:          d.Reason,
+		Escalated:       d.Escalate,
+		EscalationStage: d.EscalationStage,
+		MetricSnapshot:  normalizeValue(a.TriggerValue),
 	}, true
 }

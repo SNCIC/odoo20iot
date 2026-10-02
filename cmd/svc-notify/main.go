@@ -527,7 +527,10 @@ func (n *notifier) handleEvent(ctx context.Context, data []byte) error {
 		}
 		return err
 	}
-	if ev.Escalated && len(policy.EscalatedRecipients) > 0 {
+	if ev.EscalationStage == 1 && len(policy.AckEscalatedRecipients) > 0 {
+		policy.Recipients = policy.AckEscalatedRecipients
+	}
+	if (ev.EscalationStage >= 2 || (ev.Escalated && ev.EscalationStage == 0)) && len(policy.EscalatedRecipients) > 0 {
 		policy.Recipients = policy.EscalatedRecipients
 	}
 
