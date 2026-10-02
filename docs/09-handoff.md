@@ -29,7 +29,7 @@
 `internal/natsjs`；且 `natsjs.Subscribe` 的返回值已收窄为**不暴露 `Unsubscribe`**，使该缺陷在类型上**无法再被写出来**
 （坑 42/47）。`svc-quota` 的用量重复计数已用真 NATS 演练复现并消除（见 §4 第 21 项）。
 
-**本轮新增（2026-10-02）**：A 档 ProjectKey 失败按 `project_id` 聚合封禁，文件凭据源启用 A 档时对 A 档设备条目数执行 1000 上限；PG 凭据源与 A 档组合 fail-fast。MQTT 网关已部署 TLS 1.3 listener，真实内部 CA/服务端证书握手验证通过；mTLS 客户端证书生命周期仍待验证。网关已将 PG 凭据目录中的真实 `device_id` / `project_id` / `device_type_id` 写入信封，认证身份缺失时拒绝落库路径。
+**本轮新增（2026-10-02）**：A 档 ProjectKey 失败按 `project_id` 聚合封禁，文件凭据源启用 A 档时对 A 档设备条目数执行 1000 上限；PG 凭据源与 A 档组合 fail-fast。MQTT 网关已部署 TLS 1.3 listener，真实内部 CA/服务端证书握手验证通过；新增 mTLS 设备证书签发/轮换脚本，并用临时 CA 验证正确 CA、错误 CA、过期证书场景。生产网关仍保持单向 TLS，待所有设备证书和认证模式完成切换后再启用客户端 CA。网关已将 PG 凭据目录中的真实 `device_id` / `project_id` / `device_type_id` 写入信封，认证身份缺失时拒绝落库路径。
 
 **RLS 增量（2026-10-02）**：新增迁移 `0014_rls_hardening`，对 `t_integration_issue` 启用并强制 RLS，补齐 `project_id` 非空、租户策略和包含 `project_id` 的唯一键；`extref.Store` 的问题记录/解决路径改为显式租户事务。新增迁移 `0020_force_ready_rls`，对已完成租户事务改造的 `t_notification_endpoint`、`t_audit_log` 启用 `FORCE ROW LEVEL SECURITY`，已应用到开发库；目录、告警、DLQ 等表仍需分批迁移，不能一次性强制。
 
@@ -37,7 +37,7 @@
 
 **未确认升级增量（2026-10-02）**：`svc-alarm` 扫描 `active` 告警的 `notified_ts`，默认 30 分钟发布阶段 1 上级通知，默认 2 小时发布阶段 2 P1 通知；`t_alarm_active.escalation_stage` 通过迁移 `0015_alarm_escalation` 持久化，并用条件更新原子抢占，重启和多副本不会重复升级。策略支持 `ack_escalated_recipients`（阶段 1）与 `escalated_recipients`（阶段 2）。控制台人工确认 API 已实现：`POST /api/v1/alarms/{alarm_id}/ack`，需要 `alarm:write` scope；确认写入 `t_audit_log` 并抑制后续升级。
 
-下一步：A4 连接压测明确暂缓；继续完成目录/告警表的租户事务改造、非 owner 应用账号切换、mTLS 设备证书生命周期，以及独立 `svc-rule` 消费服务的生产接入。Odoo S1/S3 已完成本轮真实链路验收：手工触发 Outbox cron 投递 2 条 pending 事件，Redis Stream consumer `odoo-connector` 的 `pending=0、lag=0`，设备主数据同步和 `t_external_ref` 均已核验；定时 cron 仍保持关闭，避免开发环境自动对外通知。
+下一步：A4 连接压测明确暂缓；继续完成目录/告警表的租户事务改造、非 owner 应用账号切换，以及独立 `svc-rule` 消费服务的生产接入。mTLS 已具备签发和负面校验工具，仍需现场设备逐台切换与网关端到端启用验收。Odoo S1/S3 已完成本轮真实链路验收：手工触发 Outbox cron 投递 2 条 pending 事件，Redis Stream consumer `odoo-connector` 的 `pending=0、lag=0`，设备主数据同步和 `t_external_ref` 均已核验；定时 cron 仍保持关闭，避免开发环境自动对外通知。
 
 ---
 
