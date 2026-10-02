@@ -72,25 +72,28 @@ RETURNING id, project_id, odoo_company_id, ext_system, ext_model, ext_id, ext_ve
 			&out.ExtVersion, &out.LocalEntity, &out.LocalID, &out.BindSource, &out.BindConfidence, &out.Status, &out.SyncedAt, &out.UpdatedAt)
 	})
 	if err == nil {
-		_ = s.ResolveIssue(ctx, ref.ExtSystem, ref.ExtModel, ref.ExtID, "unbound")
+		_ = s.ResolveIssueForProject(ctx, ref.ProjectID, ref.ExtSystem, ref.ExtModel, ref.ExtID, "unbound")
 	}
 	return out, err
 }
 
 func (s *Store) RecordIssue(ctx context.Context, issue IntegrationIssue) error {
-	if issue.System == "" || issue.Model == "" || issue.ExternalID <= 0 || issue.Type == "" {
+	if issue.ProjectID <= 0 || issue.System == "" || issue.Model == "" || issue.ExternalID <= 0 || issue.Type == "" {
 		return fmt.Errorf("extref: 集成问题字段非法")
 	}
 	details, err := json.Marshal(issue.Details)
 	if err != nil {
 		return fmt.Errorf("extref: 序列化问题详情: %w", err)
 	}
-	_, err = s.pool.Exec(ctx, `
+	err = pg.WithProjectTx(ctx, s.pool, issue.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
 INSERT INTO t_integration_issue (project_id, ext_system, ext_model, ext_id, issue_type, details)
 VALUES ($1,$2,$3,$4,$5,$6)
-ON CONFLICT (ext_system, ext_model, ext_id, issue_type) DO UPDATE SET
+ON CONFLICT (project_id, ext_system, ext_model, ext_id, issue_type) DO UPDATE SET
  project_id=EXCLUDED.project_id, details=EXCLUDED.details, status='open', last_seen_at=now(), resolved_at=NULL`,
-		issue.ProjectID, issue.System, issue.Model, issue.ExternalID, issue.Type, details)
+			issue.ProjectID, issue.System, issue.Model, issue.ExternalID, issue.Type, details)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("extref: 记录集成问题: %w", err)
 	}
@@ -98,8 +101,14 @@ ON CONFLICT (ext_system, ext_model, ext_id, issue_type) DO UPDATE SET
 }
 
 func (s *Store) ResolveIssue(ctx context.Context, system, model string, externalID int64, issueType string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE t_integration_issue SET status='resolved', resolved_at=now(), last_seen_at=now() WHERE ext_system=$1 AND ext_model=$2 AND ext_id=$3 AND issue_type=$4`, system, model, externalID, issueType)
-	return err
+	return fmt.Errorf("extref: ResolveIssue 缺少 project_id；请使用 ResolveIssueForProject")
+}
+
+func (s *Store) ResolveIssueForProject(ctx context.Context, projectID int64, system, model string, externalID int64, issueType string) error {
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE t_integration_issue SET status='resolved', resolved_at=now(), last_seen_at=now() WHERE project_id=$1 AND ext_system=$2 AND ext_model=$3 AND ext_id=$4 AND issue_type=$5`, projectID, system, model, externalID, issueType)
+		return err
+	})
 }
 
 func (s *Store) FindByLocal(ctx context.Context, projectID int64, entity string, localID int64) (Ref, error) {

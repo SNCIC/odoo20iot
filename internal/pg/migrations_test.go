@@ -57,3 +57,28 @@ func TestShortTruncatesForReadableErrors(t *testing.T) {
 		t.Fatalf("短摘要应原样返回，得 %q", got)
 	}
 }
+
+func TestRLSHardeningMigrationCoversIntegrationIssues(t *testing.T) {
+	migs, err := LoadMigrations()
+	if err != nil {
+		t.Fatalf("LoadMigrations: %v", err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.Version == "0014_rls_hardening" {
+			sql = m.SQL
+			break
+		}
+	}
+	for _, want := range []string{
+		"ALTER TABLE t_integration_issue ENABLE ROW LEVEL SECURITY",
+		"ALTER TABLE t_integration_issue FORCE ROW LEVEL SECURITY",
+		"ALTER COLUMN project_id SET NOT NULL",
+		"UNIQUE (project_id, ext_system, ext_model, ext_id, issue_type)",
+		"CREATE POLICY tenant_integration_issue",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("0014 缺少关键 RLS 语句 %q", want)
+		}
+	}
+}

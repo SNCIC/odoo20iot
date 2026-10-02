@@ -31,6 +31,8 @@
 
 **本轮新增（2026-10-02）**：A 档 ProjectKey 失败按 `project_id` 聚合封禁，文件凭据源启用 A 档时对 A 档设备条目数执行 1000 上限；PG 凭据源与 A 档组合 fail-fast。MQTT 网关新增 TLS 1.3 listener 配置与 mTLS 客户端 CA 强制校验，C 档仍校验证书 CN 与 `device_key` 一致。`go test ./...` 全绿并已推送；未配置/部署真实证书，生产 TLS/mTLS 现场握手与设备证书生命周期仍待验证。
 
+**RLS 增量（2026-10-02）**：新增迁移 `0014_rls_hardening`，对 `t_integration_issue` 启用并强制 RLS，补齐 `project_id` 非空、租户策略和包含 `project_id` 的唯一键；`extref.Store` 的问题记录/解决路径改为显式租户事务。其余租户表暂未启用 `FORCE ROW LEVEL SECURITY`，需先完成告警 Store 的全量租户事务改造，再切换生产非超管应用账号。
+
 下一步：A4 连接压测待有干净环境后再跑；Odoo 侧 S1/S3 集成场景端到端；
 B1 的明细查询限行与预聚合表（P0 性能项）。
 
