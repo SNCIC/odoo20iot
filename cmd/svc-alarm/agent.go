@@ -143,7 +143,7 @@ func (a *agent) escalateUnconfirmed(ctx context.Context) error {
 			continue
 		}
 		d := alarm.Decision{Alarm: current, Action: alarm.ActionNotified, Notify: true,
-			Escalate: stage >= 1, EscalationStage: stage,
+			Escalate: stage >= 2, EscalationStage: stage,
 			Reason: fmt.Sprintf("未确认超过 %s，升级阶段 %d", now.Sub(current.NotifiedTS).Round(time.Second), stage)}
 		a.publishDecision(ctx, d)
 	}
