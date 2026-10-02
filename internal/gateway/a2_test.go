@@ -37,6 +37,10 @@ type fakePublisher struct {
 	closed bool
 }
 
+type discardLifecyclePublisher struct{}
+
+func (discardLifecyclePublisher) Publish(context.Context, string, []byte) error { return nil }
+
 var _ Publisher = (*fakePublisher)(nil)
 
 func (f *fakePublisher) Publish(ctx context.Context, subject string, payload []byte) error {
@@ -110,12 +114,13 @@ func newTestBrokerWithRouter(t *testing.T, pub Publisher, timeout time.Duration,
 
 	metrics := new(Metrics)
 	b, err := New(context.Background(), Options{
-		MQTTAddr:      "127.0.0.1:0",
-		Publisher:     pub,
-		Router:        router,
-		PubackTimeout: timeout,
-		Metrics:       metrics,
-		Log:           testLogger(),
+		MQTTAddr:                 "127.0.0.1:0",
+		Publisher:                pub,
+		DeviceLifecyclePublisher: discardLifecyclePublisher{},
+		Router:                   router,
+		PubackTimeout:            timeout,
+		Metrics:                  metrics,
+		Log:                      testLogger(),
 		// 这组用例验证的是 QoS1 确认时序，与认证无关；
 		// 放行匿名必须显式声明（见 Options.AllowAnonymous）。
 		AllowAnonymous:     true,

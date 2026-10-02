@@ -624,17 +624,17 @@ type Batcher[T any] struct {
 | # | 事实 | 影响 |
 |---|---|---|
 | 1 | **LWT 只在非正常断线时由 Broker 发布**（TCP 异常断开、KeepAlive 超时、Broker 检测到故障）；**客户端正常发 DISCONNECT 不会触发 LWT** | 正常下线不会产生 `offline` 事件 → 必须有「正常 DISCONNECT 处理路径」 |
-| 2 | **Broker 不会把 LWT 自动转成内部事件** —— LWT 只是往某个 topic 发一条消息，需要**网关 Hook / 桥接显式实现**：捕获 LWT topic → 发布内部 `iot.device.offline` | 机制上等同于 §1.4 的跨节点路由；实现位置在 `gw-mqtt` 的 Hook 层（`OnPublish` 或会话状态回调） |
+| 2 | **Broker 不会把 LWT 自动转成内部事件**。当前网关由 `OnDisconnect` 对正常与异常断开统一发布一次 `iot.device.offline`，不再另行翻译 LWT topic，以免与断开回调重复；LWT payload 本身不进入该生命周期事件 | `iot.device.offline` 投递到 `IOT_DEVICE_EVENTS` JetStream；订阅端按 `event_id` 幂等处理 |
 | 3 | **TTL 扫描只能作兜底**，不能作为主路径 | 主路径 = LWT（异常断线）+ 显式 DISCONNECT（正常下线）；兜底 = `svc-device` 每 30s 扫 Redis 中 TTL 过期但在线标记未清的设备（对应 01 文档 §6.3） |
 
 **实现要点**：
 
 ```
-设备异常断线 → Broker 发布 LWT 到 v1/devices/{key}/events
-                → gw-mqtt Hook 捕获 → 发布内部 iot.device.offline
+设备异常断线 → Broker 执行 LWT（设备业务 topic）并调用 OnDisconnect
+                → lifecycle Hook 发布内部 iot.device.offline（LWT 不另桥接）
                 → svc-device 消费 → 更新 Redis 在线态 + PG last_seen_at
 
-设备正常 DISCONNECT → gw-mqtt 会话回调 → 直接发布 iot.device.offline
+设备正常 DISCONNECT → OnDisconnect → lifecycle Hook 发布 iot.device.offline
                        （不能依赖 LWT）
 
 双路径都未生效（Hook 丢失 / Broker 崩溃）→ 30s TTL 扫描兜底

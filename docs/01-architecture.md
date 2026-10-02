@@ -330,7 +330,7 @@ svc-pipeline 解析回复 → NATS publish iot.cmd.reply.{project}.{deviceID}
 | **正常下线** | 设备发 DISCONNECT | `gw-mqtt` 会话回调 → 直接发布 `iot.device.offline`。**不能依赖 LWT**（LWT 只在非正常断线时触发） |
 | **兜底** | 双路径都失效 | `svc-device` 每 30s 扫 Redis 中 TTL 过期但标记仍在线的设备 |
 
-- 设备 CONNECT 成功 → `gw-mqtt` 幂等写 Redis `cache:{project}:{co}:device:online:v1:{id}`（TTL = keepalive × 2.5）+ 发布 `iot.device.online`。
+- 设备 CONNECT 成功 → 网关会话 Hook 发布 `iot.device.online`；正常与异常断开统一由 `OnDisconnect` 发布 `iot.device.offline`。事件进入 JetStream `IOT_DEVICE_EVENTS`，字段为 `event_id/event/device_key/occurred_at`。当前 Redis 在线状态仍由 A3 的 `gw:client:{device_key}` 位置键表达；不再使用旧的 `cache:*:online:v1:*` 键。
 - `svc-device` 消费 `iot.device.*` 后更新 PG `last_seen_at`（**仅作审计与历史摘要**）。
 - **实时在线判定以会话注册表（Redis `d:conn` / Broker 会话状态）为事实**，不用 PG 判定在线（评审 R-14）。LWT 的三个语义边界详见 03 文档 §5.2。
 

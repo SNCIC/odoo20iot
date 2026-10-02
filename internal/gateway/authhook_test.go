@@ -50,13 +50,14 @@ func newAuthBroker(t *testing.T) (*Broker, *auth.Authenticator, *Metrics) {
 
 	metrics := new(Metrics)
 	broker, err := New(context.Background(), Options{
-		MQTTAddr:      "127.0.0.1:0",
-		Publisher:     &fakePublisher{},
-		Router:        ContractRouter{Project: "spike"},
-		PubackTimeout: 5 * time.Second,
-		Metrics:       metrics,
-		Log:           testLogger(),
-		Authenticator: authenticator,
+		MQTTAddr:                 "127.0.0.1:0",
+		Publisher:                &fakePublisher{},
+		DeviceLifecyclePublisher: discardLifecyclePublisher{},
+		Router:                   ContractRouter{Project: "spike"},
+		PubackTimeout:            5 * time.Second,
+		Metrics:                  metrics,
+		Log:                      testLogger(),
+		Authenticator:            authenticator,
 	})
 	if err != nil {
 		t.Fatalf("构造带认证的 broker 失败: %v", err)

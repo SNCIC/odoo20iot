@@ -21,7 +21,8 @@ type Options struct {
 	// MQTTAddr 是 MQTT 监听地址（TCP）。
 	MQTTAddr string
 	// Publisher 是内部事件总线的同步投递器，A2 时序依赖它。
-	Publisher Publisher
+	Publisher                Publisher
+	DeviceLifecyclePublisher DeviceLifecyclePublisher
 	// Router 把设备 topic 映射为总线 subject。
 	Router SubjectRouter
 	// ProjectID / DeviceTypeID 是 Phase 0 的信封归属占位值（见 internal/envelope）。
@@ -92,6 +93,11 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	}
 	if opts.Router == nil {
 		return nil, fmt.Errorf("Options.Router 不能为空")
+	}
+	if opts.DeviceLifecyclePublisher == nil {
+		// 测试和嵌入式调用方可复用主发布器；生产入口传入独立的
+		// IOT_DEVICE_EVENTS 发布器，避免生命周期事件混入遥测流。
+		opts.DeviceLifecyclePublisher = opts.Publisher
 	}
 	if opts.PubackTimeout <= 0 {
 		opts.PubackTimeout = DefaultPubackTimeout
@@ -170,6 +176,12 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 			ln.Close()
 			return nil, fmt.Errorf("装载集群 hook: %w", err)
 		}
+	}
+	lifecycleHook := NewDeviceLifecycleHook(runCtx, opts.DeviceLifecyclePublisher, opts.Metrics, opts.Log)
+	if err := server.AddHook(lifecycleHook, nil); err != nil {
+		cancelClose()
+		ln.Close()
+		return nil, fmt.Errorf("装载设备生命周期 hook: %w", err)
 	}
 
 	if err := server.AddListener(listeners.NewNet("mqtt-tcp", ln)); err != nil {

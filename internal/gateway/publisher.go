@@ -156,7 +156,9 @@ type Metrics struct {
 	// QoS0PublishTotal 进入总线投递路径的 QoS0 报文数。
 	QoS0PublishTotal atomic.Int64
 	// QoS0PublishErrorTotal QoS0 投递失败数；QoS0 无设备重传确认语义。
-	QoS0PublishErrorTotal atomic.Int64
+	QoS0PublishErrorTotal        atomic.Int64
+	DeviceLifecyclePublished     atomic.Int64
+	DeviceLifecyclePublishErrors atomic.Int64
 
 	// ---- 认证与 ACL（06 §4：gw_connect_fail_total / gw_auth_cache_hit_ratio）----
 
@@ -211,6 +213,8 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	writeMetric(w, "gw_unsupported_qos_total", "超出端侧契约的 QoS 报文数", m.UnsupportedQosTotal.Load())
 	writeMetric(w, "gw_qos0_publish_total", "进入总线投递路径的 QoS0 报文数", m.QoS0PublishTotal.Load())
 	writeMetric(w, "gw_qos0_publish_error_total", "QoS0 总线投递失败数", m.QoS0PublishErrorTotal.Load())
+	writeMetric(w, "gw_device_lifecycle_published_total", "设备生命周期事件发布数", m.DeviceLifecyclePublished.Load())
+	writeMetric(w, "gw_device_lifecycle_publish_errors_total", "设备生命周期事件发布失败数", m.DeviceLifecyclePublishErrors.Load())
 
 	writeMetric(w, "gw_auth_success_total", "设备认证通过的连接数", m.AuthSuccessTotal.Load())
 	writeMetric(w, "gw_connect_fail_total", "设备认证失败的连接数（见 reason 维度）", m.ConnectFailTotal.Load())

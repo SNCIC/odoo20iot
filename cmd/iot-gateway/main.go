@@ -41,6 +41,7 @@ func main() {
 	clusterPeers := flag.String("cluster-peers", "", "A3 对端节点 ID，逗号分隔")
 	redisURL := flag.String("redis-url", "redis://100.64.0.3:28637/0", "A3 集群 Redis 地址")
 	natsStream := flag.String("nats-stream", "IOT_TELEMETRY", "遥测 Stream 名称（Phase 0 占位，待与 03 对齐）")
+	deviceEventsStream := flag.String("device-events-stream", "IOT_DEVICE_EVENTS", "设备生命周期事件 Stream 名称")
 	natsSubjects := flag.String("nats-subjects", "iot.telemetry.>", "遥测 Stream 捕获的 subject，逗号分隔")
 	pubackTimeout := flag.Duration("puback-timeout", gateway.DefaultPubackTimeout, "等待 PublishAck 的上限（超时则不回 PUBACK）")
 	project := flag.String("project", "spike", "**占位**租户标识：真实租户投影依赖 A1 的凭据注册表")
@@ -109,6 +110,14 @@ func main() {
 	}); err != nil {
 		logger.Fatal("确保遥测 Stream 存在失败", zap.Error(err))
 	}
+	lifecyclePub, err := gateway.NewNATSPublisher(*natsURL, *deviceEventsStream)
+	if err != nil {
+		logger.Fatal("连接设备生命周期事件通道失败", zap.Error(err))
+	}
+	defer func() { _ = lifecyclePub.Close() }()
+	if err := lifecyclePub.EnsureStream(gateway.StreamSpec{Subjects: []string{"iot.device.>"}, Replicas: 1}); err != nil {
+		logger.Fatal("确保设备生命周期 Stream 存在失败", zap.Error(err))
+	}
 
 	var node *cluster.Node
 	if *clusterNodeID != "" {
@@ -165,16 +174,17 @@ func main() {
 	go meterReporter.Run(ctx)
 
 	broker, err := gateway.New(ctx, gateway.Options{
-		MQTTAddr:       *mqttAddr,
-		Publisher:      pub,
-		Router:         gateway.ContractRouter{Project: *project, Shards: *shards},
-		PubackTimeout:  *pubackTimeout,
-		Metrics:        metrics,
-		Log:            gwLog,
-		Authenticator:  authenticator,
-		AllowAnonymous: *allowAnonymous,
-		Cluster:        node,
-		Meter:          meterAcc,
+		MQTTAddr:                 *mqttAddr,
+		Publisher:                pub,
+		DeviceLifecyclePublisher: lifecyclePub,
+		Router:                   gateway.ContractRouter{Project: *project, Shards: *shards},
+		PubackTimeout:            *pubackTimeout,
+		Metrics:                  metrics,
+		Log:                      gwLog,
+		Authenticator:            authenticator,
+		AllowAnonymous:           *allowAnonymous,
+		Cluster:                  node,
+		Meter:                    meterAcc,
 	})
 	if err != nil {
 		logger.Fatal("启动 MQTT 接入失败", zap.Error(err))
