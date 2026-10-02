@@ -29,6 +29,8 @@
 `internal/natsjs`；且 `natsjs.Subscribe` 的返回值已收窄为**不暴露 `Unsubscribe`**，使该缺陷在类型上**无法再被写出来**
 （坑 42/47）。`svc-quota` 的用量重复计数已用真 NATS 演练复现并消除（见 §4 第 21 项）。
 
+**本轮新增（2026-10-02）**：A 档 ProjectKey 失败按 `project_id` 聚合封禁，文件凭据源启用 A 档时对 A 档设备条目数执行 1000 上限；PG 凭据源与 A 档组合 fail-fast。MQTT 网关新增 TLS 1.3 listener 配置与 mTLS 客户端 CA 强制校验，C 档仍校验证书 CN 与 `device_key` 一致。`go test ./...` 全绿并已推送；未配置/部署真实证书，生产 TLS/mTLS 现场握手与设备证书生命周期仍待验证。
+
 下一步：A4 连接压测待有干净环境后再跑；Odoo 侧 S1/S3 集成场景端到端；
 B1 的明细查询限行与预聚合表（P0 性能项）。
 

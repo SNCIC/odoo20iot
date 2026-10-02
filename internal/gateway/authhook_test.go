@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"path/filepath"
 	"testing"
 	"time"
@@ -10,6 +11,19 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/auth"
 )
+
+func TestNew_拒绝低于TLS13的监听配置(t *testing.T) {
+	_, err := New(context.Background(), Options{
+		MQTTAddr:       "127.0.0.1:0",
+		TLSConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
+		Publisher:      &fakePublisher{},
+		Router:         ContractRouter{Project: "test"},
+		AllowAnonymous: true,
+	})
+	if err == nil {
+		t.Fatal("TLS 1.2 配置必须拒绝")
+	}
+}
 
 // 端到端认证用例：走**真实 broker + 真实 MQTT 报文**，验证 A1 的两件事 ——
 // 凭据判定与物模型 ACL。这是 A1 最关键的证据：单元测试只能证明函数正确，

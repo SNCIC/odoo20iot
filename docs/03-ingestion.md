@@ -133,6 +133,12 @@
 
 > **风险声明**：A 档的爆炸半径是**整个租户**。它只应出现在试用、PoC，或设备数极少且出口 IP 固定的场景。
 
+#### MQTT TLS / mTLS 启用
+
+网关通过 `-mqtt-tls-cert` 与 `-mqtt-tls-key` 启用 MQTT over TLS，最低版本固定为 TLS 1.3。再提供 `-mqtt-tls-client-ca` 时，服务端使用 `RequireAndVerifyClientCert` 强制客户端证书链校验；C 档认证随后从已完成握手的证书读取 CN，并要求 CN 等于 `device_key`。证书和私钥通过文件挂载提供，不得写入命令行以外的明文配置或提交到仓库。
+
+未配置服务端证书时仍可用于本地回环测试，但 B 档设备 secret 会以明文 MQTT 载荷传输，**不得用于生产或跨网络部署**。
+
 #### 认证流程（Hook: `OnConnectAuthenticate`）
 
 ```
@@ -248,7 +254,7 @@
 |---|---|---|
 | 1 | L2（Redis）/ L3（svc-auth gRPC） | 本次只实现 L1 与 `Directory` 接口；跨实例缓存一致性与熔断未验证 |
 | 2 | A 档六项强制措施 | 仅实现「默认关闭 + 显式开启」；IP 白名单、异常检测、轮换提醒、按键审计未实现 |
-| 3 | mTLS 端到端 | 代码路径已就绪（`listeners.Config.TLSConfig`），但未起 TLS 监听做过实测 |
+| 3 | mTLS 端到端 | 网关支持 `-mqtt-tls-cert` / `-mqtt-tls-key` 启用 TLS 1.3；增加 `-mqtt-tls-client-ca` 后强制校验客户端证书，并将证书 CN 交给 C 档认证；部署验证仍需使用真实 CA/设备证书做现场演练 |
 | 4 | C 档的证书吊销 | 依赖 CA/OCSP，未涉及 |
 | 5 | 4C8G Lite 节点上的容量 | 本次宿主为 64C，绝对速率不可外推到 4C8G（**必须按目标机型复测**） |
 

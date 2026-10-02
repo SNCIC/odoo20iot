@@ -8,7 +8,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -36,6 +39,9 @@ import (
 func main() {
 	httpAddr := flag.String("http-addr", ":8080", "HTTP 监听地址（健康检查与指标端点）")
 	mqttAddr := flag.String("mqtt-addr", ":1883", "MQTT 监听地址")
+	mqttTLSCert := flag.String("mqtt-tls-cert", "", "MQTT TLS 服务端证书 PEM；与 -mqtt-tls-key 一起启用 TLS")
+	mqttTLSKey := flag.String("mqtt-tls-key", "", "MQTT TLS 服务端私钥 PEM")
+	mqttTLSClientCA := flag.String("mqtt-tls-client-ca", "", "MQTT 客户端 CA PEM；设置后强制校验客户端证书")
 	natsURL := flag.String("nats-url", "nats://100.64.0.3:28222", "NATS JetStream 地址")
 	clusterNodeID := flag.String("cluster-node-id", "", "A3 集群节点 ID；为空则关闭集群路由")
 	clusterPeers := flag.String("cluster-peers", "", "A3 对端节点 ID，逗号分隔")
@@ -71,6 +77,11 @@ func main() {
 			logger.Fatal("生成演示凭据失败", zap.Error(err))
 		}
 		return
+	}
+
+	tlsConfig, err := loadMQTTTLSConfig(*mqttTLSCert, *mqttTLSKey, *mqttTLSClientCA)
+	if err != nil {
+		logger.Fatal("初始化 MQTT TLS 失败", zap.Error(err))
 	}
 
 	// 网关层（含 mochi-mqtt）使用 log/slog：mochi-mqtt 的 Hook 接口就是 slog 签名，
@@ -175,6 +186,7 @@ func main() {
 
 	broker, err := gateway.New(ctx, gateway.Options{
 		MQTTAddr:                 *mqttAddr,
+		TLSConfig:                tlsConfig,
 		Publisher:                pub,
 		DeviceLifecyclePublisher: lifecyclePub,
 		Router:                   gateway.ContractRouter{Project: *project, Shards: *shards},
@@ -211,6 +223,8 @@ func main() {
 		logger.Info("iot-gateway 启动",
 			zap.String("http_addr", *httpAddr),
 			zap.String("mqtt_addr", broker.Addr()),
+			zap.Bool("mqtt_tls", tlsConfig != nil),
+			zap.Bool("mqtt_mtls", tlsConfig != nil && tlsConfig.ClientAuth == tls.RequireAndVerifyClientCert),
 			zap.String("nats_url", *natsURL),
 			zap.Bool("auth_enabled", authenticator != nil),
 			zap.Bool("project_mode_allowed", *allowProjectMode),
@@ -246,6 +260,48 @@ func main() {
 	logger.Info("已退出",
 		zap.Int64("meter_reports", meterReporter.Metrics().ReportsTotal.Load()),
 		zap.Int64("meter_counters", meterReporter.Metrics().CountersReported.Load()))
+}
+
+func loadMQTTTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
+	if certFile == "" && keyFile == "" && clientCAFile == "" {
+		return nil, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("MQTT TLS 必须同时提供 -mqtt-tls-cert 和 -mqtt-tls-key")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("加载 MQTT TLS 服务端证书: %w", err)
+	}
+
+	config := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+	}
+	if clientCAFile == "" {
+		return config, nil
+	}
+	raw, err := os.ReadFile(clientCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("读取 MQTT 客户端 CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	for rest := raw; len(rest) > 0; {
+		block, next := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = next
+		if block.Type != "CERTIFICATE" || !pool.AppendCertsFromPEM(pem.EncodeToMemory(block)) {
+			return nil, fmt.Errorf("MQTT 客户端 CA 包含无效证书块")
+		}
+	}
+	if len(pool.Subjects()) == 0 {
+		return nil, fmt.Errorf("MQTT 客户端 CA 文件中没有有效证书")
+	}
+	config.ClientCAs = pool
+	config.ClientAuth = tls.RequireAndVerifyClientCert
+	return config, nil
 }
 
 // buildAuthenticator 组装认证器。放行匿名时必须由部署者**显式**声明，

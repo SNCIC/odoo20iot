@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -20,6 +21,9 @@ import (
 type Options struct {
 	// MQTTAddr 是 MQTT 监听地址（TCP）。
 	MQTTAddr string
+	// TLSConfig 非 nil 时启用 MQTT over TLS。生产环境应至少使用 TLS 1.3；
+	// 是否要求客户端证书由 TLSConfig.ClientAuth 决定。
+	TLSConfig *tls.Config
 	// Publisher 是内部事件总线的同步投递器，A2 时序依赖它。
 	Publisher                Publisher
 	DeviceLifecyclePublisher DeviceLifecyclePublisher
@@ -114,6 +118,18 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	if opts.DeviceTypeID == 0 {
 		opts.DeviceTypeID = DefaultDeviceTypeID
 	}
+	if opts.TLSConfig != nil {
+		opts.TLSConfig = opts.TLSConfig.Clone()
+		if opts.TLSConfig.MinVersion == 0 {
+			opts.TLSConfig.MinVersion = tls.VersionTLS13
+		}
+		if opts.TLSConfig.MinVersion < tls.VersionTLS13 {
+			return nil, fmt.Errorf("MQTT TLS 最低版本必须为 TLS 1.3")
+		}
+		if opts.TLSConfig.MaxVersion != 0 && opts.TLSConfig.MaxVersion < tls.VersionTLS13 {
+			return nil, fmt.Errorf("MQTT TLS 最高版本不能低于 TLS 1.3")
+		}
+	}
 
 	// 关闭时取消在途的等待：否则每个阻塞在 OnPublish 的连接都要等满
 	// PubackTimeout，优雅关闭会被拖长到超时上限。取消后这些消息走
@@ -124,6 +140,9 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	if err != nil {
 		cancelClose()
 		return nil, fmt.Errorf("监听 MQTT %q: %w", opts.MQTTAddr, err)
+	}
+	if opts.TLSConfig != nil {
+		ln = tls.NewListener(ln, opts.TLSConfig)
 	}
 
 	server := mqtt.New(&mqtt.Options{
