@@ -182,3 +182,26 @@ func TestDLQPayloadReferenceMigration(t *testing.T) {
 		t.Fatal("0019 缺少 payload_ref")
 	}
 }
+
+func TestForceReadyRLSMigration(t *testing.T) {
+	migs, err := LoadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.Version == "0020_force_ready_rls" {
+			sql = m.SQL
+		}
+	}
+	for _, want := range []string{
+		"ALTER TABLE t_notification_endpoint FORCE ROW LEVEL SECURITY",
+		"ALTER TABLE t_audit_log FORCE ROW LEVEL SECURITY",
+		"CREATE POLICY tenant_notification_endpoint",
+		"CREATE POLICY tenant_audit_log",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("0020 缺少 %q", want)
+		}
+	}
+}

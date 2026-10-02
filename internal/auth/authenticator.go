@@ -59,6 +59,7 @@ type Request struct {
 // Result 是认证通过的判定结果，同时携带 ACL。
 type Result struct {
 	ProjectID    int64
+	DeviceID     int64
 	DeviceTypeID int64
 	DeviceKey    string
 	Mode         Mode
@@ -268,6 +269,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, req Request) (*Result,
 
 	return &Result{
 		ProjectID:         id.ProjectID,
+		DeviceID:          id.DeviceID,
 		DeviceTypeID:      id.DeviceTypeID,
 		DeviceKey:         id.DeviceKey,
 		Mode:              id.Mode,

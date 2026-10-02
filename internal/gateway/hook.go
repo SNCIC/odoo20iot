@@ -45,7 +45,9 @@ type HookConfig struct {
 	ProjectID    int64
 	DeviceTypeID int64
 	// Meter 为 nil 时不做计量（不影响 A2 时序）。
-	Meter Meter
+	Meter             Meter
+	IdentityForClient func(string) (projectID, deviceID, deviceTypeID int64, ok bool)
+	RequireIdentity   bool
 }
 
 type Hook struct {
@@ -62,7 +64,9 @@ type Hook struct {
 	projectID    int64
 	deviceTypeID int64
 
-	meter Meter
+	meter             Meter
+	identityForClient func(string) (projectID, deviceID, deviceTypeID int64, ok bool)
+	requireIdentity   bool
 }
 
 const MaxPayloadBytes = 32 << 10
@@ -81,14 +85,16 @@ func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metric
 		log = slog.Default()
 	}
 	return &Hook{
-		baseCtx:      baseCtx,
-		acker:        acker,
-		router:       router,
-		metrics:      metrics,
-		logger:       log,
-		projectID:    cfg.ProjectID,
-		deviceTypeID: cfg.DeviceTypeID,
-		meter:        cfg.Meter,
+		baseCtx:           baseCtx,
+		acker:             acker,
+		router:            router,
+		metrics:           metrics,
+		logger:            log,
+		projectID:         cfg.ProjectID,
+		deviceTypeID:      cfg.DeviceTypeID,
+		meter:             cfg.Meter,
+		identityForClient: cfg.IdentityForClient,
+		requireIdentity:   cfg.RequireIdentity,
 	}
 }
 
@@ -139,7 +145,7 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 
 	// 包装统一信封：把归属元数据与原始报文一起发到总线（03 §2.4）。
 	// 不这样做，`device_key` 会随 subject 一并丢失，下游消费者无从落库。
-	data, err := h.buildEnvelope(pk)
+	data, err := h.buildEnvelopeForClient(cl.ID, pk)
 	if err != nil {
 		// 报文不是合法 JSON（或 topic 解析不出归属）属**不可重试**的客户端错误：
 		// 与「无法路由」同类，不回 PUBACK 只会让设备无意义地重传同一份垃圾。
@@ -187,6 +193,10 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 // device_key / stream 从 topic 解析；project_id / device_id / device_type_id
 // 为 Phase 0 占位值（真实映射依赖 A1 注册表，见 internal/envelope 包注释）。
 func (h *Hook) buildEnvelope(pk packets.Packet) ([]byte, error) {
+	return h.buildEnvelopeForClient("", pk)
+}
+
+func (h *Hook) buildEnvelopeForClient(clientID string, pk packets.Packet) ([]byte, error) {
 	deviceKey, rest := cluster.ParseDeviceTopic(pk.TopicName)
 	if deviceKey == "" {
 		return nil, fmt.Errorf("topic %q 解析不出 device_key", pk.TopicName)
@@ -208,16 +218,28 @@ func (h *Hook) buildEnvelope(pk packets.Packet) ([]byte, error) {
 		return nil, err
 	}
 
+	projectID, deviceID, deviceTypeID := h.projectID, envelope.PlaceholderDeviceID(deviceKey), h.deviceTypeID
+	if h.identityForClient != nil {
+		if resolvedProject, resolvedDevice, resolvedType, ok := h.identityForClient(clientID); ok {
+			projectID, deviceTypeID = resolvedProject, resolvedType
+			if resolvedDevice > 0 {
+				deviceID = resolvedDevice
+			}
+		} else if h.requireIdentity {
+			return nil, fmt.Errorf("设备 %q 未找到已认证的真实身份", deviceKey)
+		}
+	}
+
 	return envelope.Envelope{
 		SchemaVersion: envelope.CurrentSchemaVersion,
 		TraceID:       traceID,
-		ProjectID:    h.projectID,
-		DeviceKey:    deviceKey,
-		DeviceID:     envelope.PlaceholderDeviceID(deviceKey),
-		DeviceTypeID: h.deviceTypeID,
-		Stream:       stream,
-		ReceivedAt:   time.Now().UTC(),
-		Payload:      json.RawMessage(pk.Payload),
+		ProjectID:     projectID,
+		DeviceKey:     deviceKey,
+		DeviceID:      deviceID,
+		DeviceTypeID:  deviceTypeID,
+		Stream:        stream,
+		ReceivedAt:    time.Now().UTC(),
+		Payload:       json.RawMessage(pk.Payload),
 	}.Encode()
 }
 

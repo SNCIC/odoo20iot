@@ -14,6 +14,7 @@ import (
 // 网关不接触秘钥原文，也不接触数据库。
 type Identity struct {
 	ProjectID    int64
+	DeviceID     int64
 	DeviceTypeID int64
 	DeviceKey    string
 	Mode         Mode

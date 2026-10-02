@@ -176,10 +176,22 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	}
 
 	acker := NewAcker(opts.Publisher, opts.PubackTimeout, opts.Metrics)
+	identityForClient := func(clientID string) (int64, int64, int64, bool) {
+		if authHook == nil {
+			return 0, 0, 0, false
+		}
+		grant, ok := authHook.Grant(clientID)
+		if !ok || grant.ProjectID <= 0 || grant.DeviceTypeID <= 0 {
+			return 0, 0, 0, false
+		}
+		return grant.ProjectID, grant.DeviceID, grant.DeviceTypeID, true
+	}
 	hook := NewHook(runCtx, acker, opts.Router, opts.Metrics, opts.Log, HookConfig{
-		ProjectID:    opts.ProjectID,
-		DeviceTypeID: opts.DeviceTypeID,
-		Meter:        opts.Meter,
+		ProjectID:         opts.ProjectID,
+		DeviceTypeID:      opts.DeviceTypeID,
+		Meter:             opts.Meter,
+		IdentityForClient: identityForClient,
+		RequireIdentity:   authHook != nil,
 	})
 	if err := server.AddHook(hook, nil); err != nil {
 		cancelClose()

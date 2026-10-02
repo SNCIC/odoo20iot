@@ -196,6 +196,13 @@ func (h *AuthHook) grantCount() int {
 	return len(h.grants)
 }
 
+func (h *AuthHook) Grant(clientID string) (*auth.Result, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	res, ok := h.grants[clientID]
+	return res, ok
+}
+
 // buildRequest 从 CONNECT 报文与连接信息组装认证请求。
 func (h *AuthHook) buildRequest(cl *mqtt.Client, pk packets.Packet) auth.Request {
 	req := auth.Request{
