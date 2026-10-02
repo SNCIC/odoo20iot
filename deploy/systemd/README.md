@@ -29,6 +29,7 @@ chmod 700 /home/xfusion/etc
 chmod 600 /home/xfusion/etc/odoo20iot.env
 systemctl --user daemon-reload
 systemctl --user enable --now odoo20iot-svc-query.service
+systemctl --user enable --now odoo20iot-svc-alarm.service
 systemctl --user enable --now odoo20iot-odoo-connector.service
 systemctl --user enable --now odoo20iot-svc-notify.service
 ```
