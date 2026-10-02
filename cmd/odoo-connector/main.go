@@ -115,12 +115,12 @@ func parseFlags() config {
 	flag.StringVar(&cfg.odooDB, "odoo-db", "odoo20", "Odoo 库名（每次请求都会携带 X-Odoo-Database）")
 	flag.StringVar(&cfg.apiKey, "odoo-api-key", os.Getenv("ODOO_API_KEY"),
 		"Odoo API Key（默认取环境变量 ODOO_API_KEY；生产由 Vault 注入，禁止明文写配置文件）")
-	flag.StringVar(&cfg.redisURL, "redis-url", "redis://100.64.0.3:28637/0", "Redis 地址（幂等占位 / Outbox 流 / C-2 去重与水位）")
+	flag.StringVar(&cfg.redisURL, "redis-url", envOrDefault("IOT_REDIS_URL", "redis://100.64.0.3:28637/0"), "Redis 地址（默认取 IOT_REDIS_URL）")
 	flag.StringVar(&cfg.httpAddr, "http-addr", "127.0.0.1:18091", "健康检查/指标/webhook 监听地址")
 	flag.StringVar(&cfg.logFormat, "log-format", "json", "日志格式：json（默认）或 text")
 	flag.DurationVar(&cfg.readyProbe, "ready-probe-timeout", 5*time.Second, "就绪探针单次探测超时")
 
-	flag.StringVar(&cfg.natsURL, "nats-url", "nats://100.64.0.3:28222", "NATS JetStream 地址（事件出口）")
+	flag.StringVar(&cfg.natsURL, "nats-url", envOrDefault("IOT_NATS_URL", "nats://100.64.0.3:28222"), "NATS JetStream 地址（默认取 IOT_NATS_URL）")
 	flag.StringVar(&cfg.natsStream, "nats-stream", connector.OdooStream, "承载 iot.odoo.> 的 Stream 名")
 	flag.StringVar(&cfg.outboxStream, "outbox-stream", connector.OutboxStream,
 		"Odoo Outbox 投递的 Redis Stream 键（须与 sn_edge_integration 一致）")
@@ -138,7 +138,7 @@ func parseFlags() config {
 		"判定 Outbox 行「卡住」的宽限窗口")
 	flag.IntVar(&cfg.reconcileBatch, "reconcile-batch", connector.DefaultReconcileBatch,
 		"对账单轮单来源的处理上限")
-	flag.StringVar(&cfg.pgDSN, "pg-dsn", pg.DefaultDSN, "IoT 业务库 DSN（主数据同步启用时使用）")
+	flag.StringVar(&cfg.pgDSN, "pg-dsn", envOrDefault("IOT_PG_DSN", pg.DefaultDSN), "IoT 业务库 DSN（默认取 IOT_PG_DSN）")
 	flag.StringVar(&cfg.masterDataModel, "masterdata-model", "", "启用 Odoo 主数据增量同步的模型；留空关闭")
 	flag.DurationVar(&cfg.masterDataInterval, "masterdata-interval", time.Minute, "主数据增量同步周期")
 	flag.IntVar(&cfg.masterDataBatch, "masterdata-batch", connector.DefaultMasterDataBatch, "主数据单轮拉取上限")
@@ -561,6 +561,13 @@ func splitNonEmpty(value string) []string {
 		}
 	}
 	return out
+}
+
+func envOrDefault(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func routes(c *connector.Connector, webhook *connector.Webhook, logger *slog.Logger, cfg config) http.Handler {
