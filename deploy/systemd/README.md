@@ -32,6 +32,7 @@ systemctl --user enable --now odoo20iot-svc-query.service
 systemctl --user enable --now odoo20iot-svc-alarm.service
 systemctl --user enable --now odoo20iot-odoo-connector.service
 systemctl --user enable --now odoo20iot-svc-notify.service
+systemctl --user enable --now odoo20iot-iot-gateway.service
 ```
 
 真实密钥禁止写入 unit、命令行、Git 或日志。
@@ -47,3 +48,8 @@ curl -fsS http://127.0.0.1:18091/readyz
 飞书告警由 `svc-notify` 发送。将机器人 Webhook 放入受保护的
 `IOT_NOTIFY_WEBHOOK_URL`，并把 `open.feishu.cn` 配入
 `IOT_NOTIFY_EGRESS_ALLOW`；不要通过命令行参数传递 Webhook。
+
+网关启动前必须在环境文件配置 `IOT_MQTT_TLS_CERT` 和
+`IOT_MQTT_TLS_KEY`；设置 `IOT_MQTT_TLS_CLIENT_CA` 后启用 mTLS。
+未配置证书时启动脚本默认拒绝明文 MQTT，只有本地临时测试才允许显式设置
+`IOT_MQTT_ALLOW_PLAINTEXT=true`。
