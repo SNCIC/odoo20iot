@@ -3,6 +3,7 @@ module github.com/SNCIC/odoo20iot
 go 1.27
 
 require (
+	github.com/dop251/goja v0.0.0-20261002112749-511532d0dd57
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/expr-lang/expr v1.17.8
 	github.com/jackc/pgx/v5 v5.11.0
@@ -17,6 +18,9 @@ require (
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/dlclark/regexp2/v2 v2.8.1 // indirect
+	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
+	github.com/google/pprof v0.0.0-20230207041349-798e818bf904 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect

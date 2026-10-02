@@ -60,6 +60,23 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Ping 探活。
 func (s *Store) Ping(ctx context.Context) error { return probe(ctx, s.pool) }
 
+// ResolvePrevSnapshot 返回指定设备在 at 之前最近落库的一条 JSON 快照。
+// 该方法只暴露业务需要的快照契约，SQL 细节仍封装在 GreptimeDB 适配层。
+func (s *Store) ResolvePrevSnapshot(ctx context.Context, projectID, deviceID int64, at time.Time) (map[string]any, error) {
+	const query = `SELECT "metrics" FROM telemetry
+WHERE project_id = $1 AND device_id = $2 AND ts < $3
+ORDER BY ts DESC LIMIT 1`
+	var raw []byte
+	if err := s.pool.QueryRow(ctx, query, projectID, deviceID, at.UTC()).Scan(&raw); err != nil {
+		return nil, err
+	}
+	var values map[string]any
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("解析 prev JSON: %w", err)
+	}
+	return values, nil
+}
+
 // probe 用一条真实查询确认链路可用（GreptimeDB 拒绝空语句）。
 func probe(ctx context.Context, pool *pgxpool.Pool) error {
 	var one int
