@@ -48,7 +48,9 @@ tidy: ## 整理依赖
 .PHONY: build
 build: ## 编译全部服务到 bin/
 	$(GO_RUN) 'cd $(PROJECT_DIR) && mkdir -p bin && \
-	  go build -ldflags "$(LDFLAGS)" -o bin/iot-gateway ./cmd/iot-gateway'
+	  go build -ldflags "$(LDFLAGS)" -o bin/iot-gateway ./cmd/iot-gateway && \
+	  go build -ldflags "$(LDFLAGS)" -o bin/odoo-connector ./cmd/odoo-connector && \
+	  go build -ldflags "$(LDFLAGS)" -o bin/svc-query ./cmd/svc-query'
 
 .PHONY: test-nats
 test-nats: ## A2 真实总线验证（要求 NATS 可达；`go test ./...` 默认跳过）

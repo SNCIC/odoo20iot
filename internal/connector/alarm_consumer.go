@@ -23,6 +23,7 @@ const (
 	AlarmSubject      = "iot.alarm.>"
 	AlarmAckWait      = 30 * time.Second
 	AlarmInactive     = 7 * 24 * time.Hour
+	AlarmRetryDelay   = 10 * time.Second
 )
 
 type AlarmOdooClient interface {
@@ -90,6 +91,9 @@ func (c *AlarmConsumer) Run(ctx context.Context) error {
 		for _, msg := range messages {
 			if err := c.handle(ctx, msg); err != nil {
 				c.logger.Error("IoT 告警建单失败，保留消息等待重投", "error", err)
+				if nakErr := msg.NakWithDelay(AlarmRetryDelay); nakErr != nil {
+					c.logger.Warn("安排 IoT 告警延迟重投失败", "error", nakErr)
+				}
 				continue
 			}
 			if err := msg.Ack(); err != nil {

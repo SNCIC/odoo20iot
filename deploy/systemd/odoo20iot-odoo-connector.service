@@ -1,0 +1,15 @@
+[Unit]
+Description=Odoo20IoT Odoo connector
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/xfusion/projects/odoo20iot/deploy/systemd/run-odoo-connector.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=mixed
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
