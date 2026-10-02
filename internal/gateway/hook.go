@@ -113,8 +113,9 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 
 	switch pk.FixedHeader.Qos {
 	case 0:
-		// QoS0 无确认语义，与 A2 无关：交回 broker 原生路径，不阻塞。
-		return pk, nil
+		// QoS0 没有 PUBACK，但仍必须经过统一信封和 NATS，不能静默绕过数据总线。
+		// 投递失败时保留 broker 本地路径；同时记录错误，因为设备不会重传。
+		// 路由和封装在公共路径完成，避免 QoS0 与 QoS1 的归属口径分叉。
 	case 2:
 		// 端侧契约（§5）只使用 QoS0/QoS1。QoS2 一旦出现即为契约违规，
 		// 且本 hook 未覆盖其 PUBREC/PUBREL 流程 —— 明确拒绝而不是静默放行，
@@ -143,6 +144,16 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		h.metrics.InvalidPayloadTotal.Add(1)
 		h.logger.Warn("拒绝无法封装的上报", "client", cl.ID, "topic", pk.TopicName, "error", err)
 		return pk, packets.ErrRejectPacket
+	}
+
+	if pk.FixedHeader.Qos == 0 {
+		if err := h.acker.PublishQoS0(h.baseCtx, subject, data); err != nil {
+			h.logger.Error("QoS0 已进入统一路径但总线投递失败：设备不会重传",
+				"client", cl.ID, "topic", pk.TopicName, "subject", subject, "error", err)
+		} else if h.meter != nil {
+			h.meter.Add(h.projectID, metering.MetricMsgCount, 1)
+		}
+		return pk, nil
 	}
 
 	if err := h.acker.AwaitPersist(h.baseCtx, subject, data); err != nil {

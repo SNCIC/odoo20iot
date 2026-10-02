@@ -153,6 +153,10 @@ type Metrics struct {
 	UnsupportedQosTotal atomic.Int64
 	// InvalidPayloadTotal 无法封装为总线信封的报文数（非合法 JSON 等，03 §2.4）。
 	InvalidPayloadTotal atomic.Int64
+	// QoS0PublishTotal 进入总线投递路径的 QoS0 报文数。
+	QoS0PublishTotal atomic.Int64
+	// QoS0PublishErrorTotal QoS0 投递失败数；QoS0 无设备重传确认语义。
+	QoS0PublishErrorTotal atomic.Int64
 
 	// ---- 认证与 ACL（06 §4：gw_connect_fail_total / gw_auth_cache_hit_ratio）----
 
@@ -205,6 +209,8 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	writeMetric(w, "gw_puback_write_error_total", "回写 PUBACK 失败数", m.PubackWriteErrorTotal.Load())
 	writeMetric(w, "gw_unroutable_total", "无法路由的上报数", m.UnroutableTotal.Load())
 	writeMetric(w, "gw_unsupported_qos_total", "超出端侧契约的 QoS 报文数", m.UnsupportedQosTotal.Load())
+	writeMetric(w, "gw_qos0_publish_total", "进入总线投递路径的 QoS0 报文数", m.QoS0PublishTotal.Load())
+	writeMetric(w, "gw_qos0_publish_error_total", "QoS0 总线投递失败数", m.QoS0PublishErrorTotal.Load())
 
 	writeMetric(w, "gw_auth_success_total", "设备认证通过的连接数", m.AuthSuccessTotal.Load())
 	writeMetric(w, "gw_connect_fail_total", "设备认证失败的连接数（见 reason 维度）", m.ConnectFailTotal.Load())

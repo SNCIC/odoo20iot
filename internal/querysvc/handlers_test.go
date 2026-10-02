@@ -17,6 +17,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/latest"
+	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -28,6 +29,22 @@ type fakeReader struct {
 	block chan struct{} // 非 nil 时读到它才返回
 	calls int
 }
+
+type identityVerifier struct{ identity apiauth.Identity }
+
+func (v identityVerifier) Verify(context.Context, string) (apiauth.Identity, error) {
+	return v.identity, nil
+}
+
+type fakeEndpointStore struct{}
+
+func (fakeEndpointStore) List(context.Context, int64) ([]notifyconfig.Endpoint, error) {
+	return nil, nil
+}
+func (fakeEndpointStore) Create(_ context.Context, projectID int64, name, channel, _ string) (notifyconfig.Endpoint, error) {
+	return notifyconfig.Endpoint{ProjectID: projectID, Name: name, Channel: channel, Enabled: true}, nil
+}
+func (fakeEndpointStore) Delete(context.Context, int64, int64) error { return nil }
 
 func (f *fakeReader) QuerySeries(ctx context.Context, _ tsdb.Plan, _ tsdb.SeriesQuery) (tsdb.SeriesResult, error) {
 	f.mu.Lock()
@@ -173,6 +190,39 @@ func TestHandlers_TenantParamRejected(t *testing.T) {
 		if e := decodeErr(t, rec); e.Code != CodeTenantNotAllowed {
 			t.Fatalf("%s 期望 TENANT_NOT_ALLOWED，得到 %s", path, e.Code)
 		}
+	}
+}
+
+func TestNotificationEndpointScopes(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	svc.deps.Endpoints = fakeEndpointStore{}
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"notification:read"}}}
+	svc.mux = svc.routes()
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/notification-endpoints", nil)
+	getReq.Header.Set("Authorization", "Bearer scoped")
+	getRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("notification:read 应允许 GET，得到 %d: %s", getRec.Code, getRec.Body.String())
+	}
+
+	postReq := httptest.NewRequest(http.MethodPost, "/api/v1/notification-endpoints", strings.NewReader(`{"name":"x","channel":"webhook","target":"https://example.test/hook"}`))
+	postReq.Header.Set("Authorization", "Bearer scoped")
+	postRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusForbidden {
+		t.Fatalf("缺少 notification:write 应拒绝 POST，得到 %d", postRec.Code)
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"notification:write"}}}
+	svc.mux = svc.routes()
+	postReq = httptest.NewRequest(http.MethodPost, "/api/v1/notification-endpoints", strings.NewReader(`{"name":"x","channel":"webhook","target":"https://example.test/hook"}`))
+	postReq.Header.Set("Authorization", "Bearer scoped")
+	postRec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("notification:write 应允许 POST，得到 %d: %s", postRec.Code, postRec.Body.String())
 	}
 }
 

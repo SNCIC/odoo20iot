@@ -150,6 +150,14 @@ func (s *Service) handleNotificationEndpoints(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
 		return
 	}
+	requiredScope := "notification:read"
+	if r.Method != http.MethodGet {
+		requiredScope = "notification:write"
+	}
+	if !id.Dev && !id.HasScope(requiredScope) {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 "+requiredScope+" 权限")
+		return
+	}
 	if r.Method == http.MethodGet {
 		items, err := s.deps.Endpoints.List(r.Context(), id.ProjectID)
 		if err != nil {

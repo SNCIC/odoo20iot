@@ -52,3 +52,16 @@ func (a *Acker) AwaitPersist(ctx context.Context, subject string, payload []byte
 		return fmt.Errorf("总线投递失败（subject=%s）: %w", subject, err)
 	}
 }
+
+// PublishQoS0 将 QoS0 报文送入统一总线路径。MQTT QoS0 没有 PUBACK，
+// 因此失败只能记录并交回 broker 的本地路径，不能伪造设备侧成功确认。
+func (a *Acker) PublishQoS0(ctx context.Context, subject string, payload []byte) error {
+	a.metrics.QoS0PublishTotal.Add(1)
+	wctx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	if err := a.pub.Publish(wctx, subject, payload); err != nil {
+		a.metrics.QoS0PublishErrorTotal.Add(1)
+		return fmt.Errorf("QoS0 总线投递失败（subject=%s）: %w", subject, err)
+	}
+	return nil
+}

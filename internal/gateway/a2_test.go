@@ -411,6 +411,21 @@ func TestAcker_AwaitPersist(t *testing.T) {
 	})
 }
 
+func TestAcker_PublishQoS0(t *testing.T) {
+	pub := &fakePublisher{}
+	m := new(Metrics)
+	a := NewAcker(pub, time.Second, m)
+	if err := a.PublishQoS0(context.Background(), "iot.telemetry.p1", []byte(`{"v":1}`)); err != nil {
+		t.Fatalf("QoS0 投递失败: %v", err)
+	}
+	if m.QoS0PublishTotal.Load() != 1 || m.QoS0PublishErrorTotal.Load() != 0 {
+		t.Fatalf("QoS0 指标不符: total=%d errors=%d", m.QoS0PublishTotal.Load(), m.QoS0PublishErrorTotal.Load())
+	}
+	if pub.callCount() != 1 {
+		t.Fatalf("QoS0 应进入总线一次，实际 %d", pub.callCount())
+	}
+}
+
 // ---------- 路由单元测试 ----------
 
 func TestContractRouter(t *testing.T) {

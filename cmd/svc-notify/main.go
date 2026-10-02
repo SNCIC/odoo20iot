@@ -134,10 +134,10 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.fetchWait, "fetch-wait", 500*time.Millisecond, "单次拉取的等待上限")
 	flag.IntVar(&cfg.batch, "fetch-batch", 64, "单次拉取的消息数")
 
-	flag.StringVar(&egress, "egress-allow", "", "出站白名单（逗号分隔：域名、*.域名 或 CIDR）。**必填**")
+	flag.StringVar(&egress, "egress-allow", os.Getenv("IOT_NOTIFY_EGRESS_ALLOW"), "出站白名单（逗号分隔：域名、*.域名 或 CIDR）。**必填**")
 	flag.BoolVar(&cfg.allowLoopback, "allow-loopback", false, "放行回环地址（**仅本地联调**，生产必须为 false）")
 
-	flag.StringVar(&cfg.webhookURL, "webhook-url", "", "默认策略里的 Webhook 地址（未用策略文件时生效）")
+	flag.StringVar(&cfg.webhookURL, "webhook-url", os.Getenv("IOT_NOTIFY_WEBHOOK_URL"), "默认策略里的 Webhook 地址（默认取 IOT_NOTIFY_WEBHOOK_URL）")
 	flag.DurationVar(&cfg.webhookTimeout, "webhook-timeout", 5*time.Second, "Webhook 超时（04 §2.3：5s）")
 
 	flag.StringVar(&cfg.smtpAddr, "smtp-addr", "", "SMTP 地址 host:port；留空则不启用邮件通道")

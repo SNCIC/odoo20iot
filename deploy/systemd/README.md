@@ -30,6 +30,7 @@ chmod 600 /home/xfusion/etc/odoo20iot.env
 systemctl --user daemon-reload
 systemctl --user enable --now odoo20iot-svc-query.service
 systemctl --user enable --now odoo20iot-odoo-connector.service
+systemctl --user enable --now odoo20iot-svc-notify.service
 ```
 
 真实密钥禁止写入 unit、命令行、Git 或日志。
@@ -41,3 +42,7 @@ make build
 curl -fsS http://127.0.0.1:18091/healthz
 curl -fsS http://127.0.0.1:18091/readyz
 ```
+
+飞书告警由 `svc-notify` 发送。将机器人 Webhook 放入受保护的
+`IOT_NOTIFY_WEBHOOK_URL`，并把 `open.feishu.cn` 配入
+`IOT_NOTIFY_EGRESS_ALLOW`；不要通过命令行参数传递 Webhook。
