@@ -67,6 +67,7 @@ type Request struct {
 	ProjectID string
 	RuleID    string
 	Level     string
+	Escalated bool
 }
 
 // PolicySource 提供告警的通知策略。

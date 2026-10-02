@@ -15,8 +15,8 @@
 // 未实现（如实留白）：
 //   - 通知策略来自配置文件而非 `t_alarm_rule.notify`（该表尚未建立）；
 //   - 通知组（groups）未展开成收件人（依赖 `t_user` / `t_role`）；
-//   - 未确认升级（30min → 上级 / 2h → P1）：需要「未确认」这件事的一手数据，
-//     而它属于 svc-alarm；
+//   - 未确认升级（30min → 上级 / 2h → P1）：仍需 svc-alarm 提供确认状态；
+//     风暴熔断产生的 escalated=true 已支持按策略切换收件人；
 //   - 统一出口代理（egress-proxy，05 §1）：SSRF 防护的另外三项已实现，
 //     少的是集中出站审计；
 //   - 策略热加载：改配置需重启；
@@ -517,7 +517,7 @@ func (n *notifier) handleEvent(ctx context.Context, data []byte) error {
 	}
 
 	policy, err := n.policies.Resolve(ctx, notify.Request{
-		ProjectID: ev.ProjectID, RuleID: ev.RuleID, Level: ev.Level,
+		ProjectID: ev.ProjectID, RuleID: ev.RuleID, Level: ev.Level, Escalated: ev.Escalated,
 	})
 	if err != nil {
 		if notify.IsPermanent(err) {
@@ -526,6 +526,9 @@ func (n *notifier) handleEvent(ctx context.Context, data []byte) error {
 			return fmt.Errorf("%w: %w", errNoPolicy, err)
 		}
 		return err
+	}
+	if ev.Escalated && len(policy.EscalatedRecipients) > 0 {
+		policy.Recipients = policy.EscalatedRecipients
 	}
 
 	at := ev.NotifiedTS

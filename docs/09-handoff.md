@@ -33,6 +33,8 @@
 
 **RLS 增量（2026-10-02）**：新增迁移 `0014_rls_hardening`，对 `t_integration_issue` 启用并强制 RLS，补齐 `project_id` 非空、租户策略和包含 `project_id` 的唯一键；`extref.Store` 的问题记录/解决路径改为显式租户事务。其余租户表暂未启用 `FORCE ROW LEVEL SECURITY`，需先完成告警 Store 的全量租户事务改造，再切换生产非超管应用账号。
 
+**升级通知增量（2026-10-02）**：`svc-notify` 识别告警事件的 `escalated=true`，通知策略可配置 `escalated_recipients` 按通道替换普通收件人；未配置时保持原收件人，兼容现有策略。未确认超时升级仍待 `svc-alarm` 提供确认状态。
+
 下一步：A4 连接压测待有干净环境后再跑；Odoo 侧 S1/S3 集成场景端到端；
 B1 的明细查询限行与预聚合表（P0 性能项）。
 

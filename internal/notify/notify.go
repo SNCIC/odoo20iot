@@ -75,6 +75,8 @@ type Policy struct {
 	Template string
 	// Recipients 按通道名给收件人：webhook 是 URL、email 是地址、sms 是号码。
 	Recipients map[string][]string
+	// EscalatedRecipients 是升级事件的专用收件人；为空时沿用 Recipients。
+	EscalatedRecipients map[string][]string
 }
 
 // Validate 检查策略是否可用。

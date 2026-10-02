@@ -525,6 +525,16 @@ utils.math.clamp(v, min, max), utils.json.parse/stringify
 }
 ```
 
+风暴熔断产生的升级事件携带 `escalated=true`。通知策略可额外配置
+`escalated_recipients`，按通道替换普通收件人；未配置时沿用 `recipients`，例如：
+
+```json
+{
+  "recipients": { "webhook": ["https://ops.example/hook"] },
+  "escalated_recipients": { "webhook": ["https://p1.example/hook"] }
+}
+```
+
 条件表达式使用**受限 DSL（JSON 结构）而非任意 JS**，保证可静态分析与索引优化；复杂逻辑通过引用 `svc-rule` 的规则输出（`emit("alarm")`）实现。
 
 ### 2.5 可靠性
