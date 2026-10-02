@@ -205,8 +205,11 @@ func (s *PGStore) UpsertProject(ctx context.Context, p Project) (int64, error) {
 		p.Timezone = "UTC"
 	}
 	var id int64
-	if err := s.pool.QueryRow(ctx, upsertProjectSQL,
-		p.ID, p.ProjectKey, p.Name, p.Status, p.OdooCompanyID, p.Timezone).Scan(&id); err != nil {
+	err := pg.WithProjectTx(ctx, s.pool, p.ID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, upsertProjectSQL,
+			p.ID, p.ProjectKey, p.Name, p.Status, p.OdooCompanyID, p.Timezone).Scan(&id)
+	})
+	if err != nil {
 		return 0, fmt.Errorf("catalog: upsert 租户: %w", err)
 	}
 	return id, nil
@@ -242,8 +245,11 @@ func (s *PGStore) UpsertDeviceType(ctx context.Context, t DeviceType) (int64, er
 		t.ThingModelVersion = 1
 	}
 	var id int64
-	if err := s.pool.QueryRow(ctx, upsertDeviceTypeSQL,
-		t.ID, t.ProjectID, t.TypeKey, t.Name, t.Category, string(model), t.ThingModelVersion, t.IsGateway).Scan(&id); err != nil {
+	err := pg.WithProjectTx(ctx, s.pool, t.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, upsertDeviceTypeSQL,
+			t.ID, t.ProjectID, t.TypeKey, t.Name, t.Category, string(model), t.ThingModelVersion, t.IsGateway).Scan(&id)
+	})
+	if err != nil {
 		return 0, fmt.Errorf("catalog: upsert 设备类型: %w", err)
 	}
 	return id, nil
@@ -295,9 +301,12 @@ func (s *PGStore) UpsertDevice(ctx context.Context, d DeviceUpsert) (int64, erro
 	if d.ID > 0 {
 		deviceID = d.ID
 	}
-	if err := s.pool.QueryRow(ctx, upsertDeviceSQL,
-		deviceID, d.ProjectID, d.DeviceTypeID, d.DeviceKey, d.Name,
-		d.SecretHash, d.AuthMode, d.Status, d.ThingModelVersion, string(tagJSON), d.RotateSecret).Scan(&id); err != nil {
+	err = pg.WithProjectTx(ctx, s.pool, d.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, upsertDeviceSQL,
+			deviceID, d.ProjectID, d.DeviceTypeID, d.DeviceKey, d.Name,
+			d.SecretHash, d.AuthMode, d.Status, d.ThingModelVersion, string(tagJSON), d.RotateSecret).Scan(&id)
+	})
+	if err != nil {
 		return 0, fmt.Errorf("catalog: upsert 设备: %w", err)
 	}
 	return id, nil
