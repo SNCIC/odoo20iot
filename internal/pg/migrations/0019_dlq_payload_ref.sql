@@ -1,0 +1,2 @@
+ALTER TABLE t_dlq
+    ADD COLUMN IF NOT EXISTS payload_ref TEXT;

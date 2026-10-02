@@ -45,6 +45,7 @@ type Options struct {
 	// Authenticator 提供 03 §2.1 的三档设备认证。
 	// 与 AllowAnonymous 二选一，**必须显式指定其一**。
 	Authenticator *auth.Authenticator
+	ACLAudit      ACLAuditRecorder
 
 	// Cluster 启用跨节点投递（03 §1.4）。为 nil 时网关是单节点。
 	//
@@ -166,7 +167,7 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 			return nil, fmt.Errorf("装载匿名放行 hook: %w", err)
 		}
 	} else {
-		authHook = NewAuthHook(runCtx, opts.Authenticator, opts.Metrics, opts.Log)
+		authHook = NewAuthHook(runCtx, opts.Authenticator, opts.Metrics, opts.Log, opts.ACLAudit)
 		if err := server.AddHook(authHook, nil); err != nil {
 			cancelClose()
 			ln.Close()

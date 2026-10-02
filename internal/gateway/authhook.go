@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
@@ -30,14 +31,23 @@ type AuthHook struct {
 	logger  *slog.Logger
 	metrics *Metrics
 
-	mu     sync.RWMutex
-	grants map[string]*auth.Result
+	mu         sync.RWMutex
+	grants     map[string]*auth.Result
+	violations map[string]aclViolation
+	audit      ACLAuditRecorder
+}
+
+type ACLAuditRecorder func(context.Context, int64, string, string, bool) error
+
+type aclViolation struct {
+	started time.Time
+	count   int
 }
 
 var _ mqtt.Hook = (*AuthHook)(nil)
 
 // NewAuthHook 构造认证 Hook。baseCtx 用于取消在途的目录查询与校验排队。
-func NewAuthHook(baseCtx context.Context, a *auth.Authenticator, metrics *Metrics, log *slog.Logger) *AuthHook {
+func NewAuthHook(baseCtx context.Context, a *auth.Authenticator, metrics *Metrics, log *slog.Logger, audit ACLAuditRecorder) *AuthHook {
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
@@ -48,11 +58,13 @@ func NewAuthHook(baseCtx context.Context, a *auth.Authenticator, metrics *Metric
 		log = slog.Default()
 	}
 	return &AuthHook{
-		baseCtx: baseCtx,
-		auth:    a,
-		logger:  log,
-		metrics: metrics,
-		grants:  make(map[string]*auth.Result, 1024),
+		baseCtx:    baseCtx,
+		auth:       a,
+		logger:     log,
+		metrics:    metrics,
+		grants:     make(map[string]*auth.Result, 1024),
+		violations: make(map[string]aclViolation, 1024),
+		audit:      audit,
 	}
 }
 
@@ -130,6 +142,16 @@ func (h *AuthHook) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool {
 	}
 
 	h.metrics.ACLDeniedTotal.Add(1)
+	if h.audit != nil {
+		go func(projectID int64, deviceKey, deniedTopic string, deniedWrite bool) {
+			if err := h.audit(h.baseCtx, projectID, deniedTopic, deviceKey, deniedWrite); err != nil {
+				h.logger.Warn("写入 ACL 拒绝审计失败", "client", cl.ID, "error", err)
+			}
+		}(res.ProjectID, res.DeviceKey, topic, write)
+	}
+	if h.recordACLViolation(cl, res, topic, write) {
+		return false
+	}
 	h.logger.Info("ACL 拒绝",
 		"client", cl.ID, "device_key", res.DeviceKey, "topic", topic, "write", write)
 	return false
@@ -139,7 +161,30 @@ func (h *AuthHook) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool {
 func (h *AuthHook) OnDisconnect(cl *mqtt.Client, _ error, _ bool) {
 	h.mu.Lock()
 	delete(h.grants, cl.ID)
+	delete(h.violations, cl.ID)
 	h.mu.Unlock()
+}
+
+func (h *AuthHook) recordACLViolation(cl *mqtt.Client, res *auth.Result, topic string, write bool) bool {
+	now := time.Now()
+	h.mu.Lock()
+	v := h.violations[cl.ID]
+	if v.started.IsZero() || now.Sub(v.started) >= time.Minute {
+		v = aclViolation{started: now}
+	}
+	v.count++
+	h.violations[cl.ID] = v
+	closeConn := v.count >= 5
+	h.mu.Unlock()
+	if !closeConn {
+		return false
+	}
+	h.metrics.ACLViolationDisconnectTotal.Add(1)
+	h.logger.Warn("ACL 越权达到阈值，主动断开连接", "client", cl.ID, "device_key", res.DeviceKey, "topic", topic, "write", write, "count", v.count)
+	if cl.Net.Conn != nil {
+		_ = cl.Net.Conn.Close()
+	}
+	return true
 }
 
 // grantCount 返回当前持有授权记录的连接数（观测与测试用）。

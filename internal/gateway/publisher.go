@@ -167,7 +167,8 @@ type Metrics struct {
 	// ConnectFailTotal 认证失败的连接数（按 reason 细分见下）。
 	ConnectFailTotal atomic.Int64
 	// ACLDeniedTotal 被 ACL 拒绝的收发操作数。
-	ACLDeniedTotal atomic.Int64
+	ACLDeniedTotal              atomic.Int64
+	ACLViolationDisconnectTotal atomic.Int64
 
 	// ---- 集群路由（A3）----
 
@@ -219,6 +220,7 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	writeMetric(w, "gw_auth_success_total", "设备认证通过的连接数", m.AuthSuccessTotal.Load())
 	writeMetric(w, "gw_connect_fail_total", "设备认证失败的连接数（见 reason 维度）", m.ConnectFailTotal.Load())
 	writeMetric(w, "gw_acl_denied_total", "被 ACL 拒绝的收发操作数", m.ACLDeniedTotal.Load())
+	writeMetric(w, "gw_acl_violation_disconnect_total", "因 ACL 越权达到阈值而断开的连接数", m.ACLViolationDisconnectTotal.Load())
 	writeMetric(w, "gw_cluster_route_fail_total", "跨节点路由失败数", m.ClusterRouteFailTotal.Load())
 	writeMetric(w, "gw_cluster_offline_replay_total", "累计回放的离线消息条数", m.ClusterOfflineReplayTotal.Load())
 

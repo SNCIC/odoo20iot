@@ -9,11 +9,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
 // WatermarkPrefix 是 C-2 水位在 Redis 里的键前缀（每模型一个键）。
 const WatermarkPrefix = "reconcile:c2:wm:"
+const DefaultWatermarkTTL = 7 * 24 * time.Hour
 
 // Watermark 是 C-2 对账的水位：`(write_date, id)` 二元组。
 //
@@ -78,13 +81,19 @@ func (m *MemWatermarks) Advance(_ context.Context, model string, w Watermark) er
 // 存储形式为 `<unix_micros>:<id>`，便于在 Lua 里做「只进不退」的原子比较。
 type RedisWatermarks struct {
 	rdb redis.UniversalClient
+	pg  *pgxpool.Pool
+	ttl time.Duration
 }
 
 var _ Watermarks = (*RedisWatermarks)(nil)
 
 // NewRedisWatermarks 构造 Redis 水位存储。
 func NewRedisWatermarks(rdb redis.UniversalClient) *RedisWatermarks {
-	return &RedisWatermarks{rdb: rdb}
+	return &RedisWatermarks{rdb: rdb, ttl: DefaultWatermarkTTL}
+}
+
+func NewRedisWatermarksWithFallback(rdb redis.UniversalClient, pool *pgxpool.Pool) *RedisWatermarks {
+	return &RedisWatermarks{rdb: rdb, pg: pool, ttl: DefaultWatermarkTTL}
 }
 
 func watermarkKey(model string) string { return WatermarkPrefix + model }
@@ -93,10 +102,20 @@ func watermarkKey(model string) string { return WatermarkPrefix + model }
 func (r *RedisWatermarks) Get(ctx context.Context, model string) (Watermark, bool, error) {
 	raw, err := r.rdb.Get(ctx, watermarkKey(model)).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) { // 尚未建立水位
-			return Watermark{}, false, nil
+		if r.pg == nil && !errors.Is(err, redis.Nil) {
+			return Watermark{}, false, err
 		}
-		return Watermark{}, false, err
+		if r.pg != nil {
+			var w Watermark
+			if err := r.pg.QueryRow(ctx, `SELECT write_date, record_id FROM t_connector_watermark WHERE model=$1`, model).Scan(&w.WriteDate, &w.ID); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return Watermark{}, false, nil
+				}
+				return Watermark{}, false, err
+			}
+			return w, true, nil
+		}
+		return Watermark{}, false, nil
 	}
 	return parseWatermark(raw)
 }
@@ -128,6 +147,17 @@ func (r *RedisWatermarks) Advance(ctx context.Context, model string, w Watermark
 	).Int()
 	if err != nil {
 		return fmt.Errorf("推进水位 %s: %w", model, err)
+	}
+	if r.ttl <= 0 {
+		r.ttl = DefaultWatermarkTTL
+	}
+	if err := r.rdb.Expire(ctx, watermarkKey(model), r.ttl).Err(); err != nil {
+		return fmt.Errorf("设置水位 TTL %s: %w", model, err)
+	}
+	if r.pg != nil {
+		if _, err := r.pg.Exec(ctx, `INSERT INTO t_connector_watermark(model, write_date, record_id, updated_at) VALUES($1,$2,$3,now()) ON CONFLICT(model) DO UPDATE SET write_date=EXCLUDED.write_date, record_id=EXCLUDED.record_id, updated_at=now() WHERE t_connector_watermark.write_date < EXCLUDED.write_date OR (t_connector_watermark.write_date = EXCLUDED.write_date AND t_connector_watermark.record_id < EXCLUDED.record_id)`, model, w.WriteDate, w.ID); err != nil {
+			return fmt.Errorf("持久化水位 %s: %w", model, err)
+		}
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ package extref
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -42,6 +43,36 @@ type IntegrationIssue struct {
 type Store struct{ pool *pgxpool.Pool }
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// ReconcileUnbound closes alarm issues whose equipment reference has since
+// been created by master-data synchronization.
+func (s *Store) ReconcileUnbound(ctx context.Context) (int, error) {
+	rows, err := s.pool.Query(ctx, `SELECT project_id, ext_system, ext_model, ext_id FROM t_integration_issue WHERE status='open' AND issue_type='unbound_alarm'`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var projectID, extID int64
+		var system, model string
+		if err := rows.Scan(&projectID, &system, &model, &extID); err != nil {
+			return count, err
+		}
+		ref, err := s.FindByRemote(ctx, projectID, system, model, extID)
+		if errors.Is(err, pgx.ErrNoRows) || ref.Status != "active" {
+			continue
+		}
+		if err != nil {
+			return count, err
+		}
+		if err := s.ResolveIssueForProject(ctx, projectID, system, model, extID, "unbound_alarm"); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, rows.Err()
+}
 
 func (s *Store) Upsert(ctx context.Context, ref Ref) (Ref, error) {
 	if ref.ProjectID <= 0 || ref.ExtSystem == "" || ref.ExtModel == "" || ref.ExtID <= 0 || ref.LocalEntity == "" || ref.LocalID <= 0 {

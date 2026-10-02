@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -194,9 +195,19 @@ func main() {
 		Metrics:                  metrics,
 		Log:                      gwLog,
 		Authenticator:            authenticator,
-		AllowAnonymous:           *allowAnonymous,
-		Cluster:                  node,
-		Meter:                    meterAcc,
+		ACLAudit: func(auditCtx context.Context, projectID int64, topic, deviceKey string, write bool) error {
+			if authPool == nil {
+				return nil
+			}
+			return pg.WithProjectTx(auditCtx, authPool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+				details := fmt.Sprintf(`{"topic":%q,"write":%t}`, topic, write)
+				_, err := tx.Exec(ctx, `INSERT INTO t_audit_log(project_id, action, actor_id, resource_type, resource_id, details) VALUES($1,'acl.deny',$2,'mqtt_topic',$3,$4::jsonb)`, projectID, deviceKey, topic, details)
+				return err
+			})
+		},
+		AllowAnonymous: *allowAnonymous,
+		Cluster:        node,
+		Meter:          meterAcc,
 	})
 	if err != nil {
 		logger.Fatal("启动 MQTT 接入失败", zap.Error(err))

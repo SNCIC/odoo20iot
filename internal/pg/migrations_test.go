@@ -129,3 +129,56 @@ func TestAlarmAckMigrationAddsAuditAndActorFields(t *testing.T) {
 		}
 	}
 }
+
+func TestGatewayDeviceTypeMigrationAddsFlag(t *testing.T) {
+	migs, err := LoadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.Version == "0017_gateway_device_type" {
+			sql = m.SQL
+			break
+		}
+	}
+	for _, want := range []string{"ALTER TABLE t_device_type", "is_gateway BOOLEAN NOT NULL DEFAULT false"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("0017 缺少网关类型字段: %q", want)
+		}
+	}
+}
+
+func TestConnectorWatermarkMigration(t *testing.T) {
+	migs, err := LoadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.Version == "0018_connector_watermark" {
+			sql = m.SQL
+		}
+	}
+	for _, want := range []string{"t_connector_watermark", "write_date", "record_id"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("0018 缺少 %q", want)
+		}
+	}
+}
+
+func TestDLQPayloadReferenceMigration(t *testing.T) {
+	migs, err := LoadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.Version == "0019_dlq_payload_ref" {
+			sql = m.SQL
+		}
+	}
+	if !strings.Contains(sql, "payload_ref") {
+		t.Fatal("0019 缺少 payload_ref")
+	}
+}

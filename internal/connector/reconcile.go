@@ -49,13 +49,16 @@ type ReconcileOptions struct {
 	Publisher  Publisher
 	Watermarks Watermarks
 	// Models 是要对账的 Odoo 模型（C-2 水位差扫描）。为空则跳过该扫描。
-	Models     []string
-	Interval   time.Duration
-	StaleAfter time.Duration
-	Batch      int
-	Metrics    *Metrics
-	Logger     *slog.Logger
-	Now        func() time.Time
+	Models       []string
+	Interval     time.Duration
+	StaleAfter   time.Duration
+	Batch        int
+	Metrics      *Metrics
+	Logger       *slog.Logger
+	Now          func() time.Time
+	ExternalRefs interface {
+		ReconcileUnbound(context.Context) (int, error)
+	}
 }
 
 // ReconcileResult 是单轮对账的统计。
@@ -80,16 +83,19 @@ type ReconcileResult struct {
 //
 // §4.4 的第 ③ 项（未绑定告警待办）依赖 `t_external_ref`，该表尚未建立，故未实现。
 type Reconciler struct {
-	caller     caller
-	pub        Publisher
-	watermarks Watermarks
-	models     []string
-	interval   time.Duration
-	staleAfter time.Duration
-	batch      int
-	metrics    *Metrics
-	logger     *slog.Logger
-	now        func() time.Time
+	caller       caller
+	pub          Publisher
+	watermarks   Watermarks
+	models       []string
+	interval     time.Duration
+	staleAfter   time.Duration
+	batch        int
+	metrics      *Metrics
+	logger       *slog.Logger
+	now          func() time.Time
+	externalRefs interface {
+		ReconcileUnbound(context.Context) (int, error)
+	}
 
 	// gapStreak 记录每个来源「连续多少轮发现遗漏」。key 为 gapKeyOutbox 或模型名。
 	mu        sync.Mutex
@@ -109,17 +115,18 @@ func NewReconciler(opts ReconcileOptions) (*Reconciler, error) {
 	}
 
 	r := &Reconciler{
-		caller:     opts.Caller,
-		pub:        opts.Publisher,
-		watermarks: opts.Watermarks,
-		models:     opts.Models,
-		interval:   opts.Interval,
-		staleAfter: opts.StaleAfter,
-		batch:      opts.Batch,
-		metrics:    opts.Metrics,
-		logger:     opts.Logger,
-		now:        opts.Now,
-		gapStreak:  make(map[string]int, 4),
+		caller:       opts.Caller,
+		pub:          opts.Publisher,
+		watermarks:   opts.Watermarks,
+		models:       opts.Models,
+		interval:     opts.Interval,
+		staleAfter:   opts.StaleAfter,
+		batch:        opts.Batch,
+		metrics:      opts.Metrics,
+		logger:       opts.Logger,
+		now:          opts.Now,
+		externalRefs: opts.ExternalRefs,
+		gapStreak:    make(map[string]int, 4),
 	}
 	if r.interval <= 0 {
 		r.interval = DefaultReconcileInterval
@@ -192,6 +199,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (ReconcileResult, error)
 			return res, err
 		}
 	}
+	if r.externalRefs != nil {
+		if _, err := r.externalRefs.ReconcileUnbound(ctx); err != nil {
+			return res, fmt.Errorf("对账③：复核未绑定告警: %w", err)
+		}
+	}
 	return res, nil
 }
 
@@ -200,6 +212,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (ReconcileResult, error)
 // ---------------------------------------------------------------------------
 
 type outboxRow struct {
+	TenantID       string          `json:"tenant_id"`
 	EventID        string          `json:"event_id"`
 	CompanyID      json.RawMessage `json:"company_id"` // Many2one 返回 [id, name]
 	AggregateModel string          `json:"aggregate_model"`
@@ -299,6 +312,7 @@ func (row outboxRow) toEvent(now time.Time) (OdooEvent, error) {
 	occurred, _ := parseOdooTime(strings.TrimSpace(row.OccurredAt))
 
 	return OdooEvent{
+		TenantID: row.TenantID,
 		// **沿用原 event_id**：若原事件其实已经到达，下游按 event_id 去重即可，
 		// 补投不会变成重复。换个新 id 就等于承认「必然重复」，那去重就白做了。
 		EventID:        row.EventID,

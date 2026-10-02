@@ -25,6 +25,7 @@ const MaxWebhookBody = 1 << 20 // 1 MiB
 // Odoo 侧（`base.automation` → `ir.actions.server(state=webhook)`）需按此形状
 // POST：路由三键用于去重与定主题，`data` 承载记录快照（原样进事件载荷）。
 type webhookRequest struct {
+	TenantID  string          `json:"tenant_id"`
 	Model     string          `json:"model"`
 	ID        int64           `json:"id"`
 	WriteDate string          `json:"write_date"`
@@ -157,6 +158,7 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	occurred := parseOccurredAt(req.WriteDate, w.now())
 	ev := OdooEvent{
+		TenantID:       strings.TrimSpace(req.TenantID),
 		EventID:        eventID,
 		CompanyID:      req.CompanyID,
 		AggregateModel: req.Model,

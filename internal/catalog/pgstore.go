@@ -194,14 +194,15 @@ func (s *PGStore) UpsertProject(ctx context.Context, p Project) (int64, error) {
 }
 
 const upsertDeviceTypeSQL = `
-INSERT INTO t_device_type (id, project_id, type_key, name, category, thing_model, thing_model_version)
-VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+INSERT INTO t_device_type (id, project_id, type_key, name, category, thing_model, thing_model_version, is_gateway)
+VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
 ON CONFLICT (id) DO UPDATE SET
     type_key            = EXCLUDED.type_key,
     name                = EXCLUDED.name,
     category            = EXCLUDED.category,
     thing_model         = EXCLUDED.thing_model,
     thing_model_version = EXCLUDED.thing_model_version,
+    is_gateway         = EXCLUDED.is_gateway,
     updated_at          = now(),
     version             = t_device_type.version + 1
 RETURNING id`
@@ -223,7 +224,7 @@ func (s *PGStore) UpsertDeviceType(ctx context.Context, t DeviceType) (int64, er
 	}
 	var id int64
 	if err := s.pool.QueryRow(ctx, upsertDeviceTypeSQL,
-		t.ID, t.ProjectID, t.TypeKey, t.Name, t.Category, string(model), t.ThingModelVersion).Scan(&id); err != nil {
+		t.ID, t.ProjectID, t.TypeKey, t.Name, t.Category, string(model), t.ThingModelVersion, t.IsGateway).Scan(&id); err != nil {
 		return 0, fmt.Errorf("catalog: upsert 设备类型: %w", err)
 	}
 	return id, nil

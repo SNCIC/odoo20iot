@@ -49,6 +49,7 @@ type DeviceType struct {
 	TypeKey           string
 	Name              string
 	Category          string
+	IsGateway         bool
 	ThingModel        json.RawMessage
 	ThingModelVersion int64
 	Version           int64

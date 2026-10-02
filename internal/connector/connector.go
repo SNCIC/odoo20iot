@@ -31,6 +31,7 @@ func SuppressDLQ(ctx context.Context) context.Context {
 
 // Request 是一次写回 / 查询请求。
 type Request struct {
+	Scope  string
 	Model  string
 	Method string
 	Params any
@@ -227,7 +228,11 @@ func (c *Connector) reserve(ctx context.Context, req Request) error {
 		return nil
 	}
 
-	res, err := c.guard.Reserve(ctx, req.IdempotencyKey, req.RequestHash)
+	scope := req.Scope
+	if scope == "" {
+		scope = "integration"
+	}
+	res, err := c.guard.Reserve(ctx, scope+":"+req.IdempotencyKey, req.RequestHash)
 	if err != nil {
 		c.logger.Warn("幂等占位不可用，降级交由 Odoo 账本裁决",
 			"key", req.IdempotencyKey, "error", err)

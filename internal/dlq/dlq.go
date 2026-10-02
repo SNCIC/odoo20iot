@@ -36,7 +36,8 @@ type Entry struct {
 	TraceID string
 	// Payload 是原文。对象存储接入前先落库当兜底；
 	// 接入后可只留引用，避免 PG 被大报文撑大。
-	Payload string
+	Payload    string
+	PayloadRef string
 	// CreatedAt 零值取当前时间。
 	CreatedAt time.Time
 }
@@ -59,7 +60,8 @@ type Aggregate struct {
 
 // Store 把死信写入 t_dlq。
 type Store struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	objects ObjectStore
 
 	mu sync.Mutex
 	// ensuredMonth 缓存「本月分区已确认」，避免每条死信都多一次函数调用。
@@ -70,6 +72,10 @@ type Store struct {
 // New 构造。
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
+}
+
+func NewWithObjectStore(pool *pgxpool.Pool, objects ObjectStore) *Store {
+	return &Store{pool: pool, objects: objects}
 }
 
 // Put 写入一条死信。
@@ -91,11 +97,18 @@ func (s *Store) Put(ctx context.Context, e Entry) error {
 	if err != nil {
 		return fmt.Errorf("dlq: 序列化重试历史: %w", err)
 	}
+	if s.objects != nil && e.Payload != "" {
+		ref, err := s.objects.Put(ctx, e.Service+"/"+e.EntityType, []byte(e.Payload))
+		if err != nil {
+			return fmt.Errorf("dlq: 保存原文对象: %w", err)
+		}
+		e.PayloadRef = ref
+	}
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO t_dlq (service, subject, entity_type, idempotency_key, reason, attempts, history, trace_id, payload, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		INSERT INTO t_dlq (service, subject, entity_type, idempotency_key, reason, attempts, history, trace_id, payload, payload_ref, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		e.Service, e.Subject, e.EntityType, e.IdempotencyKey, e.Reason, e.Attempts, string(history),
-		e.TraceID, e.Payload, e.CreatedAt,
+		e.TraceID, e.Payload, e.PayloadRef, e.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("dlq: 写入死信: %w", err)
 	}

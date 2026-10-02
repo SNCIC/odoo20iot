@@ -22,8 +22,11 @@ func (d *PGDirectory) Lookup(ctx context.Context, clientID string) (*Identity, e
 	var mode, status, hash string
 	var projectID, typeID, version int64
 	var revoked bool
-	err := d.pool.QueryRow(ctx, `SELECT project_id, device_type_id, device_key, auth_mode, status, secret_hash, secret_version, (status='disabled') FROM t_device WHERE device_key=$1 AND deleted_at IS NULL`, clientID).
-		Scan(&projectID, &typeID, &id.DeviceKey, &mode, &status, &hash, &version, &revoked)
+	err := d.pool.QueryRow(ctx, `SELECT d.project_id, d.device_type_id, d.device_key, d.auth_mode, d.status, d.secret_hash, d.secret_version, (d.status='disabled'), COALESCE(t.is_gateway, false)
+FROM t_device AS d
+LEFT JOIN t_device_type AS t ON t.project_id=d.project_id AND t.id=d.device_type_id
+WHERE d.device_key=$1 AND d.deleted_at IS NULL`, clientID).
+		Scan(&projectID, &typeID, &id.DeviceKey, &mode, &status, &hash, &version, &revoked, &id.IsGateway)
 	if err != nil {
 		return nil, err
 	}

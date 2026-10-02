@@ -99,6 +99,7 @@ type config struct {
 	dlqAlertWebhookURL    string
 	dlqAlertEgressAllow   string
 	dlqAlertAllowLoopback bool
+	dlqObjectDir          string
 }
 
 func main() {
@@ -154,6 +155,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.dlqAlertWebhookURL, "dlq-alert-webhook", os.Getenv("IOT_DLQ_ALERT_WEBHOOK"), "DLQ 告警 Webhook；默认取 IOT_DLQ_ALERT_WEBHOOK")
 	flag.StringVar(&cfg.dlqAlertEgressAllow, "dlq-alert-egress-allow", os.Getenv("IOT_DLQ_ALERT_EGRESS_ALLOW"), "DLQ 告警出站白名单；默认取 IOT_DLQ_ALERT_EGRESS_ALLOW")
 	flag.BoolVar(&cfg.dlqAlertAllowLoopback, "dlq-alert-allow-loopback", false, "仅本地联调放行 DLQ 告警回环地址")
+	flag.StringVar(&cfg.dlqObjectDir, "dlq-object-dir", os.Getenv("IOT_DLQ_OBJECT_DIR"), "DLQ 原文对象目录；为空则仅保留 PG 原文")
 	flag.Parse()
 	return cfg
 }
@@ -208,7 +210,14 @@ func run(cfg config) error {
 	}
 	var dlqStoreInstance *dlq.Store
 	if businessPool != nil {
-		dlqStoreInstance = dlq.New(businessPool)
+		var objectStore dlq.ObjectStore
+		if cfg.dlqObjectDir != "" {
+			objectStore, err = dlq.NewFileObjectStore(cfg.dlqObjectDir)
+			if err != nil {
+				return fmt.Errorf("初始化 DLQ 原文对象存储: %w", err)
+			}
+		}
+		dlqStoreInstance = dlq.NewWithObjectStore(businessPool, objectStore)
 	}
 
 	// 指标由四处共用：编排层、Outbox 消费、webhook、对账。
@@ -239,7 +248,11 @@ func run(cfg config) error {
 	}
 
 	// C-2 水位：webhook 推进、对账比对，两侧必须共用同一份存储。
-	watermarks := connector.NewRedisWatermarks(rdb)
+	watermarks := connector.NewRedisWatermarksWithFallback(rdb, businessPool)
+	var refs *extref.Store
+	if businessPool != nil {
+		refs = extref.NewStore(businessPool)
+	}
 
 	// 事件入口 C-1：Odoo Outbox（Redis Streams）→ NATS。
 	consumer, err := connector.NewOutboxConsumer(connector.OutboxOptions{
@@ -273,7 +286,7 @@ func run(cfg config) error {
 
 	// 定时对账（§4.4）。Caller 传的是编排层本身，
 	// 这样对账的 Odoo 查询同样受限流与熔断保护。
-	reconciler, err := connector.NewReconciler(connector.ReconcileOptions{
+	reconcileOpts := connector.ReconcileOptions{
 		Caller:     conn,
 		Publisher:  publisher,
 		Watermarks: watermarks,
@@ -283,7 +296,11 @@ func run(cfg config) error {
 		Batch:      cfg.reconcileBatch,
 		Metrics:    metrics,
 		Logger:     logger,
-	})
+	}
+	if refs != nil {
+		reconcileOpts.ExternalRefs = refs
+	}
+	reconciler, err := connector.NewReconciler(reconcileOpts)
 	if err != nil {
 		return fmt.Errorf("构造对账器: %w", err)
 	}

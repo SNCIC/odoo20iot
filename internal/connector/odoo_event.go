@@ -35,6 +35,7 @@ const DefaultConsumerGroup = "odoo-connector"
 // 另加连接器翻译时刻与 trace。
 type OdooEvent struct {
 	EventID        string          `json:"event_id"`
+	TenantID       string          `json:"tenant_id,omitempty"`
 	CompanyID      int64           `json:"company_id"`
 	AggregateModel string          `json:"aggregate_model"`
 	AggregateID    int64           `json:"aggregate_id"`
@@ -84,6 +85,7 @@ type StreamEntry struct {
 //   - **瞬时错误**：不应 ACK，留给消费组重投。
 func parseOdooEvent(e StreamEntry, now time.Time) (OdooEvent, error) {
 	ev := OdooEvent{
+		TenantID:       strings.TrimSpace(e.Fields["tenant_id"]),
 		EventID:        strings.TrimSpace(e.Fields["event_id"]),
 		AggregateModel: strings.TrimSpace(e.Fields["aggregate_model"]),
 		TraceID:        strings.TrimSpace(e.Fields["trace_id"]),
