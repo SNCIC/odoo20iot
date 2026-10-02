@@ -37,7 +37,7 @@
 
 **未确认升级增量（2026-10-02）**：`svc-alarm` 扫描 `active` 告警的 `notified_ts`，默认 30 分钟发布阶段 1 上级通知，默认 2 小时发布阶段 2 P1 通知；`t_alarm_active.escalation_stage` 通过迁移 `0015_alarm_escalation` 持久化，并用条件更新原子抢占，重启和多副本不会重复升级。策略支持 `ack_escalated_recipients`（阶段 1）与 `escalated_recipients`（阶段 2）。控制台人工确认 API 已实现：`POST /api/v1/alarms/{alarm_id}/ack`，需要 `alarm:write` scope；确认写入 `t_audit_log` 并抑制后续升级。
 
-下一步：A4 连接压测明确暂缓；继续完成目录/告警表的租户事务改造、非 owner 应用账号切换、mTLS 设备证书生命周期，以及独立 `svc-rule` 消费服务的生产接入。Odoo S1/S3、B1 查询保护已有 Go/真实依赖验证记录，仍需在发布前按现场数据再次验收。
+下一步：A4 连接压测明确暂缓；继续完成目录/告警表的租户事务改造、非 owner 应用账号切换、mTLS 设备证书生命周期，以及独立 `svc-rule` 消费服务的生产接入。Odoo S1/S3 已完成本轮真实链路验收：手工触发 Outbox cron 投递 2 条 pending 事件，Redis Stream consumer `odoo-connector` 的 `pending=0、lag=0`，设备主数据同步和 `t_external_ref` 均已核验；定时 cron 仍保持关闭，避免开发环境自动对外通知。
 
 ---
 
@@ -248,7 +248,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | P1 | A4 | **压测工具已完成三个阶段**（`cmd/mqtt-bench`：阶段 1 建连/保持/资源采样/泄漏趋势判定，阶段 2 QoS1 发布路径，阶段 3 背靠背吞吐 + 接入确认延迟 P50/P95/P99 + SLO 判定；引入 `eclipse/paho.mqtt.golang` v1.5.1）。**5 万连接 24h 正式实测待跑**：需先起网关，且压测客户端**须分机部署**（同机跑会把工具开销算进网关）。冒烟：10 连接背靠背 → 13585 msg/s、P99 = 2ms、SLO ✅；200 连接 + 1s 周期发布 → 2098 条全成功 |
 | P1 | A4 补充项 | **机制性验证已完成**（`internal/gateway/a4_test.go`，不依赖真实 NATS）：PUBLISH 同步阻塞同连接的 PINGREQ，PINGRESP 推迟 ≈ `PubackTimeout`（400ms 用例实测 400ms）；阻塞**仅限该连接**。**5 万连接 24h 下的规模化影响**（连续上报 × 总线超时 → 设备侧误判重连）仍待压测观测（`03` §4.4.1 边界 1） |
 | ~~P0~~ | ~~A5 · 计量埋点原型~~ | ✅ **已完成（原型）**（见 §4 第 13 项）。遗留：每分钟落 PG（按 `(metric, ts_minute)` 幂等）+ 每小时对账、配额限流与分级预警、其余三类指标（设备数/存储量/API 调用数） |
-| P1 | D2 / D3 | Go 侧 JSON-2 客户端与 Odoo 侧集成骨架已完成；D3 完整 facade / 其余 IoT 路由 / 视图 / `tests/` / `EXTENSIONS.md` 和 S1/S3 端到端验收仍需逐项核对。本次发现连接器曾报告 Outbox pending 未收敛；本环境无 Odoo 服务管理权限，尚未验证 cron 配置或清空 pending。 |
+| P1 | D2 / D3 | Go 侧 JSON-2 客户端与 Odoo 侧集成骨架已完成；本轮已完成 S1/S3 真实链路验收：`edge.outbox` 2 条 pending 经 `_cron_deliver()` 投递成功，Redis consumer `pending=0、lag=0`，`t_external_ref` 已有 3 条 active 设备映射，IoT `t_device` 已同步设备 1/2/3。D3 完整 facade / 其余 IoT 路由 / 视图 / `tests/` / `EXTENSIONS.md` 仍需逐项核对。 |
 | ~~P1~~ | ~~`odoo-connector` 补充项~~ | **已完成**：编排层、两条事件入口、Odoo cron、定时对账、主数据增量拉取、`t_external_ref` 外部引用、`t_integration_issue` 未绑定待办、结构化 DLQ、聚合告警与可选重放均已完成。DLQ 默认开启；重放默认关闭，需显式设置 `-dlq-replay-interval`；聚合告警默认每 5 分钟扫描最近 15 分钟，阈值为 1 条，可用 `-dlq-alert-*` 调整；配置 `IOT_DLQ_ALERT_WEBHOOK` + `IOT_DLQ_ALERT_EGRESS_ALLOW` 后可投递飞书/钉钉机器人。**遗留**：对象存储原文、告警去重/升级策略和生产轮换自动化。|
 | P1 | 告警引擎补充项 | **五态 FSM + 去重/聚合/抑制 + PG `Store` + `svc-alarm` 服务（双通道 + 5s 扫描 + 至少一次发布）+ `svc-notify` 三通道通知 + 未确认升级 + 人工确认 API 均已完成**（见 §4 第 17、18、19、20 项）。**遗留**：`dedup_key` 哈希分片、静默窗口的配置源、批量告警实体与通知合并路径 |
 | ~~P1~~ | ~~**「重启即重放」缺陷的另外 3 处**~~ | ✅ **已完成**（见 §4 第 21 项）：`svc-pipeline` / `svc-quota` / `internal/cluster` 统一走 `internal/natsjs`，且 `natsjs.Subscribe` 的返回值已收窄为不暴露 `Unsubscribe`（结构性防复发）。真 NATS 演练：`svc-quota` 的重启不再重复计数（对照实验复现了旧的 5→10） |
@@ -463,7 +463,7 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 ## 8. 2026-10-01 继续开发记录
 
 - **第1项**：真实 MQTT → NATS → GreptimeDB → Redis 最新值 → `svc-query` 验收已完成；新增 Odoo 集成账本迁移 `0007`，并在真实 IoT PostgreSQL 验证外部引用唯一约束、集成日志月分区和幂等注册表。
-- **第2项**：新增 `internal/extref` 的远端/本地查询、状态更新和租户事务写入基础；`odoo-connector` 已支持通过 `-masterdata-model maintenance.equipment` 开启主数据增量同步，使用 Redis `(write_date,id)` 游标，幂等 upsert `t_device_type`/`t_device` 并写入 `t_external_ref`。仍未完成 Odoo S1/S3 真实端到端验收、DLQ 重放编排和多模型字段映射。
+- **第2项**：新增 `internal/extref` 的远端/本地查询、状态更新和租户事务写入基础；`odoo-connector` 已支持通过 `-masterdata-model maintenance.equipment` 开启主数据增量同步，使用 Redis `(write_date,id)` 游标，幂等 upsert `t_device_type`/`t_device` 并写入 `t_external_ref`。2026-10-02 已完成 Odoo S1/S3 真实端到端验收；仍未完成 DLQ 重放编排和多模型字段映射。
 - **2026-10-01 实际联调**：已安装 Odoo `maintenance`（`20.0.1.0`），`maintenance.equipment` JSON-2 返回 `HTTP 200`；IoT `t_project.id=1` 已绑定 Odoo `res.company.id=1`（圣宁咨询）。主数据同步首轮真实运行通过，`read=0/upserted=0/skipped=0`，原因是 Odoo 当前没有设备记录；不是链路失败。
 - **2026-10-01 设备端到端验收**：通过 Odoo JSON-2 创建验收设备 `maintenance.equipment.id=1`，随后真实同步 `read=1/upserted=1`；修改 Odoo 设备后再次同步 `read=1/upserted=1`，重复运行 `read=0/upserted=0`。IoT 最终 `t_device.id=1`、`t_external_ref.local_id=1`、版本递增到 2，Redis 游标已推进。期间修复了 `t_device.id=0` 的序列生成缺陷。
 - **2026-10-02 告警建单链路**：Odoo `sn_edge_integration` 已提供幂等 `POST /api/iot/v1/maintenance/request`；`odoo-connector` 新增持久 JetStream 告警消费者，按 `t_external_ref` 解析设备并在建单成功后 ACK。通过 `-alarm-to-odoo` 显式启用，未绑定设备记录为 `unbound_alarm` 集成问题。
