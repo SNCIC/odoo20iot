@@ -17,14 +17,23 @@
 package envelope
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"regexp"
 	"time"
 )
 
+const CurrentSchemaVersion = "1"
+
+var traceIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
 // Envelope 是网关发布到 NATS 的统一信封。
 type Envelope struct {
+	SchemaVersion string `json:"schema_version,omitempty"`
+	TraceID       string `json:"trace_id,omitempty"`
+
 	// 归属元数据（Phase 0 为占位值，见包注释）。
 	ProjectID    int64  `json:"project_id"`
 	DeviceKey    string `json:"device_key"`
@@ -54,6 +63,14 @@ func (e Envelope) Encode() ([]byte, error) {
 	return b, nil
 }
 
+func NewTraceID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("生成 trace_id: %w", err)
+	}
+	return fmt.Sprintf("%x", raw), nil
+}
+
 // Decode 反序列化信封并校验必要字段。
 //
 // 校验刻意严格：缺 `device_key` 或 `payload` 的信封无法落库，
@@ -65,6 +82,12 @@ func Decode(b []byte) (Envelope, error) {
 	}
 	if e.DeviceKey == "" {
 		return Envelope{}, fmt.Errorf("设备信封缺少 device_key")
+	}
+	if e.SchemaVersion != CurrentSchemaVersion {
+		return Envelope{}, fmt.Errorf("设备信封 schema_version 不支持: %q", e.SchemaVersion)
+	}
+	if !traceIDPattern.MatchString(e.TraceID) {
+		return Envelope{}, fmt.Errorf("设备信封 trace_id 非法")
 	}
 	if len(e.Payload) == 0 {
 		return Envelope{}, fmt.Errorf("设备信封缺少 payload（device_key=%s）", e.DeviceKey)

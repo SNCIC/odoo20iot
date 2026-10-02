@@ -10,13 +10,15 @@ import (
 
 func sample() Envelope {
 	return Envelope{
-		ProjectID:    1,
-		DeviceKey:    "dev-A",
-		DeviceID:     PlaceholderDeviceID("dev-A"),
-		DeviceTypeID: 55,
-		Stream:       "telemetry",
-		ReceivedAt:   time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
-		Payload:      json.RawMessage(`{"ts":"2026-10-01T08:12:33.421Z","seq":1042,"data":{"temperature":25.3}}`),
+		SchemaVersion: CurrentSchemaVersion,
+		TraceID:       "0123456789abcdef0123456789abcdef",
+		ProjectID:     1,
+		DeviceKey:     "dev-A",
+		DeviceID:      PlaceholderDeviceID("dev-A"),
+		DeviceTypeID:  55,
+		Stream:        "telemetry",
+		ReceivedAt:    time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
+		Payload:       json.RawMessage(`{"ts":"2026-10-01T08:12:33.421Z","seq":1042,"data":{"temperature":25.3}}`),
 	}
 }
 
@@ -37,6 +39,9 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 	if got.DeviceKey != orig.DeviceKey {
 		t.Errorf("device_key 丢失: %q", got.DeviceKey)
 	}
+	if got.SchemaVersion != CurrentSchemaVersion || got.TraceID != orig.TraceID {
+		t.Errorf("信封追踪元数据不一致: %+v", got)
+	}
 	if got.Stream != "telemetry" {
 		t.Errorf("stream 应为 telemetry，得到 %q", got.Stream)
 	}
@@ -45,6 +50,13 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got.Payload, orig.Payload) {
 		t.Errorf("payload 被改写:\n 期望 %s\n 实际 %s", orig.Payload, got.Payload)
+	}
+}
+
+func TestNewTraceID(t *testing.T) {
+	traceID, err := NewTraceID()
+	if err != nil || len(traceID) != 32 {
+		t.Fatalf("trace_id=%q err=%v", traceID, err)
 	}
 }
 
@@ -67,8 +79,10 @@ func TestEnvelope_PayloadNotBase64(t *testing.T) {
 // TestDecode_RejectsInvalid 验证入口校验：缺关键字段 / 非法 JSON 一律拒绝。
 func TestDecode_RejectsInvalid(t *testing.T) {
 	cases := map[string]string{
-		"缺 device_key": `{"payload":{"a":1}}`,
-		"缺 payload":    `{"device_key":"dev-A"}`,
+		"缺 device_key": `{"schema_version":"1","trace_id":"0123456789abcdef0123456789abcdef","payload":{"a":1}}`,
+		"缺 payload":    `{"schema_version":"1","trace_id":"0123456789abcdef0123456789abcdef","device_key":"dev-A"}`,
+		"缺 schema":     `{"trace_id":"0123456789abcdef0123456789abcdef","device_key":"dev-A","payload":{"a":1}}`,
+		"非法 trace":     `{"schema_version":"1","trace_id":"bad","device_key":"dev-A","payload":{"a":1}}`,
 		"非法 JSON":      `{"device_key":"dev-A",`,
 	}
 	for name, raw := range cases {

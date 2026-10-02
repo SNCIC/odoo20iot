@@ -61,13 +61,15 @@ const (
 func mustEnvelope(t *testing.T, payload string) []byte {
 	t.Helper()
 	env := envelope.Envelope{
-		ProjectID:    testProjectID,
-		DeviceKey:    "dev-A",
-		DeviceID:     testDeviceID,
-		DeviceTypeID: 55,
-		Stream:       "telemetry",
-		ReceivedAt:   time.Now(),
-		Payload:      json.RawMessage(payload),
+		SchemaVersion: envelope.CurrentSchemaVersion,
+		TraceID:       "0123456789abcdef0123456789abcdef",
+		ProjectID:     testProjectID,
+		DeviceKey:     "dev-A",
+		DeviceID:      testDeviceID,
+		DeviceTypeID:  55,
+		Stream:        "telemetry",
+		ReceivedAt:    time.Now(),
+		Payload:       json.RawMessage(payload),
 	}
 	data, err := env.Encode()
 	if err != nil {

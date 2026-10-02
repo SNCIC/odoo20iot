@@ -65,6 +65,8 @@ type Hook struct {
 	meter Meter
 }
 
+const MaxPayloadBytes = 32 << 10
+
 var _ mqtt.Hook = (*Hook)(nil)
 
 // NewHook 构造 A2 hook。baseCtx 决定「优雅关闭时在途等待是否立即放弃」。
@@ -198,8 +200,17 @@ func (h *Hook) buildEnvelope(pk packets.Packet) ([]byte, error) {
 	if !json.Valid(pk.Payload) {
 		return nil, fmt.Errorf("payload 不是合法 JSON（%d 字节）", len(pk.Payload))
 	}
+	if len(pk.Payload) > MaxPayloadBytes {
+		return nil, fmt.Errorf("payload 超过 %d 字节上限", MaxPayloadBytes)
+	}
+	traceID, err := envelope.NewTraceID()
+	if err != nil {
+		return nil, err
+	}
 
 	return envelope.Envelope{
+		SchemaVersion: envelope.CurrentSchemaVersion,
+		TraceID:       traceID,
 		ProjectID:    h.projectID,
 		DeviceKey:    deviceKey,
 		DeviceID:     envelope.PlaceholderDeviceID(deviceKey),

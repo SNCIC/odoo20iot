@@ -24,13 +24,15 @@ func newTestParser(t *testing.T) *Parser {
 
 func envWith(payload string) envelope.Envelope {
 	return envelope.Envelope{
-		ProjectID:    7,
-		DeviceKey:    "dev-A",
-		DeviceID:     12345,
-		DeviceTypeID: 55,
-		Stream:       "telemetry",
-		ReceivedAt:   time.Now(),
-		Payload:      json.RawMessage(payload),
+		SchemaVersion: envelope.CurrentSchemaVersion,
+		TraceID:       "0123456789abcdef0123456789abcdef",
+		ProjectID:     7,
+		DeviceKey:     "dev-A",
+		DeviceID:      12345,
+		DeviceTypeID:  55,
+		Stream:        "telemetry",
+		ReceivedAt:    time.Now(),
+		Payload:       json.RawMessage(payload),
 	}
 }
 
