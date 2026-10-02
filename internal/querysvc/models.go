@@ -17,6 +17,7 @@ const (
 	CodeUnprocessable    Code = "UNPROCESSABLE"      // 422 违反查询保护规则
 	CodeTenantNotAllowed Code = "TENANT_NOT_ALLOWED" // 400 请求里出现了 project_id
 	CodeQueryBusy        Code = "QUERY_BUSY"         // 503 每租户排队已满/超时
+	CodeRateLimited      Code = "RATE_LIMITED"       // 429 租户速率超限
 	CodeQueryTimeout     Code = "QUERY_TIMEOUT"      // 504 查询超时
 	CodeUpstream         Code = "UPSTREAM_UNAVAILABLE"
 	CodeInternal         Code = "INTERNAL"
@@ -64,6 +65,18 @@ type seriesResponse struct {
 	CapHit      bool        `json:"cap_hit"`
 	Points      []pointDTO  `json:"points,omitempty"`
 	Buckets     []bucketDTO `json:"buckets,omitempty"`
+}
+
+type latestDTO struct {
+	DeviceID  int64          `json:"device_id"`
+	Available bool           `json:"available"`
+	TS        *time.Time     `json:"ts,omitempty"`
+	Values    map[string]any `json:"values,omitempty"`
+}
+
+type latestResponse struct {
+	OK     bool        `json:"ok"`
+	Latest []latestDTO `json:"latest"`
 }
 
 // deviceDTO 是设备列表的一行。**永不包含 secret_hash**。

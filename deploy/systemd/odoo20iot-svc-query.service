@@ -1,0 +1,15 @@
+[Unit]
+Description=Odoo20IoT query service
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/xfusion/projects/odoo20iot/deploy/systemd/run-svc-query.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+KillMode=mixed
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

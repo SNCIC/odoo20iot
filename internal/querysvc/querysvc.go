@@ -9,6 +9,8 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/latest"
+	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -18,6 +20,16 @@ import (
 // 抽成接口的直接收益：handler 单测可以用假实现覆盖全部状态码，不必连真实 GreptimeDB。
 type SeriesReader interface {
 	QuerySeries(ctx context.Context, p tsdb.Plan, q tsdb.SeriesQuery) (tsdb.SeriesResult, error)
+}
+
+type LatestReader interface {
+	Get(ctx context.Context, projectID, deviceID int64) (latest.Snapshot, error)
+}
+
+type NotificationEndpointStore interface {
+	List(context.Context, int64) ([]notifyconfig.Endpoint, error)
+	Create(context.Context, int64, string, string, string) (notifyconfig.Endpoint, error)
+	Delete(context.Context, int64, int64) error
 }
 
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
@@ -57,6 +69,8 @@ func DefaultConfig() Config {
 // Deps 是服务依赖。
 type Deps struct {
 	Reader      SeriesReader
+	Latest      LatestReader
+	Endpoints   NotificationEndpointStore
 	Catalog     catalog.Store
 	Verifier    apiauth.Verifier
 	Health      Health

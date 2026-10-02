@@ -14,6 +14,7 @@ var (
 	ErrQueueFull = errors.New("querysvc: 每租户排队已满")
 	// ErrQueueTimeout 表示排队等超时 → 503。
 	ErrQueueTimeout = errors.New("querysvc: 排队超时")
+	ErrRateLimited  = errors.New("querysvc: 租户请求速率超限")
 )
 
 // LimiterConfig 是每租户并发限制的参数。
@@ -28,6 +29,10 @@ type LimiterConfig struct {
 	MaxTenants int
 	// IdleTTL 是租户通道的空闲驱逐阈值。
 	IdleTTL time.Duration
+	// RatePerSecond 是每租户请求速率；0 表示不启用速率限制。
+	RatePerSecond float64
+	// Burst 是每租户令牌桶容量；0 时按速率向上取整。
+	Burst int
 }
 
 // DefaultLimiterConfig 对齐 02 §4.3。
@@ -38,6 +43,8 @@ func DefaultLimiterConfig() LimiterConfig {
 		QueueTimeout:   2 * time.Second,
 		MaxTenants:     10_000,
 		IdleTTL:        10 * time.Minute,
+		RatePerSecond:  20,
+		Burst:          40,
 	}
 }
 
@@ -45,6 +52,9 @@ type tenantLimiter struct {
 	sem      chan struct{}
 	waiting  atomic.Int64
 	lastUsed atomic.Int64 // unix nano
+	rateMu   sync.Mutex
+	tokens   float64
+	refill   time.Time
 }
 
 // Limiter 是每租户的「信号量 + 有界队列」。
@@ -79,6 +89,12 @@ func NewLimiter(cfg LimiterConfig, m *Metrics, now func() time.Time) *Limiter {
 	if cfg.IdleTTL <= 0 {
 		cfg.IdleTTL = def.IdleTTL
 	}
+	if cfg.RatePerSecond < 0 {
+		cfg.RatePerSecond = 0
+	}
+	if cfg.RatePerSecond > 0 && cfg.Burst <= 0 {
+		cfg.Burst = int(cfg.RatePerSecond + 0.999999)
+	}
 	if now == nil {
 		now = time.Now
 	}
@@ -93,6 +109,9 @@ func (l *Limiter) Acquire(ctx context.Context, projectID int64) (func(), error) 
 	tl, err := l.tenant(projectID)
 	if err != nil {
 		return nil, err
+	}
+	if !l.allowRate(tl) {
+		return nil, ErrRateLimited
 	}
 
 	select {
@@ -123,6 +142,32 @@ func (l *Limiter) Acquire(ctx context.Context, projectID int64) (func(), error) 
 		}
 		return nil, ctx.Err()
 	}
+}
+
+func (l *Limiter) allowRate(tl *tenantLimiter) bool {
+	if l.cfg.RatePerSecond <= 0 {
+		return true
+	}
+	now := l.now()
+	tl.rateMu.Lock()
+	defer tl.rateMu.Unlock()
+	if tl.refill.IsZero() {
+		tl.refill = now
+		tl.tokens = float64(l.cfg.Burst)
+	}
+	elapsed := now.Sub(tl.refill).Seconds()
+	if elapsed > 0 {
+		tl.tokens += elapsed * l.cfg.RatePerSecond
+		if tl.tokens > float64(l.cfg.Burst) {
+			tl.tokens = float64(l.cfg.Burst)
+		}
+		tl.refill = now
+	}
+	if tl.tokens < 1 {
+		return false
+	}
+	tl.tokens--
+	return true
 }
 
 func (l *Limiter) releaseFunc(tl *tenantLimiter) func() {

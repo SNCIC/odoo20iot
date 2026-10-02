@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -152,6 +153,16 @@ func (d *Dispatcher) Metrics() *Metrics { return d.metrics }
 // 时，需要看到「主通道试了 4 次、都失败、降级到邮件成功」，
 // 而不是只看到最后那个「成功」。
 func (d *Dispatcher) Dispatch(ctx context.Context, msg Message, policy Policy) ([]Result, error) {
+	return d.dispatch(ctx, msg, policy, true)
+}
+
+// Replay 重新投递一条已进入 DLQ 的通知。
+// 重放失败由 DLQ 重放器记录，不能在这里再次写入 DLQ，否则会形成递归死信。
+func (d *Dispatcher) Replay(ctx context.Context, msg Message, policy Policy) ([]Result, error) {
+	return d.dispatch(ctx, msg, policy, false)
+}
+
+func (d *Dispatcher) dispatch(ctx context.Context, msg Message, policy Policy, recordDLQ bool) ([]Result, error) {
 	if err := policy.Validate(); err != nil {
 		return nil, err
 	}
@@ -206,8 +217,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, msg Message, policy Policy) (
 		}
 
 		results = append(results, res)
-		if err := d.recordDLQ(ctx, msg, name, res); err != nil {
-			dlqFailed = true
+		if recordDLQ {
+			if err := d.recordDLQ(ctx, msg, policy, name, res); err != nil {
+				dlqFailed = true
+			}
 		}
 		if failedFrom == "" {
 			failedFrom = name
@@ -258,17 +271,27 @@ func (d *Dispatcher) deliver(ctx context.Context, ch Channel, msg Message, recip
 	}
 }
 
-func (d *Dispatcher) recordDLQ(ctx context.Context, msg Message, channel string, res Result) error {
+func (d *Dispatcher) recordDLQ(ctx context.Context, msg Message, policy Policy, channel string, res Result) error {
 	d.metrics.DLQTotal.Add(1)
+	payload, err := json.Marshal(struct {
+		Message Message `json:"message"`
+		Policy  Policy  `json:"policy"`
+		Channel string  `json:"channel"`
+	}{Message: msg, Policy: policy, Channel: channel})
+	if err != nil {
+		return fmt.Errorf("notify: 序列化死信载荷: %w", err)
+	}
 	entry := dlq.Entry{
-		Service:   "svc-notify",
-		Subject:   channel,
-		Payload:   truncate(msg.Subject + "\n" + msg.Body),
-		Reason:    errString(res.Err),
-		Attempts:  res.Attempts,
-		History:   []string{fmt.Sprintf("%s: 尝试 %d 次，最后错误：%s", channel, res.Attempts, errString(res.Err))},
-		TraceID:   msg.TraceID,
-		CreatedAt: d.now(),
+		Service:        "svc-notify",
+		Subject:        channel,
+		EntityType:     "notification",
+		IdempotencyKey: msg.DedupKey + ":" + channel,
+		Payload:        truncate(string(payload)),
+		Reason:         errString(res.Err),
+		Attempts:       res.Attempts,
+		History:        []string{fmt.Sprintf("%s: 尝试 %d 次，最后错误：%s", channel, res.Attempts, errString(res.Err))},
+		TraceID:        msg.TraceID,
+		CreatedAt:      d.now(),
 	}
 
 	if err := d.dlq.Put(ctx, entry); err != nil {

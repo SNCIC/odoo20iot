@@ -133,3 +133,8 @@ type Store interface {
 	// 不存在与跨租户都表现为「不在返回值里」。
 	DeviceIDsOwned(ctx context.Context, projectID int64, ids []int64) (map[int64]bool, error)
 }
+
+// ProjectByOdooCompany 是 Odoo 主数据同步解析租户边界所需的最小读接口。
+type ProjectByOdooCompany interface {
+	FindProjectByOdooCompany(ctx context.Context, companyID int64) (Project, error)
+}

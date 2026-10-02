@@ -56,7 +56,9 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/dlq"
 	"github.com/SNCIC/odoo20iot/internal/natsjs"
 	"github.com/SNCIC/odoo20iot/internal/notify"
+	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/pg"
+	"github.com/SNCIC/odoo20iot/internal/secureconfig"
 )
 
 const nakDelay = 500 * time.Millisecond
@@ -92,15 +94,18 @@ type config struct {
 	smsSender   string
 	smsTemplate string
 	// 策略
-	policyFile       string
-	defaultChannels  []string
-	defaultWebhooks  string
-	defaultEmails    string
-	defaultSMSTo     string
-	defaultTemplate  string
-	healthThreshold  float64
-	healthMinSamples int
-	healthWindow     time.Duration
+	policyFile        string
+	policySource      string
+	defaultChannels   []string
+	defaultWebhooks   string
+	defaultEmails     string
+	defaultSMSTo      string
+	defaultTemplate   string
+	healthThreshold   float64
+	healthMinSamples  int
+	healthWindow      time.Duration
+	dlqReplayInterval time.Duration
+	dlqReplayBatch    int
 	// HTTP
 	httpAddr   string
 	readyProbe time.Duration
@@ -146,6 +151,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.smsTemplate, "sms-template", "", "短信模板 ID")
 
 	flag.StringVar(&cfg.policyFile, "policy-file", "", "通知策略文件（JSON）；留空用下面的默认策略")
+	flag.StringVar(&cfg.policySource, "policy-source", "db", "通知策略来源：db 或 file")
 	flag.StringVar(&channels, "default-channels", "webhook", "默认通道优先级（逗号分隔）")
 	flag.StringVar(&cfg.defaultWebhooks, "default-webhook-to", "", "默认 Webhook 收件人（逗号分隔 URL）")
 	flag.StringVar(&cfg.defaultEmails, "default-email-to", "", "默认邮件收件人（逗号分隔）")
@@ -154,6 +160,8 @@ func parseFlags() config {
 	flag.Float64Var(&cfg.healthThreshold, "channel-failure-threshold", 0.3, "通道失败率阈值（04 §2.3：0.3）")
 	flag.IntVar(&cfg.healthMinSamples, "channel-min-samples", 5, "通道健康判定的最小样本数")
 	flag.DurationVar(&cfg.healthWindow, "channel-window", 10*time.Minute, "通道健康统计窗口")
+	flag.DurationVar(&cfg.dlqReplayInterval, "dlq-replay-interval", 0, "DLQ 自动重放周期；0 表示关闭")
+	flag.IntVar(&cfg.dlqReplayBatch, "dlq-replay-batch", 50, "单轮 DLQ 重放上限")
 
 	flag.StringVar(&cfg.httpAddr, "http-addr", "127.0.0.1:18093", "健康检查与指标监听地址")
 	flag.DurationVar(&cfg.readyProbe, "ready-probe", 3*time.Second, "就绪探测超时")
@@ -237,9 +245,29 @@ func run(cfg config) error {
 		return err
 	}
 
-	policies, err := loadPolicySource(cfg.policyFile, defaultPolicy(cfg))
-	if err != nil {
-		return err
+	var policies notify.PolicySource
+	if strings.EqualFold(cfg.policySource, "file") {
+		policies, err = loadPolicySource(cfg.policyFile, defaultPolicy(cfg))
+		if err != nil {
+			return err
+		}
+	} else if strings.EqualFold(cfg.policySource, "db") {
+		var endpointStore *notifyconfig.Store
+		if rawKey := os.Getenv("IOT_CONFIG_KEY"); rawKey != "" {
+			key, keyErr := secureconfig.NewKey(rawKey)
+			if keyErr != nil {
+				return keyErr
+			}
+			endpointStore, err = notifyconfig.New(pool, key)
+			if err != nil {
+				return err
+			}
+		} else {
+			logger.Warn("IOT_CONFIG_KEY 未设置，数据库通知策略仍可用，但不会读取加密通知端点")
+		}
+		policies = newDBPolicySource(pool, defaultPolicy(cfg), endpointStore)
+	} else {
+		return fmt.Errorf("未知策略来源 %q：只能是 db 或 file", cfg.policySource)
 	}
 
 	renderer := notify.NewRenderer()
@@ -291,6 +319,13 @@ func run(cfg config) error {
 		dispatcher: dispatcher, renderer: renderer, policies: policies,
 		metrics: metrics, counts: counts, logger: logger,
 	}
+	replayer, err := dlq.NewReplayer(dlq.New(pool), 3)
+	if err != nil {
+		return err
+	}
+	if err := registerNotifyReplay(replayer, dispatcher, logger); err != nil {
+		return err
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.httpAddr,
@@ -301,14 +336,17 @@ func run(cfg config) error {
 	logger.Info("svc-notify 已就绪",
 		"subject", cfg.subject, "durable", cfg.durable,
 		"channels", channelNames(channels),
-		"policy_from_file", policies.FromFile(),
+		"policy_source", cfg.policySource,
 		"egress_allow", cfg.egressAllow,
 		"allow_loopback", cfg.allowLoopback,
 		"version", buildinfo.Version, "commit", buildinfo.Commit)
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() { errCh <- serveHTTP(srv, logger) }()
 	go func() { errCh <- consumeLoop(ctx, sub, app, cfg, logger) }()
+	if cfg.dlqReplayInterval > 0 {
+		go func() { errCh <- runNotifyDLQReplay(ctx, replayer, cfg.dlqReplayInterval, cfg.dlqReplayBatch, logger) }()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -567,4 +605,53 @@ func pendingMigrations(ctx context.Context, pool *pgxpool.Pool) ([]string, error
 		}
 	}
 	return pending, nil
+}
+
+type notifyReplayPayload struct {
+	Message notify.Message `json:"message"`
+	Policy  notify.Policy  `json:"policy"`
+	Channel string         `json:"channel"`
+}
+
+func registerNotifyReplay(replayer *dlq.Replayer, dispatcher *notify.Dispatcher, logger *slog.Logger) error {
+	return replayer.Register("notification", func(ctx context.Context, row dlq.Record) error {
+		var payload notifyReplayPayload
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return notify.Permanent("解析通知 DLQ 载荷: %v", err)
+		}
+		if payload.Channel == "" || len(payload.Policy.Recipients[payload.Channel]) == 0 {
+			return notify.Permanent("通知 DLQ 载荷缺少 channel 或 message")
+		}
+		policy := payload.Policy
+		policy.Channels = []string{payload.Channel}
+		if _, err := dispatcher.Replay(ctx, payload.Message, policy); err != nil {
+			logger.Warn("通知 DLQ 重放失败", "dlq_id", row.ID, "channel", payload.Channel, "error", err)
+			return err
+		}
+		logger.Info("通知 DLQ 重放成功", "dlq_id", row.ID, "channel", payload.Channel)
+		return nil
+	})
+}
+
+func runNotifyDLQReplay(ctx context.Context, replayer *dlq.Replayer, interval time.Duration, batch int, logger *slog.Logger) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	run := func() {
+		result, err := replayer.Replay(ctx, "svc-notify", "", batch)
+		if err != nil {
+			logger.Error("通知 DLQ 扫描失败", "error", err)
+			return
+		}
+		if result.Scanned > 0 {
+			logger.Info("通知 DLQ 扫描完成", "scanned", result.Scanned, "succeeded", result.Succeeded, "failed", result.Failed, "skipped", result.Skipped)
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			run()
+		}
+	}
 }

@@ -215,15 +215,15 @@ func TestDispatchDoesNotPublishStorm(t *testing.T) {
 		Action: alarm.ActionCreated, Notify: false, Escalate: true,
 		Reason: "告警风暴：单租户窗口内新增告警超阈值",
 	}})
-	if pub.count() != 0 {
-		t.Fatalf("风暴决策不该走告警事件通道，得 %v", pub.subjects)
+	if pub.count() != 1 || pub.subjects[0] != "iot.alarm.escalation.p1" {
+		t.Fatalf("风暴决策应只发布 P1 升级事件，得 %v", pub.subjects)
 	}
 
 	// 正常进入 active 的仍要发。
 	a.dispatch(ctx, []alarm.Decision{{
 		Alarm: sampleAlarm("alarm-1", "dk1"), Action: alarm.ActionNotified, Notify: true,
 	}})
-	if pub.count() != 1 {
+	if pub.count() != 2 {
 		t.Fatalf("正常告警应发布，得 %d", pub.count())
 	}
 }

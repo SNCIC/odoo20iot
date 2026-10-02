@@ -16,6 +16,7 @@ import (
 type PGStore struct{ pool *pgxpool.Pool }
 
 var _ Store = (*PGStore)(nil)
+var _ ProjectByOdooCompany = (*PGStore)(nil)
 
 // NewPGStore 构造存储。
 func NewPGStore(pool *pgxpool.Pool) (*PGStore, error) {
@@ -23,6 +24,17 @@ func NewPGStore(pool *pgxpool.Pool) (*PGStore, error) {
 		return nil, fmt.Errorf("catalog: PGStore 需要非空连接池")
 	}
 	return &PGStore{pool: pool}, nil
+}
+
+func (s *PGStore) FindProjectByOdooCompany(ctx context.Context, companyID int64) (Project, error) {
+	if companyID <= 0 {
+		return Project{}, fmt.Errorf("catalog: odoo company_id 必须为正数")
+	}
+	var p Project
+	err := s.pool.QueryRow(ctx, `SELECT id, project_key, name, status, odoo_company_id, timezone, version, created_at, updated_at, deleted_at
+FROM t_project WHERE odoo_company_id=$1 AND deleted_at IS NULL`, companyID).Scan(
+		&p.ID, &p.ProjectKey, &p.Name, &p.Status, &p.OdooCompanyID, &p.Timezone, &p.Version, &p.CreatedAt, &p.UpdatedAt, &p.DeletedAt)
+	return p, err
 }
 
 // deviceColumns 是设备读取列（顺序与 scanDevice 严格一致）。
@@ -220,7 +232,7 @@ func (s *PGStore) UpsertDeviceType(ctx context.Context, t DeviceType) (int64, er
 const upsertDeviceSQL = `
 INSERT INTO t_device (id, project_id, device_type_id, device_key, name,
                       secret_hash, secret_version, auth_mode, status, thing_model_version, tags)
-VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9, $10::jsonb)
+VALUES (COALESCE($1, nextval('t_device_id_seq')), $2, $3, $4, $5, $6, 1, $7, $8, $9, $10::jsonb)
 ON CONFLICT (project_id, device_key) DO UPDATE SET
     device_type_id      = EXCLUDED.device_type_id,
     name                = EXCLUDED.name,
@@ -259,8 +271,12 @@ func (s *PGStore) UpsertDevice(ctx context.Context, d DeviceUpsert) (int64, erro
 	}
 
 	var id int64
+	var deviceID any
+	if d.ID > 0 {
+		deviceID = d.ID
+	}
 	if err := s.pool.QueryRow(ctx, upsertDeviceSQL,
-		d.ID, d.ProjectID, d.DeviceTypeID, d.DeviceKey, d.Name,
+		deviceID, d.ProjectID, d.DeviceTypeID, d.DeviceKey, d.Name,
 		d.SecretHash, d.AuthMode, d.Status, d.ThingModelVersion, string(tagJSON), d.RotateSecret).Scan(&id); err != nil {
 		return 0, fmt.Errorf("catalog: upsert 设备: %w", err)
 	}

@@ -2,18 +2,31 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/sony/gobreaker"
+
+	"github.com/SNCIC/odoo20iot/internal/dlq"
 )
 
 // Client 是连接器对 Odoo 的依赖，收窄为一次调用，便于注入 fake 做确定性测试。
 // 生产里传 `*odoo.Client`。
 type Client interface {
 	Call(ctx context.Context, model, method string, params any, out any) error
+}
+
+type DLQ interface {
+	Put(context.Context, dlq.Entry) error
+}
+
+type dlqSuppressedKey struct{}
+
+func SuppressDLQ(ctx context.Context) context.Context {
+	return context.WithValue(ctx, dlqSuppressedKey{}, true)
 }
 
 // Request 是一次写回 / 查询请求。
@@ -40,6 +53,7 @@ type Options struct {
 	// Guard 是幂等占位（§4.3.1）。nil 时不做并发重复拦截 ——
 	// 权威账本仍在 Odoo 侧，缺它只是少了快速失败，不影响正确性。
 	Guard Guard
+	DLQ   DLQ
 	// Sleep 注入退避等待（测试把 1s/3s/9s 压成瞬时）；nil 时用真实等待。
 	Sleep func(ctx context.Context, d time.Duration) error
 	// Now 注入时钟（耗时观测）。
@@ -53,6 +67,7 @@ type Connector struct {
 	adm     *admission
 	breaker *breaker
 	guard   Guard
+	dlq     DLQ
 	metrics *Metrics
 	logger  *slog.Logger
 	sleep   func(context.Context, time.Duration) error
@@ -89,6 +104,7 @@ func New(client Client, opts Options) (*Connector, error) {
 		adm:     newAdmission(p),
 		breaker: newBreaker(p),
 		guard:   opts.Guard,
+		dlq:     opts.DLQ,
 		metrics: metrics,
 		logger:  logger,
 		sleep:   sleep,
@@ -170,7 +186,35 @@ func (c *Connector) Call(ctx context.Context, req Request, out any) error {
 	}
 
 	c.observe(start)
-	return c.fail(req, lastCode, "Odoo 调用失败", lastErr)
+	err := c.fail(req, lastCode, "Odoo 调用失败", lastErr)
+	c.recordDLQ(ctx, req, err)
+	return err
+}
+
+func (c *Connector) recordDLQ(ctx context.Context, req Request, callErr error) {
+	if c.dlq == nil || req.IdempotencyKey == "" || ctx.Value(dlqSuppressedKey{}) == true {
+		return
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		c.logger.Error("序列化 Odoo DLQ 请求失败", "model", req.Model, "method", req.Method, "error", err)
+		return
+	}
+	entry := dlq.Entry{
+		Service:        "odoo-connector",
+		Subject:        req.Model + "." + req.Method,
+		EntityType:     "odoo_call",
+		IdempotencyKey: req.IdempotencyKey,
+		Payload:        string(payload),
+		Reason:         callErr.Error(),
+		Attempts:       1,
+		History:        []string{callErr.Error()},
+		TraceID:        req.TraceID,
+		CreatedAt:      c.now(),
+	}
+	if err := c.dlq.Put(ctx, entry); err != nil {
+		c.logger.Error("写入 Odoo DLQ 失败", "model", req.Model, "method", req.Method, "error", err)
+	}
 }
 
 // reserve 执行 §4.3.1 的幂等占位。

@@ -251,6 +251,25 @@ func TestDispatchAllChannelsFail(t *testing.T) {
 	}
 }
 
+func TestReplayFailureDoesNotWriteDLQ(t *testing.T) {
+	a := &fakeChannel{name: ChannelWebhook, errs: []error{Permanent("webhook unavailable")}}
+	rec := &dlqRecorder{}
+	var slept []time.Duration
+	d := newTestDispatcher(t,
+		map[string]Channel{ChannelWebhook: a}, rec,
+		ChannelHealth{Threshold: 1, MinSamples: 100}, &slept)
+
+	if _, err := d.Replay(context.Background(), testMessage(), Policy{
+		Channels:   []string{ChannelWebhook},
+		Recipients: map[string][]string{ChannelWebhook: {"https://example.test"}},
+	}); err == nil {
+		t.Fatal("重放失败时必须返回错误")
+	}
+	if rec.count() != 0 {
+		t.Fatalf("重放失败不应再次写入 DLQ，得 %d 条", rec.count())
+	}
+}
+
 func TestDispatchRespectsPolicyOrder(t *testing.T) {
 	a := &fakeChannel{name: ChannelWebhook}
 	b := &fakeChannel{name: ChannelEmail}

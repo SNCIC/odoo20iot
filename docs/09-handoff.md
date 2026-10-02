@@ -29,7 +29,7 @@
 `internal/natsjs`；且 `natsjs.Subscribe` 的返回值已收窄为**不暴露 `Unsubscribe`**，使该缺陷在类型上**无法再被写出来**
 （坑 42/47）。`svc-quota` 的用量重复计数已用真 NATS 演练复现并消除（见 §4 第 21 项）。
 
-下一步：A4 连接压测待有干净环境后再跑；`odoo-connector` 的主数据增量拉取与死信；Odoo 侧 S1/S3 集成场景端到端；
+下一步：A4 连接压测待有干净环境后再跑；Odoo 侧 S1/S3 集成场景端到端；
 B1 的明细查询限行与预聚合表（P0 性能项）。
 
 ---
@@ -213,7 +213,7 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | 21 | **「重启即重放」剩余 3 处（P1 · §5.1 原第 27 行）** | **完成**。`cmd/svc-pipeline` / `cmd/svc-quota` / `internal/cluster` 的路由消费者原先各自 `js.PullSubscribe(...)` 且 `defer sub.Unsubscribe()` —— 退出即**删掉消费者**，重启按 `DeliverAll` 重放整个保留窗口。三处统一改走 `internal/natsjs.Subscribe`：`svc-quota` 新增 `-consumer-inactive`（默认 24h）、`svc-pipeline` 新增同名列并透传 `MaxAckPending`（`natsjs.Options` 新增该字段）、`cluster.Options` 新增 `RouteRetention`（默认 1h，与路由流 `MaxAge` 用**同一个常量** `DefaultRouteRetention`，避免两处各自漂移）。⚠️ `internal/cluster.ReplayOffline` 的临时消费者（durable 为空 + `StartSequence` + `AckNone`）**刻意保留 `Unsubscribe`** —— 它现建现删、起点由 Redis 游标给出而非 `DeliverAll`，删掉才是正确清理；已就地加注释，防止后续被"统一"掉。**结构性防复发**：`natsjs.Subscribe` 的返回值由 `*nats.Subscription` 收窄为 `*natsjs.Subscription`（**只暴露 `Fetch`**）—— 调用方拿不到 `Unsubscribe`，这是坑 47「把规避方式做成可复用的东西」的落点；5 个调用点同步调整，`TestUnsubscribeDeletesDurableAndReplays` 改为**直接用原生 `js.PullSubscribe`** 演示坑本身（正因为收窄后就踩不到了）。**真 NATS 演练**（独立 stream/subject/durable/redis-key，不碰任何真实状态）：发布 5 条计量上报 → 计数器 `=5`；SIGTERM 停止后消费者**仍在**（`delivered=5 pending=0 ack_floor=5`，进度未丢）；重启后计数器**仍为 5**（未重放）。**对照**（复现缺陷）：停止后删掉消费者（等价旧的 `Unsubscribe`）→ 重启后计数器变成 **10**，重复计数被复现并由本修复消除。门禁 `gofmt` / `go build` / `go vet` / `go test` 全绿 |
 | 23 | **B1 补充项（1）· 明细查询限行 + 自适应降采样（P0 · 02 §4.3.1）** | **完成**。`internal/tsdb` 新增契约：`MaxDetailRows=5000` 等保护常量、`SeriesQuery.Normalize`（project_id>0 / 设备 ≤50 / 指标白名单 / 回溯 ≤90d / Limit ∈[1,5000]）、纯函数 `AdaptiveBucket(span, devices, cap)`（在「设备数 × 桶数 ≤ cap」下取最小可读桶宽，阶梯 1s…24h）。适配层 `QuerySeries`：Normalize → **廉价探测** `SELECT 1 ... LIMIT cap+1`（只取常量、不解析指标、不排序，超限时尽早终止）→ 未超限返回原始明细；超限按桶宽降采样返回并标注 `Granularity`/`Bucket`/`CapHit`，**绝不静默截断**（聚合若仍超限则直接报错）。裸查询改名为 `SelectRangeUnprotected`/`SelectBucketsUnprotected`（仅压测/诊断），业务侧唯一读入口是 `QuerySeries`。**实测**（`make b1-bench` §5.2，2026-10-01）：Q3 形态（10 设备 × 1h ≈ 3.6 万行）返回 **35990 → 3610** 行，P95 **257.4 → 152.4ms（JSON）/ 224.3 → 106.7ms（宽表）**，双双落回 P95<200ms 预算内；探测成本从「取指标值 + ORDER BY」的 **95.7ms** 降到 **20.4ms**（1.12M 行表实测）。集成测试 `internal/tsdb/greptimedb/query_test.go`（`IOT_GREPTIMEDB_DSN` + `IOT_PERF_ASSERT` 门控，`make test-tsdb`）。结论与边界 `02` §4.3.1.1；原始报告 `docs/reports/b1-detail-limit.md`。**遗留**：并发上限（20）、慢查询降级（>3s）、多指标端点（≤4）、大窗口（如 50 设备 × 90d）延迟实测 |
 | 24 | **B1 补充项（2）· 预聚合表 + 跨度路由（P0 · 02 §7）** | **完成**。**开工探针**（`internal/tsdb/greptimedb/capability_test.go`，临时表，6 项全过·无回退）：`INSERT…SELECT`+绑定参数可用、**非 append 表同键重写=覆盖**（幂等由表结构保证）、`json_get` 对 JSON 布尔返回 1（布尔可聚合）、rollup 表接受 TTL、`metric` 是保留字（须加引号）、全 NULL 分组写出 `sum=NULL,count=0` 行且 `NULLIF` 可用。**契约**：`Rollup`（1m/1h）、`Source`、纯函数 `RouteSource`（≤6h 原始 / 6h–30d 1m / >30d 1h，**只对 JSON 方案路由**），`SeriesResult.Source`。**表结构**：`telemetry_1m/1h` 长表 `(ts, project_id, device_id, device_type_id, "metric", "sum", "max", "count")`，**不设 append_mode**，物模型加指标零 DDL。**物化**：`Store.RollupWindow` 每指标一条 `INSERT…SELECT`；`cmd/svc-rollup` 增量调度（单飞 PG 咨询锁，失败不致命），水位落 PG `t_rollup_watermark`（迁移 `0005`，`GREATEST` 只进不退，**只在写入成功后推进**）。**路由**：`QuerySeries` 按源选表，agg 源再聚合 `SUM("sum")/NULLIF(SUM("count"),0)`（跨桶无损），输出桶宽不低于源粒度。**实测**（`make test-rollup`，2026-10-01）：10 设备 × 6h × 1Hz（21.6 万行）上 **守恒**（数值+布尔指标的 sum/max/count 与原始聚合逐项相等，1e-9）、**幂等**（重跑行数/取值不变）、**Q4 形态 P95 432.7 → 67.2ms**（同返回 730 行）；`make test-rollup-pg` 覆盖水位账本。结论与边界 `02` §4.3.2 / §7；原始报告 `docs/reports/b1-rollup.md`。**遗留**：1h（>30d）路径未单独压测、迟到数据超 `lag` 不回修、首次水位只回看 24h（更早需 `-backfill-since`）、多副本调度未压测、宽表方案未物化 |
-| 25 | **读侧查询 API `svc-query` + 控制面主数据最小集（P1 · 02 §3 / §4.3）** | **完成**。**迁移 `0006`**：`t_project` / `t_device_type` / `t_device`（PK 修正为 **`(id, project_id)`** —— 原文 `id PRIMARY KEY` + `PARTITION BY HASH(project_id)` 在 PG 里是非法 DDL；16 个显式分区；复合外键 `(project_id, device_type_id)` 在 DB 层挡跨租户挂类型；**刻意不启用 RLS**，理由与替代方案见 `02 §3.5`）。**主数据**：`internal/catalog`（契约 + `PGStore` + `MemStore` + Argon2id 摘要编解码，复用 `internal/auth`）。**种子**：`cmd/iot-seed`（幂等；仅新建或 `-rotate` 时生成凭据；凭据落 `tmp/` 0600）。**认证**：`internal/apiauth` —— JWT 自写验签（ES256/RS256、`iss` 允许列表、`aud`、**强制 `tenant`**、`jti` 查 Redis 吊销且依赖故障 **fail-closed 503**）、JWKS（HTTP/本地文件）、开发静态令牌（常量时间比较 + **只允许绑回环**，启动与每次认证打 WARN）。**查询服务**：`internal/querysvc` + `cmd/svc-query`（默认 `127.0.0.1:18094`），`GET /api/v1/devices`、`GET /api/v1/series`（每租户并发上限 20 + 有界排队、慢查询 >3s 记指标+WARN、稳定错误码）。**时序读路径增量**：`SeriesQuery.Bucket` 显式分桶 → `Granularity=aggregated`（零值=原行为，既有 tsdb 用例原样通过）。**实测**：`make test-catalog` 7/7（含外键挡跨租户、RLS 未启用断言）、`make test-query` 全绿（含 `-race`；JWT 各失败形态、限流器队列、handler 全状态码）、`make test-query-e2e` 真 PG + 真 GreptimeDB 端到端通过；真实二进制 curl 走查见报告。**遗留**：RLS、最新值（Redis Write-Through）、历史导出、多指标投影、Odoo 设备同步、按类型物模型校验、慢查询自动降级、每租户速率限制/读写池分离、**前端**（当前唯一"界面"是 GreptimeDB dashboard）。结论与契约 `02 §3.5` / §4.3.2、`05 §3.3`；报告 `docs/reports/query-svc.md` |
+| 25 | **读侧查询 API `svc-query` + 控制面主数据最小集（P1 · 02 §3 / §4.3）** | **完成**。**迁移 `0006`**：`t_project` / `t_device_type` / `t_device`（PK 修正为 **`(id, project_id)`** —— 原文 `id PRIMARY KEY` + `PARTITION BY HASH(project_id)` 在 PG 里是非法 DDL；16 个显式分区；复合外键 `(project_id, device_type_id)` 在 DB 层挡跨租户挂类型；**刻意不启用 RLS**，理由与替代方案见 `02 §3.5`）。**主数据**：`internal/catalog`（契约 + `PGStore` + `MemStore` + Argon2id 摘要编解码，复用 `internal/auth`）。**种子**：`cmd/iot-seed`（幂等；仅新建或 `-rotate` 时生成凭据；凭据落 `tmp/` 0600）。**认证**：`internal/apiauth` —— JWT 自写验签（ES256/RS256、`iss` 允许列表、`aud`、**强制 `tenant`**、`jti` 查 Redis 吊销且依赖故障 **fail-closed 503**）、JWKS（HTTP/本地文件）、开发静态令牌（常量时间比较 + **只允许绑回环**，启动与每次认证打 WARN）。**查询服务**：`internal/querysvc` + `cmd/svc-query`（默认 `127.0.0.1:18094`），`GET /api/v1/devices`、`GET /api/v1/series`、`GET /api/v1/latest`（每租户并发上限 20 + 有界排队、慢查询 >3s 记指标+WARN、稳定错误码）。**时序读路径增量**：`SeriesQuery.Bucket` 显式分桶 → `Granularity=aggregated`（零值=原行为，既有 tsdb 用例原样通过）。**实测**：`make test-catalog` 7/7（含外键挡跨租户、RLS 未启用断言）、`make test-query` 全绿（含 `-race`；JWT 各失败形态、限流器队列、handler 全状态码）、`make test-query-e2e` 真 PG + 真 GreptimeDB 端到端通过；真实二进制 curl 走查见报告。**遗留**：RLS、历史导出、多指标投影、Odoo 设备同步、按类型物模型校验、慢查询自动降级、每租户速率限制/读写池分离、**前端**（当前唯一"界面"是 GreptimeDB dashboard）。结论与契约 `02 §3.5` / §4.3.2、`05 §3.3`；报告 `docs/reports/query-svc.md` |
 
 ---
 
@@ -233,16 +233,16 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | ~~P0~~ | ~~B1 补充项（1）~~ | ✅ **已完成**：明细查询限行 + 自适应降采样已落地（见 §4 第 23 项）。Q3 形态经 `QuerySeries` 后 P95 257→152ms（JSON）/ 224→107ms（宽表），双双达标 |
 | ~~P0~~ | ~~B1 补充项（2）~~ | ✅ **已完成**：预聚合表 + 跨度路由已落地（见 §4 第 24 项）。Q4 形态 P95 432.7ms → 67.2ms，落回预算内 |
 | P1 | B1 补充项（3） | 上生产前按 **3 副本集群 + NVMe** 重测写入吞吐；宽表开启前用**租户真实样本**重测存储占用 |
-| ~~P1~~ | ~~读侧查询 API `svc-query` + 控制面主数据最小集~~ | ✅ **已完成**（见 §4 第 25 项）。**仍缺**：RLS、最新值（Redis Write-Through）、历史导出、多指标投影、Odoo 设备同步、按类型物模型校验、慢查询自动降级、每租户速率限制、**前端** |
+| ~~P1~~ | ~~读侧查询 API `svc-query` + 控制面主数据最小集~~ | ✅ **已完成**（见 §4 第 25 项）。**仍缺**：RLS、历史导出、多指标投影、Odoo 设备同步、按类型物模型校验、慢查询自动降级、每租户速率限制、**前端** |
 | P1 | 控制面其余主数据表 | 迁移 `0006` 只建了 `t_project`/`t_device_type`/`t_device`。`t_user`/`t_role`/`t_api_token`/`t_alarm_rule`/`t_external_ref`/`t_idem_registry` 等仍缺，卡住「通知策略」「批量告警」「connector 对账第③项」 |
 | P1 | **RLS（租户行级隔离）** | `02 §3.1` 要求所有租户表 `ENABLE ROW LEVEL SECURITY` + `SET LOCAL app.project_id`；当前**未启用**，隔离只在应用层。要落地需先建连接池侧的 `SET LOCAL` 管线 |
 | ~~P1~~ | ~~A3 补充项~~ | ✅ **已完成**：Redis Locator/Cursor 跨节点端到端已实测（`redis_test.go`，`IOT_NATS_URL`+`IOT_REDIS_URL` 触发） |
-| ~~P0~~ | ~~svc-pipeline（物模型解析 + GreptimeDB 写入 + 幂等）~~ | ✅ **已完成（MVP）**（见 §4 第 12 项）。**遗留**：`raw_parsers` 二进制解析沙箱、32 分片静态绑定消费、Redis 最新值 Write-Through、`normalized` 转发、DLQ 与毒消息落 `event(parse_error)` |
+| ~~P0~~ | ~~svc-pipeline（物模型解析 + GreptimeDB 写入 + 幂等）~~ | ✅ **已完成（MVP）**（见 §4 第 12 项）。**遗留**：`raw_parsers` 二进制解析沙箱、32 分片静态绑定消费、`normalized` 转发、DLQ 与毒消息落 `event(parse_error)` |
 | P1 | A4 | **压测工具已完成三个阶段**（`cmd/mqtt-bench`：阶段 1 建连/保持/资源采样/泄漏趋势判定，阶段 2 QoS1 发布路径，阶段 3 背靠背吞吐 + 接入确认延迟 P50/P95/P99 + SLO 判定；引入 `eclipse/paho.mqtt.golang` v1.5.1）。**5 万连接 24h 正式实测待跑**：需先起网关，且压测客户端**须分机部署**（同机跑会把工具开销算进网关）。冒烟：10 连接背靠背 → 13585 msg/s、P99 = 2ms、SLO ✅；200 连接 + 1s 周期发布 → 2098 条全成功 |
 | P1 | A4 补充项 | **机制性验证已完成**（`internal/gateway/a4_test.go`，不依赖真实 NATS）：PUBLISH 同步阻塞同连接的 PINGREQ，PINGRESP 推迟 ≈ `PubackTimeout`（400ms 用例实测 400ms）；阻塞**仅限该连接**。**5 万连接 24h 下的规模化影响**（连续上报 × 总线超时 → 设备侧误判重连）仍待压测观测（`03` §4.4.1 边界 1） |
 | ~~P0~~ | ~~A5 · 计量埋点原型~~ | ✅ **已完成（原型）**（见 §4 第 13 项）。遗留：每分钟落 PG（按 `(metric, ts_minute)` 幂等）+ 每小时对账、配额限流与分级预警、其余三类指标（设备数/存储量/API 调用数） |
 | ~~P1~~ | ~~D2 / D3~~ | ✅ **已完成（骨架 + 安装验证 + 已推送）**（见 §4 第 14 项）。**遗留**：D3 的完整实现（facade / 其余 IoT 路由 / cron 投递 / 视图 / `tests/` / `EXTENSIONS.md`）、S1/S3 集成场景端到端 |
-| P1 | `odoo-connector` 补充项 | **编排层 + 两条事件入口 + Odoo 侧 cron 投递 + 15min 定时对账均已完成并实测**（见 §4 第 15 项）。**遗留**：主数据增量拉取与游标（Redis+PG）、死信 `t_dlq` + 聚合告警、对账第 ③ 项（依赖尚未建立的 `t_external_ref`） |
+| ~~P1~~ | ~~`odoo-connector` 补充项~~ | **已完成**：编排层、两条事件入口、Odoo cron、定时对账、主数据增量拉取、`t_external_ref` 外部引用、`t_integration_issue` 未绑定待办、结构化 DLQ、聚合告警与可选重放均已完成。DLQ 默认开启；重放默认关闭，需显式设置 `-dlq-replay-interval`；聚合告警默认每 5 分钟扫描最近 15 分钟，阈值为 1 条，可用 `-dlq-alert-*` 调整；配置 `IOT_DLQ_ALERT_WEBHOOK` + `IOT_DLQ_ALERT_EGRESS_ALLOW` 后可投递飞书/钉钉机器人。**遗留**：对象存储原文、告警去重/升级策略和生产轮换自动化。|
 | P1 | 告警引擎补充项 | **五态 FSM + 去重/聚合/抑制 + PG `Store` + `svc-alarm` 服务（双通道 + 5s 扫描 + 至少一次发布）+ `svc-notify` 三通道通知均已完成**（见 §4 第 17、18、19、20 项）。**遗留**：未确认升级（30min 通知上级 / 2h P1 升级）、通知策略解析与模板渲染（需 `t_alarm_rule.notify`）、`dedup_key` 哈希分片、静默窗口的配置源、批量告警实体与通知合并路径 |
 | ~~P1~~ | ~~**「重启即重放」缺陷的另外 3 处**~~ | ✅ **已完成**（见 §4 第 21 项）：`svc-pipeline` / `svc-quota` / `internal/cluster` 统一走 `internal/natsjs`，且 `natsjs.Subscribe` 的返回值已收窄为不暴露 `Unsubscribe`（结构性防复发）。真 NATS 演练：`svc-quota` 的重启不再重复计数（对照实验复现了旧的 5→10） |
 | ~~P1~~ | ~~**流保留未设 `MaxAge`（`EnsureStream` 只建不校）**~~ | ✅ **已完成**（见 §4 第 22 项）：抽出 `natsjs.EnsureStream`（建或校 + WARN），`gateway` / `connector` / `svc-alarm` 三处统一；策略定为**自动校正 + 告警**，零值表示不约束，`svc-alarm` 的 subjects 仍保持严格。**遗留动作**：既存流要等**对应服务下次启动**才被校正，届时会删掉超期消息（`IOT_TELEMETRY` 当前 `max_age=0` / 57400 条） |
@@ -305,6 +305,10 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:18094/api/v1/devices'
 #   -auth-mode jwt -jwt-issuer https://auth.example.com -jwt-jwks-url https://auth.example.com/.well-known/jwks.json \
 #   -redis-url redis://100.64.0.3:28637/0
 
+# 最新值（由 svc-pipeline 写入 Redis，查询服务读取；缺失时 available=false）
+curl -s -H 'Authorization: Bearer devtoken' \
+  'http://127.0.0.1:18094/api/v1/latest?device_ids=1001,1002'
+
 # C1 规则条件引擎：P99 验收 + 求值基准
 make c1-bench
 # 等价于：IOT_PERF_ASSERT=1 go test ./internal/rules -run TestPerf -count=1 -v
@@ -349,13 +353,15 @@ docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && g
 
 # Odoo 连接器（07 §4.3 编排层 + §4.4 事件入口与对账；API Key 与令牌由 Vault/环境变量注入，切勿写进命令行历史）
 docker exec -u xfusion devbox bash -lc 'cd /home/xfusion/projects/odoo20iot && \
-  ODOO_API_KEY=xxx ODOO_WEBHOOK_TOKEN=yyy go run ./cmd/odoo-connector \
+  ODOO_API_KEY=xxx ODOO_WEBHOOK_TOKEN=yyy IOT_DLQ_ALERT_WEBHOOK=xxx IOT_DLQ_ALERT_EGRESS_ALLOW=open.feishu.cn go run ./cmd/odoo-connector \
     -odoo-url http://127.0.0.1:8070 -odoo-db odoo20 \
-    -log-format text -reconcile-models maintenance.equipment'
+    -log-format text -reconcile-models maintenance.equipment \
+    -dlq-alert-interval 5m -dlq-alert-window 15m -dlq-alert-threshold 1'
 # ⚠️ -log-format 是字符串 flag：不要用 -log-json false 这种写法 ——
 #    Go 的 flag 包遇到第一个非 flag 参数会**静默丢弃其后所有参数**。
 # 对账调试：-reconcile-interval 4s -reconcile-stale-after 2s（加速观察补投）
 # 探活：curl -sS 127.0.0.1:18091/healthz ；就绪（真打 Odoo）：/readyz ；指标：/metrics
+# DLQ 重放：追加 `-dlq-replay-interval 30s -dlq-replay-batch 20`；默认关闭。
 # C-1 入口：Odoo 侧 cron XADD 到 Redis Stream odoo:outbox，连接器自动搬运到 NATS IOT_ODOO
 # C-2 入口：curl -sS -X POST -H "Authorization: Bearer yyy" -H 'Content-Type: application/json' \
 #   -d '{"model":"maintenance.equipment","id":7,"write_date":"2026-10-01 06:30:00","company_id":1,"data":{}}' \
@@ -447,6 +453,19 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 
 ## 7. 文档索引
 
+## 8. 2026-10-01 继续开发记录
+
+- **第1项**：真实 MQTT → NATS → GreptimeDB → Redis 最新值 → `svc-query` 验收已完成；新增 Odoo 集成账本迁移 `0007`，并在真实 IoT PostgreSQL 验证外部引用唯一约束、集成日志月分区和幂等注册表。
+- **第2项**：新增 `internal/extref` 的远端/本地查询、状态更新和租户事务写入基础；`odoo-connector` 已支持通过 `-masterdata-model maintenance.equipment` 开启主数据增量同步，使用 Redis `(write_date,id)` 游标，幂等 upsert `t_device_type`/`t_device` 并写入 `t_external_ref`。仍未完成 Odoo S1/S3 真实端到端验收、DLQ 重放编排和多模型字段映射。
+- **2026-10-01 实际联调**：已安装 Odoo `maintenance`（`20.0.1.0`），`maintenance.equipment` JSON-2 返回 `HTTP 200`；IoT `t_project.id=1` 已绑定 Odoo `res.company.id=1`（圣宁咨询）。主数据同步首轮真实运行通过，`read=0/upserted=0/skipped=0`，原因是 Odoo 当前没有设备记录；不是链路失败。
+- **2026-10-01 设备端到端验收**：通过 Odoo JSON-2 创建验收设备 `maintenance.equipment.id=1`，随后真实同步 `read=1/upserted=1`；修改 Odoo 设备后再次同步 `read=1/upserted=1`，重复运行 `read=0/upserted=0`。IoT 最终 `t_device.id=1`、`t_external_ref.local_id=1`、版本递增到 2，Redis 游标已推进。期间修复了 `t_device.id=0` 的序列生成缺陷。
+- **2026-10-02 告警建单链路**：Odoo `sn_edge_integration` 已提供幂等 `POST /api/iot/v1/maintenance/request`；`odoo-connector` 新增持久 JetStream 告警消费者，按 `t_external_ref` 解析设备并在建单成功后 ACK。通过 `-alarm-to-odoo` 显式启用，未绑定设备记录为 `unbound_alarm` 集成问题。
+- **DLQ 基础**：迁移 `0010_dlq_replay` 已应用；`internal/dlq` 新增实体类型、幂等键、待重放查询、重放标记和按实体聚合统计。
+- **DLQ 执行层**：新增 `internal/dlq.Replayer`，按 `entity_type` 注册处理器，成功后标记解决，失败记录重放次数和原因，未知实体安全跳过，默认最多重放 3 次；已补幂等键透传和单元测试。当前仍需把 `odoo-connector`、`svc-notify` 的具体下游处理器注册到该执行层。
+- **第3项**：新增 `internal/pg.WithProjectTx`，通过事务级 `set_config('app.project_id', ..., true)` 固定租户上下文；迁移 `0008` 已对 `t_external_ref`、`t_integration_log`、`t_idem_registry` 启用并强制 RLS。真实库已验证租户 101 与 202 只能看到各自行；`t_project`/`t_device_type`/`t_device` 等旧路径仍需逐个迁移后再开启 RLS。
+- **第4项**：迁移 `0009` 新增 `t_alarm_rule` 与 `t_alarm_silence`；`svc-alarm` 启动时从 `t_alarm_silence` 加载有效静默窗口。未确认升级、通知策略热加载/模板渲染、批量告警实体和 dedup 分片仍是后续工作。
+- **本轮验证**：`go test ./...`、`go vet ./...`、`go build ./...` 全部通过；真实库已应用 `0007`、`0008`、`0009`。
+
 | 文件 | 内容 |
 |---|---|
 | `README.md`（docs） | 设计目标、NFR/SLO、对标矩阵、ADR 决策记录 |
@@ -460,3 +479,14 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 | `08-odoo-perf-alignment.md` | 与 Odoo 性能/架构的对齐评审 |
 | `odoo20iot-revision-checklist.md` | 四轮评审的全部缺陷与处置（含根因分析） |
 | **`09-handoff.md`（本文）** | **交接与工作约定** |
+
+## 9. 2026-10-02 安全与产品增强
+
+- 查询服务新增每租户令牌桶速率限制：`-rate-per-second`、`-rate-burst`，超限返回 `429/RATE_LIMITED`。
+- 查询服务内置最小控制台，访问 `/` 可查看设备和最新值；API 仍要求 Bearer Token。
+- 迁移 `0012_control_plane_security` 已应用：新增 `t_role`、`t_user`、`t_api_token`，并为控制面、设备台账、告警配置启用 RLS 策略。
+- 网关新增 `-auth-source pg`，可从业务库 `t_device.secret_hash` 读取设备认证摘要；默认 `file` 保持开发兼容。
+- 通知服务新增 `-policy-source db|file`，默认从 `t_alarm_rule.notify` 读取策略，并按角色展开用户邮箱。
+- 告警风暴升级现在发布 `iot.alarm.escalation.<project>` 事件，载荷含 `escalated=true`，不再只写日志。
+- 规则层新增内存滑动窗口聚合器，支持 `avg/max/min/count/last/p50`，窗口缓存不作为事实数据持久化。
+- 当前仍需外部配置/验收：真实飞书 Webhook、生产 Vault、mTLS、完整 Odoo 多模型字段映射和前端产品化页面。

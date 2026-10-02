@@ -22,6 +22,10 @@ type Entry struct {
 	Service string
 	// Subject 是二级分类：失败的通道、主题名、实体类型。
 	Subject string
+	// EntityType 是业务实体类型，用于按实体聚合和选择重放处理器。
+	EntityType string
+	// IdempotencyKey 是原请求的幂等键，重放必须沿用它。
+	IdempotencyKey string
 	// Reason 是失败原因（最后一条错误）。
 	Reason string
 	// Attempts 是总尝试次数。
@@ -35,6 +39,22 @@ type Entry struct {
 	Payload string
 	// CreatedAt 零值取当前时间。
 	CreatedAt time.Time
+}
+
+type Record struct {
+	ID        int64
+	CreatedAt time.Time
+	Entry
+	ReplayCount    int
+	LastReplayedAt *time.Time
+	ResolvedAt     *time.Time
+}
+
+type Aggregate struct {
+	Service    string
+	Subject    string
+	EntityType string
+	Count      int64
 }
 
 // Store 把死信写入 t_dlq。
@@ -72,14 +92,83 @@ func (s *Store) Put(ctx context.Context, e Entry) error {
 		return fmt.Errorf("dlq: 序列化重试历史: %w", err)
 	}
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO t_dlq (service, subject, reason, attempts, history, trace_id, payload, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		e.Service, e.Subject, e.Reason, e.Attempts, string(history),
+		INSERT INTO t_dlq (service, subject, entity_type, idempotency_key, reason, attempts, history, trace_id, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		e.Service, e.Subject, e.EntityType, e.IdempotencyKey, e.Reason, e.Attempts, string(history),
 		e.TraceID, e.Payload, e.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("dlq: 写入死信: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) ListPending(ctx context.Context, service, subject string, limit int) ([]Record, error) {
+	if service == "" {
+		return nil, fmt.Errorf("dlq: service 不能为空")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	q := `SELECT id, service, subject, entity_type, idempotency_key, reason, attempts, history, trace_id, payload, created_at, replay_count, last_replayed_at, resolved_at FROM t_dlq WHERE service=$1 AND resolved_at IS NULL`
+	args := []any{service}
+	if subject != "" {
+		q += ` AND subject=$2`
+		args = append(args, subject)
+	}
+	q += ` ORDER BY created_at, id LIMIT $` + fmt.Sprint(len(args)+1)
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("dlq: 查询待重放: %w", err)
+	}
+	defer rows.Close()
+	var out []Record
+	for rows.Next() {
+		var r Record
+		var history []byte
+		if err := rows.Scan(&r.ID, &r.Service, &r.Subject, &r.EntityType, &r.IdempotencyKey, &r.Reason, &r.Attempts, &history, &r.TraceID, &r.Payload, &r.CreatedAt, &r.ReplayCount, &r.LastReplayedAt, &r.ResolvedAt); err != nil {
+			return nil, fmt.Errorf("dlq: 扫描待重放: %w", err)
+		}
+		if err := json.Unmarshal(history, &r.History); err != nil {
+			return nil, fmt.Errorf("dlq: 解析重试历史: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("dlq: 遍历待重放: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) MarkReplayed(ctx context.Context, id int64, createdAt time.Time, success bool, reason string) error {
+	if id <= 0 || createdAt.IsZero() {
+		return fmt.Errorf("dlq: id 和 created_at 必填")
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE t_dlq SET replay_count=replay_count+1, last_replayed_at=now(), resolved_at=CASE WHEN $3 THEN now() ELSE resolved_at END, reason=CASE WHEN $4<>'' THEN $4 ELSE reason END WHERE id=$1 AND created_at=$2`, id, createdAt, success, reason)
+	if err != nil {
+		return fmt.Errorf("dlq: 更新重放状态: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) AggregateSince(ctx context.Context, since time.Time) ([]Aggregate, error) {
+	rows, err := s.pool.Query(ctx, `SELECT service, subject, entity_type, count(*) FROM t_dlq WHERE created_at >= $1 GROUP BY service, subject, entity_type ORDER BY count(*) DESC`, since)
+	if err != nil {
+		return nil, fmt.Errorf("dlq: 聚合统计: %w", err)
+	}
+	defer rows.Close()
+	var out []Aggregate
+	for rows.Next() {
+		var a Aggregate
+		if err := rows.Scan(&a.Service, &a.Subject, &a.EntityType, &a.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // ensurePartition 保证目标月份的分区存在（幂等）。

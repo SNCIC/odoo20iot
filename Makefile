@@ -84,6 +84,10 @@ test-query-e2e: ## 查询服务端到端（真实 PG + 真实 GreptimeDB；⚠�
 	$(GO_RUN) 'cd $(PROJECT_DIR) && IOT_PG_DSN=$(IOT_PG_DSN) IOT_GREPTIMEDB_DSN=$(GREPTIME_DSN) \
 	  go test ./internal/querysvc -run TestE2E -count=1 -v'
 
+.PHONY: test-latest
+test-latest: ## 最新值缓存与管道 Write-Through 单测
+	$(GO_RUN) 'cd $(PROJECT_DIR) && go test ./internal/latest ./internal/pipeline ./internal/querysvc -count=1'
+
 .PHONY: seed-dev
 seed-dev: ## 写入开发种子（租户 / 设备类型 / 设备）
 	$(GO_RUN) 'cd $(PROJECT_DIR) && go run ./cmd/iot-seed -pg-dsn $(IOT_PG_DSN) \

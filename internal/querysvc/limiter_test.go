@@ -199,3 +199,33 @@ func TestLimiter_IndependentTenants(t *testing.T) {
 	}
 	rel2()
 }
+
+func TestLimiterRateLimit(t *testing.T) {
+	now := time.Unix(100, 0)
+	l := NewLimiter(LimiterConfig{
+		MaxConcurrency: 1,
+		MaxQueue:       0,
+		QueueTimeout:   time.Second,
+		RatePerSecond:  2,
+		Burst:          2,
+	}, nil, func() time.Time { return now })
+	release, err := l.Acquire(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("first token: %v", err)
+	}
+	release()
+	release, err = l.Acquire(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("second token: %v", err)
+	}
+	release()
+	if _, err := l.Acquire(context.Background(), 7); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("third request should be rate limited, got %v", err)
+	}
+	now = now.Add(500 * time.Millisecond)
+	release, err = l.Acquire(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("refilled token: %v", err)
+	}
+	release()
+}

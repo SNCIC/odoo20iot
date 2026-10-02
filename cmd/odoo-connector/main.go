@@ -11,9 +11,11 @@
 //   - 定时对账（§4.4，每 15 min）：① 补投 Odoo `edge.outbox` 的非终态行；
 //     ② 比对 C-2 水位差并补投遗漏记录；连续两轮仍有遗漏则告警。
 //
+// 已实现：
+//   - 可选主数据增量拉取（按 `write_date` 水位 + id 断点，Redis 游标，写入 IoT PG）；
+//
 // 尚未实现（如实留白，不做假实现）：
-//   - 主数据增量拉取（每 60s 按 `write_date` 水位 + id 断点，§4.4）；
-//   - 死信：`t_dlq` + 对象存储原文 + 按 entity_type 聚合告警（§4.3）；
+//   - 死信对象存储原文（当前先落 PostgreSQL），以及告警去重/升级策略；
 //   - 对账的第 ③ 项（未绑定告警待办）：依赖 `t_external_ref`，该表尚未建立；
 //   - 幂等**权威**账本仍在 Odoo 侧 `edge.idempotency`（§5.2.1）：
 //     本服务只做占位拦截，不承担裁决。
@@ -39,12 +41,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/connector"
+	"github.com/SNCIC/odoo20iot/internal/dlq"
+	"github.com/SNCIC/odoo20iot/internal/extref"
+	"github.com/SNCIC/odoo20iot/internal/notify"
 	"github.com/SNCIC/odoo20iot/internal/odoo"
+	"github.com/SNCIC/odoo20iot/internal/pg"
 )
 
 type config struct {
@@ -71,10 +79,26 @@ type config struct {
 
 	webhookToken string
 
-	reconcileModels     string
-	reconcileInterval   time.Duration
-	reconcileStaleAfter time.Duration
-	reconcileBatch      int
+	reconcileModels       string
+	reconcileInterval     time.Duration
+	reconcileStaleAfter   time.Duration
+	reconcileBatch        int
+	pgDSN                 string
+	masterDataModel       string
+	masterDataInterval    time.Duration
+	masterDataBatch       int
+	alarmToOdoo           bool
+	alarmStream           string
+	alarmConsumer         string
+	dlqEnabled            bool
+	dlqReplayInterval     time.Duration
+	dlqReplayBatch        int
+	dlqAlertInterval      time.Duration
+	dlqAlertWindow        time.Duration
+	dlqAlertThreshold     int64
+	dlqAlertWebhookURL    string
+	dlqAlertEgressAllow   string
+	dlqAlertAllowLoopback bool
 }
 
 func main() {
@@ -114,6 +138,22 @@ func parseFlags() config {
 		"判定 Outbox 行「卡住」的宽限窗口")
 	flag.IntVar(&cfg.reconcileBatch, "reconcile-batch", connector.DefaultReconcileBatch,
 		"对账单轮单来源的处理上限")
+	flag.StringVar(&cfg.pgDSN, "pg-dsn", pg.DefaultDSN, "IoT 业务库 DSN（主数据同步启用时使用）")
+	flag.StringVar(&cfg.masterDataModel, "masterdata-model", "", "启用 Odoo 主数据增量同步的模型；留空关闭")
+	flag.DurationVar(&cfg.masterDataInterval, "masterdata-interval", time.Minute, "主数据增量同步周期")
+	flag.IntVar(&cfg.masterDataBatch, "masterdata-batch", connector.DefaultMasterDataBatch, "主数据单轮拉取上限")
+	flag.BoolVar(&cfg.alarmToOdoo, "alarm-to-odoo", false, "启用 IoT 告警到 Odoo maintenance.request 建单")
+	flag.StringVar(&cfg.alarmStream, "alarm-stream", connector.AlarmStream, "IoT 告警 JetStream 流名")
+	flag.StringVar(&cfg.alarmConsumer, "alarm-consumer", connector.AlarmConsumerName, "IoT 告警持久消费者名")
+	flag.BoolVar(&cfg.dlqEnabled, "dlq-enabled", true, "启用 Odoo 调用死信落库；默认开启")
+	flag.DurationVar(&cfg.dlqReplayInterval, "dlq-replay-interval", 0, "Odoo DLQ 自动重放周期；0 表示关闭")
+	flag.IntVar(&cfg.dlqReplayBatch, "dlq-replay-batch", 50, "Odoo DLQ 单轮重放上限")
+	flag.DurationVar(&cfg.dlqAlertInterval, "dlq-alert-interval", 5*time.Minute, "DLQ 聚合告警周期；0 表示关闭")
+	flag.DurationVar(&cfg.dlqAlertWindow, "dlq-alert-window", 15*time.Minute, "DLQ 聚合告警统计窗口")
+	flag.Int64Var(&cfg.dlqAlertThreshold, "dlq-alert-threshold", 1, "触发 DLQ 聚合告警的最小条数")
+	flag.StringVar(&cfg.dlqAlertWebhookURL, "dlq-alert-webhook", os.Getenv("IOT_DLQ_ALERT_WEBHOOK"), "DLQ 告警 Webhook；默认取 IOT_DLQ_ALERT_WEBHOOK")
+	flag.StringVar(&cfg.dlqAlertEgressAllow, "dlq-alert-egress-allow", os.Getenv("IOT_DLQ_ALERT_EGRESS_ALLOW"), "DLQ 告警出站白名单；默认取 IOT_DLQ_ALERT_EGRESS_ALLOW")
+	flag.BoolVar(&cfg.dlqAlertAllowLoopback, "dlq-alert-allow-loopback", false, "仅本地联调放行 DLQ 告警回环地址")
 	flag.Parse()
 	return cfg
 }
@@ -152,8 +192,24 @@ func run(cfg config) error {
 		return fmt.Errorf("构造 Odoo 客户端: %w", err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	rdb := redis.NewClient(mustParseRedis(cfg.redisURL))
 	defer func() { _ = rdb.Close() }()
+
+	var businessPool *pgxpool.Pool
+	if cfg.dlqEnabled || strings.TrimSpace(cfg.masterDataModel) != "" || cfg.dlqReplayInterval > 0 || cfg.dlqAlertInterval > 0 || cfg.alarmToOdoo {
+		businessPool, err = pg.Open(ctx, pg.Config{DSN: cfg.pgDSN})
+		if err != nil {
+			return fmt.Errorf("连接 IoT 业务库: %w", err)
+		}
+		defer businessPool.Close()
+	}
+	var dlqStoreInstance *dlq.Store
+	if businessPool != nil {
+		dlqStoreInstance = dlq.New(businessPool)
+	}
 
 	// 指标由四处共用：编排层、Outbox 消费、webhook、对账。
 	metrics := new(connector.Metrics)
@@ -163,13 +219,11 @@ func run(cfg config) error {
 		Metrics: metrics,
 		Logger:  logger,
 		Guard:   connector.NewRedisGuard(rdb, connector.DefaultGuardTTL),
+		DLQ:     dlqStoreInstance,
 	})
 	if err != nil {
 		return fmt.Errorf("构造连接器: %w", err)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	// 事件出口：NATS。MaxReconnects(-1) 表示永不放弃重连 ——
 	// 连接器是搬运工，NATS 抖动时应该等它回来，而不是退出重启。
@@ -234,6 +288,54 @@ func run(cfg config) error {
 		return fmt.Errorf("构造对账器: %w", err)
 	}
 
+	var masterSync *connector.MasterDataSync
+	if strings.TrimSpace(cfg.masterDataModel) != "" {
+		cat, err := catalog.NewPGStore(businessPool)
+		if err != nil {
+			return err
+		}
+		masterSync, err = connector.NewMasterDataSync(connector.MasterDataOptions{
+			Caller: conn, Catalog: cat, Projects: cat, Refs: extref.NewStore(businessPool),
+			Batch: cfg.masterDataBatch, Logger: logger,
+		})
+		if err != nil {
+			return fmt.Errorf("构造主数据同步器: %w", err)
+		}
+	}
+	var alarmConsumer *connector.AlarmConsumer
+	if cfg.alarmToOdoo {
+		js, err := nc.JetStream()
+		if err != nil {
+			return fmt.Errorf("获取告警 JetStream 上下文: %w", err)
+		}
+		alarmConsumer, err = connector.NewAlarmConsumer(connector.AlarmConsumerOptions{
+			JS: js, Odoo: client, Refs: extref.NewStore(businessPool),
+			Stream: cfg.alarmStream, Durable: cfg.alarmConsumer, Logger: logger,
+		})
+		if err != nil {
+			return fmt.Errorf("构造 Odoo 告警消费者: %w", err)
+		}
+	}
+
+	var replayer *dlq.Replayer
+	if cfg.dlqReplayInterval > 0 {
+		replayer, err = dlq.NewReplayer(dlq.New(businessPool), 3)
+		if err != nil {
+			return fmt.Errorf("构造 Odoo DLQ 重放器: %w", err)
+		}
+		if err := replayer.Register("odoo_call", func(ctx context.Context, row dlq.Record) error {
+			var req connector.Request
+			if err := json.Unmarshal([]byte(row.Payload), &req); err != nil {
+				return fmt.Errorf("解析 Odoo DLQ 请求: %w", err)
+			}
+			if req.Model == "" || req.Method == "" {
+				return fmt.Errorf("Odoo DLQ 请求缺少 model 或 method")
+			}
+			return conn.Call(connector.SuppressDLQ(ctx), req, nil)
+		}); err != nil {
+			return fmt.Errorf("注册 Odoo DLQ 重放器: %w", err)
+		}
+	}
 	srv := &http.Server{
 		Addr:              cfg.httpAddr,
 		Handler:           routes(conn, webhook, logger, cfg),
@@ -249,7 +351,7 @@ func run(cfg config) error {
 		"rate_per_sec", policy.RatePerSecond, "max_in_flight", policy.MaxInFlight,
 		"version", buildinfo.Version, "commit", buildinfo.Commit)
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("HTTP 服务异常退出: %w", err)
@@ -265,6 +367,43 @@ func run(cfg config) error {
 			errCh <- fmt.Errorf("对账异常退出: %w", err)
 		}
 	}()
+	if masterSync != nil {
+		go func() {
+			if err := runMasterDataLoop(ctx, masterSync, watermarks, cfg.masterDataModel, cfg.masterDataInterval, logger); err != nil {
+				errCh <- fmt.Errorf("主数据同步异常退出: %w", err)
+			}
+		}()
+	}
+	if alarmConsumer != nil {
+		go func() {
+			if err := alarmConsumer.Run(ctx); err != nil {
+				errCh <- fmt.Errorf("Odoo 告警消费者异常退出: %w", err)
+			}
+		}()
+	}
+	if replayer != nil {
+		go func() {
+			if err := runOdooDLQReplay(ctx, replayer, cfg.dlqReplayInterval, cfg.dlqReplayBatch, logger); err != nil {
+				errCh <- fmt.Errorf("Odoo DLQ 重放异常退出: %w", err)
+			}
+		}()
+	}
+	if dlqStoreInstance != nil && cfg.dlqAlertInterval > 0 {
+		var dlqAlertSender *notify.WebhookChannel
+		if strings.TrimSpace(cfg.dlqAlertWebhookURL) != "" {
+			allow := splitNonEmpty(cfg.dlqAlertEgressAllow)
+			if len(allow) == 0 {
+				return errors.New("配置 DLQ 告警 Webhook 时必须提供 -dlq-alert-egress-allow 或 IOT_DLQ_ALERT_EGRESS_ALLOW")
+			}
+			guard := &notify.Guard{AllowedHosts: allow, AllowLoopback: cfg.dlqAlertAllowLoopback}
+			dlqAlertSender = notify.NewWebhookChannel(guard, 5*time.Second)
+		}
+		go func() {
+			if err := runDLQAlertLoop(ctx, dlqStoreInstance, cfg.dlqAlertInterval, cfg.dlqAlertWindow, cfg.dlqAlertThreshold, dlqAlertSender, cfg.dlqAlertWebhookURL, logger); err != nil {
+				errCh <- fmt.Errorf("DLQ 聚合告警异常退出: %w", err)
+			}
+		}()
+	}
 
 	select {
 	case err := <-errCh:
@@ -285,6 +424,123 @@ func run(cfg config) error {
 		"published", metrics.PublishedTotal.Load(), "publish_errors", metrics.PublishErrors.Load(),
 		"reconcile_republished", metrics.ReconcileRepublished.Load())
 	return nil
+}
+
+func runMasterDataLoop(ctx context.Context, syncer *connector.MasterDataSync, watermarks connector.Watermarks, model string, interval time.Duration, logger *slog.Logger) error {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	key := "masterdata:" + model
+	run := func() error {
+		cursor, ok, err := watermarks.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			cursor = connector.Watermark{}
+		}
+		next, result, err := syncer.SyncOnce(ctx, model, cursor)
+		if err != nil {
+			return err
+		}
+		if next.After(cursor) {
+			if err := watermarks.Advance(ctx, key, next); err != nil {
+				return err
+			}
+		}
+		logger.Info("主数据同步完成", "model", model, "read", result.Read, "upserted", result.Upserted, "skipped", result.Skipped, "unbound", result.Unbound, "cursor", next)
+		return nil
+	}
+	if err := run(); err != nil {
+		logger.Error("主数据首次同步失败", "model", model, "error", err)
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			if err := run(); err != nil {
+				logger.Error("主数据同步失败", "model", model, "error", err)
+			}
+		}
+	}
+}
+
+func runOdooDLQReplay(ctx context.Context, replayer *dlq.Replayer, interval time.Duration, batch int, logger *slog.Logger) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	replay := func() {
+		result, err := replayer.Replay(ctx, "odoo-connector", "", batch)
+		if err != nil {
+			logger.Error("Odoo DLQ 扫描失败", "error", err)
+			return
+		}
+		if result.Scanned > 0 {
+			logger.Info("Odoo DLQ 扫描完成", "scanned", result.Scanned, "succeeded", result.Succeeded, "failed", result.Failed, "skipped", result.Skipped)
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			replay()
+		}
+	}
+}
+
+func runDLQAlertLoop(ctx context.Context, store *dlq.Store, interval, window time.Duration, threshold int64, sender *notify.WebhookChannel, webhookURL string, logger *slog.Logger) error {
+	if interval <= 0 {
+		return nil
+	}
+	if window <= 0 {
+		window = 15 * time.Minute
+	}
+	if threshold <= 0 {
+		threshold = 1
+	}
+	alert := func() {
+		since := time.Now().Add(-window)
+		aggregates, err := store.AggregateSince(ctx, since)
+		if err != nil {
+			logger.Error("DLQ 聚合查询失败", "error", err)
+			return
+		}
+		for _, aggregate := range aggregates {
+			if aggregate.Count < threshold {
+				continue
+			}
+			logger.Warn("P2：DLQ 聚合告警",
+				"service", aggregate.Service,
+				"subject", aggregate.Subject,
+				"entity_type", aggregate.EntityType,
+				"count", aggregate.Count,
+				"window", window,
+			)
+			if sender != nil {
+				msg := notify.Message{
+					TraceID: "dlq-alert", AlarmID: fmt.Sprintf("dlq:%s:%s:%s", aggregate.Service, aggregate.Subject, aggregate.EntityType),
+					Level: "critical", Subject: "IoT DLQ 聚合告警",
+					Body: fmt.Sprintf("服务=%s\n主题=%s\n实体=%s\n数量=%d\n窗口=%s", aggregate.Service, aggregate.Subject, aggregate.EntityType, aggregate.Count, window),
+				}
+				if err := sender.Send(ctx, msg, []string{webhookURL}); err != nil {
+					logger.Error("DLQ 聚合告警 Webhook 投递失败", "error", err, "service", aggregate.Service, "subject", aggregate.Subject)
+				}
+			}
+		}
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			alert()
+		}
+	}
 }
 
 func mustParseRedis(raw string) *redis.Options {

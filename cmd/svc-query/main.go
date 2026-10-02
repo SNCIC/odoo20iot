@@ -7,7 +7,7 @@
 //   - 保护：每租户并发上限（默认 20）+ 有界排队、慢查询（>3s）指标与日志。
 //
 // 未实现（如实留白，见 09 §5.1）：
-//   - 最新值（Redis Write-Through）与历史导出（Parquet + 对象存储）都没有；
+//   - 历史导出（Parquet + 对象存储）没有；
 //   - 慢查询**自动降级**到预聚合表只有指标+日志，没有自动切换；
 //   - 每租户**速率**限制（只有并发上限）、读写连接池分离未做；
 //   - 多指标投影（`MaxProjectedMetrics=4` 只是契约常量，API 是单指标）。
@@ -37,8 +37,11 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/latest"
+	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/querysvc"
+	"github.com/SNCIC/odoo20iot/internal/secureconfig"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 	"github.com/SNCIC/odoo20iot/internal/tsdb/greptimedb"
 )
@@ -55,17 +58,19 @@ type config struct {
 	httpAddr string
 	plan     string
 
-	authMode      string
-	jwtIssuers    string
-	jwtAudience   string
-	jwtJWKSURL    string
-	jwtJWKSFile   string
-	jwtJWKSTTL    time.Duration
-	jwtLeeway     time.Duration
-	redisURL      string
-	jwtRevocation string
-	devToken      string
-	devProjectID  int64
+	authMode       string
+	jwtIssuers     string
+	jwtAudience    string
+	jwtJWKSURL     string
+	jwtJWKSFile    string
+	jwtJWKSTTL     time.Duration
+	jwtLeeway      time.Duration
+	redisURL       string
+	latestRedisURL string
+	jwtRevocation  string
+	devToken       string
+	devProjectID   int64
+	allowDevLAN    bool
 
 	limitDefaultDevices int
 	limitMaxDevices     int
@@ -74,8 +79,11 @@ type config struct {
 	maxConcurrency      int
 	queueDepth          int
 	queueTimeout        time.Duration
+	ratePerSecond       float64
+	rateBurst           int
 	readyProbe          time.Duration
 	logFormat           string
+	ensureTSDBSchema    bool
 }
 
 func main() {
@@ -101,9 +109,11 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.jwtJWKSTTL, "jwt-jwks-ttl", 10*time.Minute, "JWKS 缓存有效期")
 	flag.DurationVar(&cfg.jwtLeeway, "jwt-leeway", 30*time.Second, "时间声明容差")
 	flag.StringVar(&cfg.redisURL, "redis-url", "", "Redis 地址（jti 吊销表）")
+	flag.StringVar(&cfg.latestRedisURL, "latest-redis-url", "redis://100.64.0.3:28637/0", "最新值 Redis 地址")
 	flag.StringVar(&cfg.jwtRevocation, "jwt-revocation", "on", "jti 吊销检查：on | off（off 仅开发，启动打 WARN）")
 	flag.StringVar(&cfg.devToken, "dev-token", "", "开发静态令牌（非空即启用；仅开发/PoC）")
 	flag.Int64Var(&cfg.devProjectID, "dev-project-id", 0, "开发令牌绑定的 project_id")
+	flag.BoolVar(&cfg.allowDevLAN, "allow-dev-lan", false, "允许开发令牌监听非回环地址（仅限隔离开发环境）")
 
 	flag.IntVar(&cfg.limitDefaultDevices, "limit-default-devices", catalog.DefaultListLimit, "设备列表默认页大小")
 	flag.IntVar(&cfg.limitMaxDevices, "limit-max-devices", catalog.MaxListLimit, "设备列表页大小上限")
@@ -112,9 +122,12 @@ func parseFlags() config {
 	flag.IntVar(&cfg.maxConcurrency, "max-concurrency", 20, "每租户并发查询上限")
 	flag.IntVar(&cfg.queueDepth, "queue-depth", 40, "每租户排队位上限")
 	flag.DurationVar(&cfg.queueTimeout, "queue-timeout", 2*time.Second, "排队等待上限")
+	flag.Float64Var(&cfg.ratePerSecond, "rate-per-second", 20, "每租户查询速率；0 表示关闭")
+	flag.IntVar(&cfg.rateBurst, "rate-burst", 40, "每租户查询突发容量")
 	flag.DurationVar(&cfg.readyProbe, "ready-probe", 3*time.Second, "就绪探测超时")
 	// ⚠️ 字符串开关而非 -log-json 布尔：布尔被写成 `-log-json false` 时会吞掉后续参数（09 §6）。
 	flag.StringVar(&cfg.logFormat, "log-format", "json", "日志格式：json 或 text")
+	flag.BoolVar(&cfg.ensureTSDBSchema, "ensure-tsdb-schema", true, "启动时幂等创建遥测与预聚合表")
 	flag.Parse()
 	return cfg
 }
@@ -160,10 +173,43 @@ func run(cfg config) error {
 		return fmt.Errorf("连接 GreptimeDB: %w", err)
 	}
 	defer gres.Close()
+	if cfg.ensureTSDBSchema {
+		if err := gres.CreateTable(ctx, plan); err != nil {
+			return fmt.Errorf("初始化 GreptimeDB 遥测表: %w", err)
+		}
+		if err := gres.EnsureRollupTable(ctx, tsdb.Rollup1m); err != nil {
+			return fmt.Errorf("初始化 GreptimeDB 1m 预聚合表: %w", err)
+		}
+		if err := gres.EnsureRollupTable(ctx, tsdb.Rollup1h); err != nil {
+			return fmt.Errorf("初始化 GreptimeDB 1h 预聚合表: %w", err)
+		}
+	}
 
 	store, err := catalog.NewPGStore(pool)
 	if err != nil {
 		return err
+	}
+	var endpointStore *notifyconfig.Store
+	if rawKey := os.Getenv("IOT_CONFIG_KEY"); rawKey != "" {
+		key, keyErr := secureconfig.NewKey(rawKey)
+		if keyErr != nil {
+			return keyErr
+		}
+		endpointStore, err = notifyconfig.New(pool, key)
+		if err != nil {
+			return err
+		}
+	} else {
+		logger.Warn("IOT_CONFIG_KEY 未设置，通知端点配置 API 未启用")
+	}
+	latestOpts, err := redis.ParseURL(cfg.latestRedisURL)
+	if err != nil {
+		return fmt.Errorf("解析最新值 Redis 地址: %w", err)
+	}
+	latestRedis := redis.NewClient(latestOpts)
+	defer latestRedis.Close()
+	if err := latestRedis.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("连接最新值 Redis: %w", err)
 	}
 
 	authMetrics := new(apiauth.Metrics)
@@ -177,11 +223,15 @@ func run(cfg config) error {
 			MaxConcurrency: cfg.maxConcurrency,
 			MaxQueue:       cfg.queueDepth,
 			QueueTimeout:   cfg.queueTimeout,
+			RatePerSecond:  cfg.ratePerSecond,
+			Burst:          cfg.rateBurst,
 		},
 	}, querysvc.Deps{
-		Reader:   gres,
-		Catalog:  store,
-		Verifier: verifier,
+		Reader:    gres,
+		Latest:    latest.NewRedisStore(latestRedis),
+		Endpoints: endpointStore,
+		Catalog:   store,
+		Verifier:  verifier,
 		Health: querysvc.Health{
 			PingPG:            pool.Ping,
 			PingTSDB:          gres.Ping,
@@ -253,7 +303,7 @@ func buildVerifier(ctx context.Context, cfg config, logger *slog.Logger) (apiaut
 		if cfg.devProjectID <= 0 {
 			return nil, fmt.Errorf("-auth-mode=%s 需要 -dev-project-id > 0", mode)
 		}
-		if err := requireLoopback(cfg.httpAddr); err != nil {
+		if err := requireDevListen(cfg.httpAddr, cfg.allowDevLAN); err != nil {
 			return nil, err
 		}
 		dev, err := apiauth.NewStaticTokenVerifier(cfg.devToken, cfg.devProjectID)
@@ -262,7 +312,8 @@ func buildVerifier(ctx context.Context, cfg config, logger *slog.Logger) (apiaut
 		}
 		verifiers = append(verifiers, dev)
 		logger.Warn("开发静态令牌已启用：仅限开发/PoC，禁止用于生产",
-			"project_id", cfg.devProjectID, "http_addr", cfg.httpAddr)
+			"project_id", cfg.devProjectID, "http_addr", cfg.httpAddr,
+			"allow_dev_lan", cfg.allowDevLAN)
 	}
 
 	if mode == "jwt" || mode == "both" {
@@ -322,14 +373,23 @@ func buildVerifier(ctx context.Context, cfg config, logger *slog.Logger) (apiaut
 	return verifiers, nil
 }
 
-// requireLoopback 拒绝在非回环地址上启用开发令牌。
+// requireDevListen 默认拒绝在非回环地址上启用开发令牌。
 //
 // 这不是洁癖：开发令牌是共享常量、无过期、无吊销，一旦绑到 0.0.0.0 就等于把整个
-// 租户的数据敞给同网段。
-func requireLoopback(addr string) error {
+// 租户的数据敞给同网段。allowDevLAN 只应在外层已有网络隔离和访问控制时启用。
+func requireDevListen(addr string, allowDevLAN bool) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("解析 -http-addr %q: %w", addr, err)
+	}
+	if allowDevLAN {
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			return fmt.Errorf("-allow-dev-lan 禁止监听全接口地址 %q；请绑定容器网卡地址", addr)
+		}
+		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
+			return nil
+		}
+		return fmt.Errorf("-allow-dev-lan 需要明确的非回环 IP 地址，得到 %q", addr)
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		return fmt.Errorf("开发令牌模式禁止监听 %q（会暴露到全网段）；请绑 127.0.0.1", addr)

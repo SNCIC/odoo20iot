@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/SNCIC/odoo20iot/internal/envelope"
+	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -82,8 +83,12 @@ type Handler struct {
 	idem    IdempotencyStore
 	metrics *Metrics
 	logger  *slog.Logger
+	latest  latest.Store
 	cfg     HandlerConfig
 }
+
+// SetLatestStore 启用遥测落库后的最新值 Write-Through。缓存失败不影响历史数据 ACK。
+func (h *Handler) SetLatestStore(store latest.Store) { h.latest = store }
 
 // NewHandler 构造处理器。idem 为 nil 时退化为无幂等（仅单实例冒烟用，不推荐）。
 func NewHandler(parser *Parser, batcher *Batcher[tsdb.Row], idem IdempotencyStore, metrics *Metrics, logger *slog.Logger) *Handler {
@@ -161,6 +166,12 @@ func (h *Handler) Handle(ctx context.Context, data []byte) (Result, error) {
 		// 释放 processing，让重投能重新处理（TTL 也会兜底）。
 		_ = h.idem.ReleaseProcessing(ctx, key)
 		return ResultRetry, fmt.Errorf("落库失败: %w", err)
+	}
+	if h.latest != nil {
+		if err := h.latest.Put(ctx, rec.Row, h.parser.Metrics()); err != nil {
+			h.logger.Warn("写入最新值缓存失败（历史数据已落库）",
+				"project_id", rec.Row.ProjectID, "device_id", rec.Row.DeviceID, "error", err)
+		}
 	}
 
 	// 4) **持久化确认之后**才写 done（03 §4.3 步骤 7）。

@@ -159,10 +159,15 @@ func run(cfg config) error {
 	}
 	metrics := new(alarm.Metrics)
 	counts := new(counters)
+	silences, err := alarm.LoadSilences(ctx, pool)
+	if err != nil {
+		return err
+	}
 	engine, err := alarm.New(alarm.Options{
-		Store:   store,
-		Metrics: metrics,
-		Logger:  logger,
+		Store:    store,
+		Silences: silences,
+		Metrics:  metrics,
+		Logger:   logger,
 	})
 	if err != nil {
 		return err

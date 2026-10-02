@@ -2,11 +2,17 @@ package querysvc
 
 import (
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
@@ -15,6 +21,7 @@ import (
 
 func (s *Service) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.Handle("/", consoleHandler())
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "alive"})
@@ -29,8 +36,208 @@ func (s *Service) routes() http.Handler {
 	})
 	mux.Handle("/api/v1/devices", auth(http.HandlerFunc(s.handleDevices)))
 	mux.Handle("/api/v1/series", auth(http.HandlerFunc(s.handleSeries)))
+	mux.Handle("/api/v1/series/multi", auth(http.HandlerFunc(s.handleSeriesMulti)))
+	mux.Handle("/api/v1/export", auth(http.HandlerFunc(s.handleExport)))
+	if s.deps.Latest != nil {
+		mux.Handle("/api/v1/latest", auth(http.HandlerFunc(s.handleLatest)))
+	}
+	if s.deps.Endpoints != nil {
+		mux.Handle("/api/v1/notification-endpoints", auth(http.HandlerFunc(s.handleNotificationEndpoints)))
+	}
 
-	return mux
+	return securityHeaders(mux)
+}
+
+func (s *Service) handleSeriesMulti(w http.ResponseWriter, r *http.Request) {
+	metrics := splitMetrics(r.URL.Query().Get("metrics"))
+	if len(metrics) == 0 || len(metrics) > tsdb.MaxProjectedMetrics {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, fmt.Sprintf("metrics 必须包含 1-%d 个指标", tsdb.MaxProjectedMetrics))
+		return
+	}
+	result := make(map[string]json.RawMessage, len(metrics))
+	for _, metric := range metrics {
+		q := r.URL.Query()
+		q.Set("metric", metric)
+		q.Del("metrics")
+		req := r.Clone(r.Context())
+		req.URL.RawQuery = q.Encode()
+		rec := httptest.NewRecorder()
+		s.handleSeries(rec, req)
+		if rec.Code >= http.StatusBadRequest {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(rec.Code)
+			_, _ = w.Write(rec.Body.Bytes())
+			return
+		}
+		result[metric] = json.RawMessage(rec.Body.Bytes())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "series": result})
+}
+
+func (s *Service) handleExport(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(r.URL.Query().Get("metric")) == "" {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "metric 必填")
+		return
+	}
+	rec := httptest.NewRecorder()
+	s.handleSeries(rec, r)
+	if rec.Code >= http.StatusBadRequest {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+		return
+	}
+	var body seriesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		writeError(w, http.StatusInternalServerError, CodeInternal, "导出结果解析失败")
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="iot-series.csv"`)
+	w.WriteHeader(http.StatusOK)
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"ts", "device_id", "value", "avg", "max", "count"})
+	for _, p := range body.Points {
+		value := ""
+		if p.Value != nil {
+			value = fmt.Sprintf("%v", *p.Value)
+		}
+		_ = cw.Write([]string{p.TS.UTC().Format(time.RFC3339Nano), strconv.FormatInt(p.DeviceID, 10), value, "", "", ""})
+	}
+	for _, b := range body.Buckets {
+		avg, max := "", ""
+		if b.Avg != nil {
+			avg = fmt.Sprintf("%v", *b.Avg)
+		}
+		if b.Max != nil {
+			max = fmt.Sprintf("%v", *b.Max)
+		}
+		_ = cw.Write([]string{b.Bucket.UTC().Format(time.RFC3339Nano), strconv.FormatInt(b.DeviceID, 10), "", avg, max, strconv.FormatInt(b.Count, 10)})
+	}
+	cw.Flush()
+}
+
+func splitMetrics(raw string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" && !seen[item] {
+			seen[item] = true
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:")
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Service) handleNotificationEndpoints(w http.ResponseWriter, r *http.Request) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if r.Method == http.MethodGet {
+		items, err := s.deps.Endpoints.List(r.Context(), id.ProjectID)
+		if err != nil {
+			s.fail(w, "读取通知端点", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "endpoints": items})
+		return
+	}
+	if r.Method == http.MethodDelete {
+		endpointID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("id")), 10, 64)
+		if err != nil || endpointID <= 0 {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "id 必须为正整数")
+			return
+		}
+		if err := s.deps.Endpoints.Delete(r.Context(), id.ProjectID, endpointID); err != nil {
+			s.fail(w, "删除通知端点", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "不支持的 HTTP 方法")
+		return
+	}
+	var req struct{ Name, Channel, Target string }
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "请求体非法")
+		return
+	}
+	if req.Channel != "webhook" && req.Channel != "email" && req.Channel != "sms" {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "channel 必须是 webhook、email 或 sms")
+		return
+	}
+	e, err := s.deps.Endpoints.Create(r.Context(), id.ProjectID, strings.TrimSpace(req.Name), req.Channel, strings.TrimSpace(req.Target))
+	if err != nil {
+		s.fail(w, "创建通知端点", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "endpoint": e})
+}
+
+func (s *Service) handleLatest(w http.ResponseWriter, r *http.Request) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	q := r.URL.Query()
+	if q.Has("project_id") {
+		writeError(w, http.StatusBadRequest, CodeTenantNotAllowed, "租户只能来自令牌，不能作为查询参数")
+		return
+	}
+	deviceIDs, err := parseDeviceIDs(q.Get("device_ids"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, err.Error())
+		return
+	}
+	if len(deviceIDs) > 50 {
+		writeError(w, http.StatusUnprocessableEntity, CodeUnprocessable, "device_ids 最多 50 台")
+		return
+	}
+	owned, err := s.deps.Catalog.DeviceIDsOwned(r.Context(), id.ProjectID, deviceIDs)
+	if err != nil {
+		s.fail(w, "校验设备归属", err)
+		return
+	}
+	items := make([]latestDTO, 0, len(deviceIDs))
+	for _, deviceID := range deviceIDs {
+		if !owned[deviceID] {
+			writeError(w, http.StatusForbidden, CodeForbidden, "设备不存在或不属于本租户")
+			return
+		}
+		snapshot, err := s.deps.Latest.Get(r.Context(), id.ProjectID, deviceID)
+		if errors.Is(err, redis.Nil) {
+			items = append(items, latestDTO{DeviceID: deviceID})
+			continue
+		}
+		if err != nil {
+			s.fail(w, "读取最新值", err)
+			return
+		}
+		ts := snapshot.TS
+		items = append(items, latestDTO{DeviceID: deviceID, Available: true, TS: &ts, Values: snapshot.Values})
+	}
+	writeJSON(w, http.StatusOK, latestResponse{OK: true, Latest: items})
 }
 
 // handleReadyz 真打 PG（并把迁移状态查清楚）与 GreptimeDB。
@@ -234,6 +441,8 @@ func (s *Service) handleSeries(w http.ResponseWriter, r *http.Request) {
 		s.deps.Metrics.Rejected.Add(1)
 		w.Header().Set("Retry-After", "1")
 		switch {
+		case errors.Is(err, ErrRateLimited):
+			writeError(w, http.StatusTooManyRequests, CodeRateLimited, "该租户请求过于频繁，请稍后重试")
 		case errors.Is(err, ErrQueueFull):
 			writeError(w, http.StatusServiceUnavailable, CodeQueryBusy, "该租户查询排队已满，请稍后重试")
 		case errors.Is(err, ErrQueueTimeout):

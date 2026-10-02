@@ -54,6 +54,7 @@ type Event struct {
 	NotifyCount int    `json:"notify_count"`
 	BatchID     string `json:"batch_id,omitempty"`
 	Reason      string `json:"reason,omitempty"`
+	Escalated   bool   `json:"escalated,omitempty"`
 
 	// MetricSnapshot 是触发时的取值快照（07 §6 S3 的 iot_metric_snapshot）。
 	MetricSnapshot json.RawMessage `json:"metric_snapshot,omitempty"`
@@ -88,6 +89,7 @@ func NewEvent(d Decision) (Event, bool) {
 		NotifyCount:    a.NotifyCount,
 		BatchID:        a.BatchID,
 		Reason:         d.Reason,
+		Escalated:      d.Escalate,
 		MetricSnapshot: normalizeValue(a.TriggerValue),
 	}, true
 }

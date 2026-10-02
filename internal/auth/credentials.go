@@ -16,6 +16,8 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -143,4 +145,48 @@ func GenerateSecret() (string, error) {
 		return "", fmt.Errorf("生成 secret 失败: %w", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// ParseEncodedDigest parses the argon2id encoding stored in control-plane tables.
+func ParseEncodedDigest(encoded string) (Digest, error) {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 4 || parts[0] != "argon2id" {
+		return Digest{}, fmt.Errorf("摘要格式非法")
+	}
+	p := Params{KeyLen: DefaultParams.KeyLen}
+	for _, item := range strings.Split(parts[1], ",") {
+		k, v, ok := strings.Cut(item, "=")
+		if !ok {
+			return Digest{}, fmt.Errorf("摘要参数非法")
+		}
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return Digest{}, err
+		}
+		switch k {
+		case "t":
+			p.Time = uint32(n)
+		case "m":
+			p.Memory = uint32(n)
+		case "p":
+			p.Threads = uint8(n)
+		default:
+			return Digest{}, fmt.Errorf("未知摘要参数")
+		}
+	}
+	if p.Time == 0 || p.Memory == 0 || p.Threads == 0 {
+		return Digest{}, fmt.Errorf("摘要参数不完整")
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[2])
+	if err != nil {
+		return Digest{}, err
+	}
+	hash, err := base64.RawStdEncoding.DecodeString(parts[3])
+	if err != nil {
+		return Digest{}, err
+	}
+	if len(salt) == 0 || len(hash) == 0 {
+		return Digest{}, fmt.Errorf("摘要为空")
+	}
+	return Digest{Params: p, Salt: salt, Hash: hash}, nil
 }

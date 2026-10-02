@@ -29,6 +29,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/natsjs"
 	"github.com/SNCIC/odoo20iot/internal/pipeline"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
@@ -151,6 +152,7 @@ func run(cfg config) error {
 
 	metrics := new(pipeline.Metrics)
 	handler := pipeline.NewHandler(parser, batcher, pipeline.NewRedisIdempotency(rdb), metrics, logger)
+	handler.SetLatestStore(latest.NewRedisStore(rdb))
 
 	// 5) 消费：durable pull consumer + 手动 ACK。
 	//

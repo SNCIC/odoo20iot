@@ -108,3 +108,19 @@ $ curl -s -H 'Authorization: Bearer devtoken' '.../api/v1/series?device_ids=1001
 
 本报告是**功能验收**，不是性能报告。延迟相关结论（P95<200ms、行数上限、跨度路由）见
 `b1-tsdb-bench.md` / `b1-detail-limit.md` / `b1-rollup.md`；本服务未做并发/吞吐压测。
+
+## 7. 2026-10-02 产品化增量
+
+已完成：
+
+- `svc-query` 支持用户级 systemd 常驻运行，配置从受保护的 EnvironmentFile 注入。
+- 查询服务启动时可幂等创建遥测表和 `telemetry_1m` / `telemetry_1h` 预聚合表。
+- 增加 HTTP 安全响应头，生产 TLS 下自动发送 HSTS。
+- 增加 `/api/v1/series/multi?metrics=a,b`，最多同时投影 4 个指标。
+- 增加 `/api/v1/export` CSV 导出接口，前端设备详情页提供“导出 CSV”。
+- 局域网和 Tailscale 入口由独立用户级 systemd 代理自动恢复。
+
+仍需生产化：
+
+- JWT/OIDC 身份源和用户管理尚未在本仓库内签发；当前服务仍可用开发 Token 验收。
+- 真实 Odoo S1/S3 场景、数据库备份恢复演练、A4 连接压测和真实飞书发送测试不在本次执行范围内。

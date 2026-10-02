@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/cluster"
 	"github.com/SNCIC/odoo20iot/internal/gateway"
 	"github.com/SNCIC/odoo20iot/internal/metering"
+	"github.com/SNCIC/odoo20iot/internal/pg"
 )
 
 func main() {
@@ -46,6 +48,8 @@ func main() {
 	meterWindow := flag.Duration("metering-window", metering.DefaultWindow, "计量上报窗口（04 §6：每 10s 批量上报）")
 
 	authFile := flag.String("auth-file", "tmp/dev-credentials.json", "设备凭据文件（L1 之外的凭据来源；仅开发/PoC）")
+	authSource := flag.String("auth-source", "file", "设备凭据来源：file 或 pg")
+	pgDSN := flag.String("pg-dsn", pg.DefaultDSN, "auth-source=pg 时的业务库 DSN")
 	allowAnonymous := flag.Bool("allow-anonymous", false, "⚠️ 放行全部连接（仅本地冒烟；生产绝不可开）")
 	allowProjectMode := flag.Bool("allow-project-mode", false, "允许 A 档（项目级共享凭据）；ADR-008 要求显式开启")
 	maxVerify := flag.Int("auth-max-concurrent", auth.DefaultPolicy().MaxConcurrentVerify, "Argon2 并发校验上限（按内存带宽定，见 03 §2.1.1）")
@@ -74,9 +78,21 @@ func main() {
 
 	metrics := new(gateway.Metrics)
 
-	authenticator, err := buildAuthenticator(*authFile, *allowAnonymous, *allowProjectMode, *maxVerify, logger)
+	var authPoolCloser func()
+	var authPool *pgxpool.Pool
+	if *authSource == "pg" {
+		authPool, err = pg.Open(context.Background(), pg.Config{DSN: *pgDSN})
+		if err != nil {
+			logger.Fatal("打开认证数据库失败", zap.Error(err))
+		}
+		authPoolCloser = func() { authPool.Close() }
+	}
+	authenticator, err := buildAuthenticator(*authSource, *authFile, authPool, *allowAnonymous, *allowProjectMode, *maxVerify, logger)
 	if err != nil {
 		logger.Fatal("初始化认证失败", zap.Error(err))
+	}
+	if authPoolCloser != nil {
+		defer authPoolCloser()
 	}
 
 	// 总线不可达即拒绝启动：一个无法确认持久化的网关只会静默丢数据，
@@ -224,15 +240,29 @@ func main() {
 
 // buildAuthenticator 组装认证器。放行匿名时必须由部署者**显式**声明，
 // 不能让「忘记配凭据文件」静默退化成「谁都能连」。
-func buildAuthenticator(file string, anonymous, allowProjectMode bool, maxVerify int, logger *zap.Logger) (*auth.Authenticator, error) {
+func buildAuthenticator(source, file string, pool *pgxpool.Pool, anonymous, allowProjectMode bool, maxVerify int, logger *zap.Logger) (*auth.Authenticator, error) {
 	if anonymous {
 		logger.Warn("⚠️ 已放行全部连接（-allow-anonymous）：此模式不得用于任何非本地环境")
 		return nil, nil
 	}
 
-	dir, err := auth.LoadFile(file)
-	if err != nil {
-		return nil, fmt.Errorf("%w\n提示：用 -gen-auth-file=%s 生成一份演示凭据，或改用具名凭据后端", err, file)
+	var dir auth.Directory
+	var size int
+	if source == "pg" {
+		if pool == nil {
+			return nil, fmt.Errorf("auth-source=pg 需要业务库连接")
+		}
+		pgDir, err := auth.NewPGDirectory(pool)
+		if err != nil {
+			return nil, err
+		}
+		dir = pgDir
+	} else {
+		fileDir, err := auth.LoadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("%w\n提示：用 -gen-auth-file=%s 生成一份演示凭据，或改用 auth-source=pg", err, file)
+		}
+		dir, size = fileDir, fileDir.Size()
 	}
 
 	policy := auth.DefaultPolicy()
@@ -248,8 +278,9 @@ func buildAuthenticator(file string, anonymous, allowProjectMode bool, maxVerify
 		policy, metrics)
 
 	logger.Info("认证已启用",
+		zap.String("auth_source", source),
 		zap.String("auth_file", file),
-		zap.Int("devices", dir.Size()),
+		zap.Int("devices", size),
 		zap.Bool("project_mode", allowProjectMode),
 		zap.Int("max_concurrent_verify", policy.MaxConcurrentVerify),
 		zap.String("argon2", auth.DefaultParams.String()))

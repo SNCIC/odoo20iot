@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/sony/gobreaker"
 
+	"github.com/SNCIC/odoo20iot/internal/dlq"
 	"github.com/SNCIC/odoo20iot/internal/odoo"
 )
 
@@ -22,6 +24,24 @@ type fakeClient struct {
 	mu    sync.Mutex
 	errs  []error
 	calls int
+}
+
+type fakeDLQ struct {
+	mu      sync.Mutex
+	entries []dlq.Entry
+}
+
+func (f *fakeDLQ) Put(_ context.Context, entry dlq.Entry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries = append(f.entries, entry)
+	return nil
+}
+
+func (f *fakeDLQ) all() []dlq.Entry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]dlq.Entry(nil), f.entries...)
 }
 
 func (f *fakeClient) Call(_ context.Context, _, _ string, _, _ any) error {
@@ -88,6 +108,64 @@ func newTestConnector(t *testing.T, client Client, p Policy) *Connector {
 		t.Fatalf("构造连接器失败: %v", err)
 	}
 	return c
+}
+
+func newTestConnectorWithDLQ(t *testing.T, client Client, p Policy, store DLQ) *Connector {
+	t.Helper()
+	c, err := New(client, Options{
+		Policy: p,
+		Logger: testLogger(),
+		Sleep:  func(context.Context, time.Duration) error { return nil },
+		DLQ:    store,
+	})
+	if err != nil {
+		t.Fatalf("构造连接器失败: %v", err)
+	}
+	return c
+}
+
+func TestConnectorFailureWritesStructuredDLQ(t *testing.T) {
+	client := &fakeClient{errs: []error{apiErr(http.StatusInternalServerError)}}
+	store := &fakeDLQ{}
+	c := newTestConnectorWithDLQ(t, client, noRetryPolicy(), store)
+
+	req := Request{
+		Model: "maintenance.equipment", Method: "write",
+		Params:         map[string]any{"ids": []int{1}, "values": map[string]any{"name": "updated"}},
+		IdempotencyKey: "device:1:write:1", RequestHash: "hash-1", TraceID: "trace-1",
+	}
+	if err := c.Call(context.Background(), req, nil); err == nil {
+		t.Fatal("上游失败时应返回错误")
+	}
+	entries := store.all()
+	if len(entries) != 1 {
+		t.Fatalf("应写入 1 条 DLQ，得到 %d", len(entries))
+	}
+	entry := entries[0]
+	if entry.Service != "odoo-connector" || entry.EntityType != "odoo_call" || entry.IdempotencyKey != req.IdempotencyKey || entry.TraceID != req.TraceID {
+		t.Fatalf("DLQ 元数据错误: %+v", entry)
+	}
+	var got Request
+	if err := json.Unmarshal([]byte(entry.Payload), &got); err != nil {
+		t.Fatalf("DLQ payload 不是合法 JSON: %v", err)
+	}
+	if got.Model != req.Model || got.Method != req.Method || got.IdempotencyKey != req.IdempotencyKey {
+		t.Fatalf("DLQ 请求不完整: %+v", got)
+	}
+}
+
+func TestConnectorReplaySuppressesNewDLQ(t *testing.T) {
+	client := &fakeClient{errs: []error{apiErr(http.StatusInternalServerError)}}
+	store := &fakeDLQ{}
+	c := newTestConnectorWithDLQ(t, client, noRetryPolicy(), store)
+	req := Request{Model: "m", Method: "write", IdempotencyKey: "idem-replay"}
+
+	if err := c.Call(SuppressDLQ(context.Background()), req, nil); err == nil {
+		t.Fatal("重放失败时应返回错误")
+	}
+	if got := len(store.all()); got != 0 {
+		t.Fatalf("重放失败不应再次写入 DLQ，得到 %d 条", got)
+	}
 }
 
 // TestConnector_业务拒绝不重试 是 §4.3.2 的核心约定：

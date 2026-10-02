@@ -16,6 +16,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -172,6 +173,38 @@ func TestHandlers_TenantParamRejected(t *testing.T) {
 		if e := decodeErr(t, rec); e.Code != CodeTenantNotAllowed {
 			t.Fatalf("%s 期望 TENANT_NOT_ALLOWED，得到 %s", path, e.Code)
 		}
+	}
+}
+
+func TestHandlers_Latest(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	store := latest.NewMemStore()
+	row := tsdb.Row{
+		ProjectID: 1, DeviceID: 1, TS: time.Date(2026, 10, 1, 11, 0, 0, 0, time.UTC),
+		Values: []tsdb.Value{tsdb.Number(25.5), tsdb.Null(), tsdb.Null(), tsdb.Null(), tsdb.Bool(true)},
+	}
+	if err := store.Put(context.Background(), row, tsdb.BenchMetrics); err != nil {
+		t.Fatal(err)
+	}
+	svc.deps.Latest = store
+	svc.mux = svc.routes()
+
+	rec := get(t, svc.Handler(), "/api/v1/latest?device_ids=1,2", "tok")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d（%s）", rec.Code, rec.Body.String())
+	}
+	var resp latestResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Latest) != 2 || !resp.Latest[0].Available || resp.Latest[1].Available {
+		t.Fatalf("最新值响应不符: %+v", resp)
+	}
+	if resp.Latest[0].Values["temperature"] != float64(25.5) || resp.Latest[0].Values["running"] != true {
+		t.Fatalf("最新值指标不符: %+v", resp.Latest[0])
+	}
+	if rec := get(t, svc.Handler(), "/api/v1/latest?device_ids=9", "tok"); rec.Code != http.StatusForbidden {
+		t.Fatalf("跨租户最新值应返回 403，得到 %d", rec.Code)
 	}
 }
 

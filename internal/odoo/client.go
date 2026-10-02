@@ -111,9 +111,31 @@ func (c *Client) Call(ctx context.Context, model, method string, params any, out
 		}
 	}
 
+	return c.postJSON(ctx, endpoint, payload, model+"."+method, out)
+}
+
+// PostJSON 调用自定义 JSON HTTP 路由，复用 Odoo 的认证和多库路由头。
+func (c *Client) PostJSON(ctx context.Context, path string, payload any, out any) error {
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("odoo: 自定义路由必须以 / 开头")
+	}
+	body := []byte("{}")
+	var err error
+	if payload != nil {
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("odoo: 序列化自定义路由请求: %w", err)
+		}
+	}
+	endpoint := *c.base
+	endpoint.Path = path
+	return c.postJSON(ctx, endpoint, body, path, out)
+}
+
+func (c *Client) postJSON(ctx context.Context, endpoint url.URL, payload []byte, operation string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("odoo: 构造请求: %w", err)
+		return fmt.Errorf("odoo: 构造 %s 请求: %w", operation, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
@@ -122,23 +144,23 @@ func (c *Client) Call(ctx context.Context, model, method string, params any, out
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("odoo: 请求 %s.%s: %w", model, method, err)
+		return fmt.Errorf("odoo: 请求 %s: %w", operation, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
-		return fmt.Errorf("odoo: 读取 %s.%s 响应: %w", model, method, err)
+		return fmt.Errorf("odoo: 读取 %s 响应: %w", operation, err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return newAPIError(resp.StatusCode, model, method, body)
+		return newAPIError(resp.StatusCode, operation, "", body)
 	}
 	if out == nil || len(body) == 0 {
 		return nil
 	}
 	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("odoo: 解析 %s.%s 响应: %w", model, method, err)
+		return fmt.Errorf("odoo: 解析 %s 响应: %w", operation, err)
 	}
 	return nil
 }

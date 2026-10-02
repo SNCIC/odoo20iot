@@ -102,18 +102,32 @@ func (a *agent) scanOnce(ctx context.Context) error {
 
 func (a *agent) dispatch(ctx context.Context, ds []alarm.Decision) {
 	for _, d := range ds {
+		notifyNormal := d.Notify
 		if d.Escalate {
 			// 04 §2.2：风暴熔断要「只发一条聚合通知并 P1 升级」。
-			// 升级通道属于 svc-notify（§2.3），尚未实现 —— 这里明确记 ERROR，
-			// 而不是让它只体现在一个没人看的计数器上。
+			// 通过同一条线上事件携带 escalated=true，通知服务可按策略切换
+			// P1 收件人，而不是只写一条没人消费的日志。
 			project := ""
 			if d.Alarm != nil {
 				project = d.Alarm.ProjectID
 			}
-			a.logger.Error("告警风暴熔断，需 P1 升级（升级通道未实现）",
+			a.logger.Warn("告警风暴熔断，发布 P1 升级事件",
 				"project", project, "reason", d.Reason)
+			escalation := d
+			escalation.Notify = true
+			if ev, ok := alarm.NewEvent(escalation); ok {
+				data, err := json.Marshal(ev)
+				if err != nil {
+					a.logger.Error("序列化 P1 升级事件失败", "error", err)
+				} else {
+					subject := alarm.AlarmSubjectPrefix + ".escalation." + ev.ProjectID
+					if err := a.pub.Publish(ctx, subject, data); err != nil {
+						a.logger.Error("发布 P1 升级事件失败", "subject", subject, "error", err)
+					}
+				}
+			}
 		}
-		if d.Notify {
+		if notifyNormal {
 			a.publishDecision(ctx, d)
 		}
 	}
