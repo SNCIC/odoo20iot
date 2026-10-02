@@ -29,7 +29,7 @@
 `internal/natsjs`；且 `natsjs.Subscribe` 的返回值已收窄为**不暴露 `Unsubscribe`**，使该缺陷在类型上**无法再被写出来**
 （坑 42/47）。`svc-quota` 的用量重复计数已用真 NATS 演练复现并消除（见 §4 第 21 项）。
 
-**本轮新增（2026-10-02）**：A 档 ProjectKey 失败按 `project_id` 聚合封禁，文件凭据源启用 A 档时对 A 档设备条目数执行 1000 上限；PG 凭据源与 A 档组合 fail-fast。MQTT 网关已部署 TLS 1.3 listener，真实内部 CA/服务端证书握手验证通过；新增 mTLS 设备证书签发/轮换脚本，并用临时 CA 验证正确 CA、错误 CA、过期证书场景。生产网关仍保持单向 TLS，待所有设备证书和认证模式完成切换后再启用客户端 CA。网关已将 PG 凭据目录中的真实 `device_id` / `project_id` / `device_type_id` 写入信封，认证身份缺失时拒绝落库路径。
+**本轮新增（2026-10-02）**：A 档 ProjectKey 失败按 `project_id` 聚合封禁，文件凭据源启用 A 档时对 A 档设备条目数执行 1000 上限；PG 凭据源与 A 档组合 fail-fast。MQTT 网关已部署 TLS 1.3 listener，真实内部 CA/服务端证书握手验证通过；新增 mTLS 设备证书签发/轮换脚本，并用临时 CA 验证正确 CA、错误 CA、过期证书场景。开发环境完成一次真实 mTLS 端到端验收：正确 CN 的 MQTT 客户端连接成功，错误 CN 被认证拒绝；验收后已恢复为单向 TLS，生产切换仍需按设备批次执行。网关已将 PG 凭据目录中的真实 `device_id` / `project_id` / `device_type_id` 写入信封，认证身份缺失时拒绝落库路径。
 
 **RLS 增量（2026-10-02）**：新增迁移 `0014_rls_hardening`，对 `t_integration_issue` 启用并强制 RLS，补齐 `project_id` 非空、租户策略和包含 `project_id` 的唯一键；`extref.Store` 的问题记录/解决路径改为显式租户事务。新增迁移 `0020_force_ready_rls`，对已完成租户事务改造的 `t_notification_endpoint`、`t_audit_log` 启用 `FORCE ROW LEVEL SECURITY`，已应用到开发库；目录 `PGStore` 的设备查询、归属校验、设备键查询和三类 upsert 已迁移到 `pg.WithProjectTx`，全量 Go 测试、静态检查和网关/查询/连接器重启验证通过。目录表尚未强制 RLS；告警、DLQ 等表仍需分批迁移，不能一次性强制。
 
