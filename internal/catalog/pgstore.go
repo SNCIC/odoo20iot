@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/SNCIC/odoo20iot/internal/pg"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -75,30 +77,35 @@ func (s *PGStore) ListDevices(ctx context.Context, f DeviceFilter) (DevicePage, 
 	limit := next(nf.Limit + 1)
 
 	sql := fmt.Sprintf("SELECT %s FROM t_device WHERE %s ORDER BY id LIMIT %s", deviceColumns, where, limit)
-	rows, err := s.pool.Query(ctx, sql, args...)
-	if err != nil {
-		return DevicePage{}, fmt.Errorf("catalog: 列设备: %w", err)
-	}
-	defer rows.Close()
-
-	var out []Device
-	for rows.Next() {
-		d, err := scanDevice(rows)
-		if err != nil {
-			return DevicePage{}, err
-		}
-		out = append(out, d)
-	}
-	if err := rows.Err(); err != nil {
-		return DevicePage{}, fmt.Errorf("catalog: 迭代设备行: %w", err)
-	}
-
 	page := DevicePage{}
-	if len(out) > nf.Limit {
-		page.NextAfterID = out[nf.Limit-1].ID
-		out = out[:nf.Limit]
+	err = pg.WithProjectTx(ctx, s.pool, nf.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, sql, args...)
+		if err != nil {
+			return fmt.Errorf("catalog: 列设备: %w", err)
+		}
+		defer rows.Close()
+
+		var out []Device
+		for rows.Next() {
+			d, err := scanDevice(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, d)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("catalog: 迭代设备行: %w", err)
+		}
+		if len(out) > nf.Limit {
+			page.NextAfterID = out[nf.Limit-1].ID
+			out = out[:nf.Limit]
+		}
+		page.Devices = out
+		return nil
+	})
+	if err != nil {
+		return DevicePage{}, err
 	}
-	page.Devices = out
 	return page, nil
 }
 
@@ -111,22 +118,28 @@ func (s *PGStore) DeviceIDsOwned(ctx context.Context, projectID int64, ids []int
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT id FROM t_device WHERE project_id = $1 AND deleted_at IS NULL AND id = ANY($2)`,
-		projectID, ids)
-	if err != nil {
-		return nil, fmt.Errorf("catalog: 校验设备归属: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("catalog: 扫描设备 id: %w", err)
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`SELECT id FROM t_device WHERE project_id = $1 AND deleted_at IS NULL AND id = ANY($2)`,
+			projectID, ids)
+		if err != nil {
+			return fmt.Errorf("catalog: 校验设备归属: %w", err)
 		}
-		out[id] = true
+		defer rows.Close()
+
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return fmt.Errorf("catalog: 扫描设备 id: %w", err)
+			}
+			out[id] = true
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // DeviceKeysExisting 返回 keys 中**已存在**（含软删）的 device_key 子集。
@@ -141,21 +154,27 @@ func (s *PGStore) DeviceKeysExisting(ctx context.Context, projectID int64, keys 
 	if len(keys) == 0 {
 		return out, nil
 	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT device_key FROM t_device WHERE project_id = $1 AND device_key = ANY($2)`, projectID, keys)
-	if err != nil {
-		return nil, fmt.Errorf("catalog: 查询已存在设备键: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var k string
-		if err := rows.Scan(&k); err != nil {
-			return nil, fmt.Errorf("catalog: 扫描 device_key: %w", err)
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`SELECT device_key FROM t_device WHERE project_id = $1 AND device_key = ANY($2)`, projectID, keys)
+		if err != nil {
+			return fmt.Errorf("catalog: 查询已存在设备键: %w", err)
 		}
-		out[k] = true
+		defer rows.Close()
+
+		for rows.Next() {
+			var k string
+			if err := rows.Scan(&k); err != nil {
+				return fmt.Errorf("catalog: 扫描 device_key: %w", err)
+			}
+			out[k] = true
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 const upsertProjectSQL = `
