@@ -33,9 +33,9 @@
 
 **RLS 增量（2026-10-02）**：新增迁移 `0014_rls_hardening`，对 `t_integration_issue` 启用并强制 RLS，补齐 `project_id` 非空、租户策略和包含 `project_id` 的唯一键；`extref.Store` 的问题记录/解决路径改为显式租户事务。新增迁移 `0020_force_ready_rls`，对已完成租户事务改造的 `t_notification_endpoint`、`t_audit_log` 启用 `FORCE ROW LEVEL SECURITY`，已应用到开发库；目录、告警、DLQ 等表仍需分批迁移，不能一次性强制。
 
-**升级通知增量（2026-10-02）**：`svc-notify` 识别告警事件的 `escalated=true`，通知策略可配置 `escalated_recipients` 按通道替换普通收件人；未配置时保持原收件人，兼容现有策略。未确认超时升级仍待 `svc-alarm` 提供确认状态。
+**升级通知增量（2026-10-02）**：`svc-notify` 识别告警事件的 `escalated=true`，通知策略可配置 `escalated_recipients` 按通道替换普通收件人；未配置时保持原收件人，兼容现有策略。`svc-alarm` 已持久化升级阶段并支持人工确认；确认后的升级抑制通过 `acknowledged_at` 闭环。
 
-**未确认升级增量（2026-10-02）**：`svc-alarm` 扫描 `active` 告警的 `notified_ts`，默认 30 分钟发布阶段 1 上级通知，默认 2 小时发布阶段 2 P1 通知；`t_alarm_active.escalation_stage` 通过迁移 `0015_alarm_escalation` 持久化，并用条件更新原子抢占，重启和多副本不会重复升级。策略支持 `ack_escalated_recipients`（阶段 1）与 `escalated_recipients`（阶段 2）。当前仍没有控制台人工确认 API，确认后抑制升级的闭环是后续工作。
+**未确认升级增量（2026-10-02）**：`svc-alarm` 扫描 `active` 告警的 `notified_ts`，默认 30 分钟发布阶段 1 上级通知，默认 2 小时发布阶段 2 P1 通知；`t_alarm_active.escalation_stage` 通过迁移 `0015_alarm_escalation` 持久化，并用条件更新原子抢占，重启和多副本不会重复升级。策略支持 `ack_escalated_recipients`（阶段 1）与 `escalated_recipients`（阶段 2）。控制台人工确认 API 已实现：`POST /api/v1/alarms/{alarm_id}/ack`，需要 `alarm:write` scope；确认写入 `t_audit_log` 并抑制后续升级。
 
 下一步：A4 连接压测明确暂缓；继续完成目录/告警表的租户事务改造、非 owner 应用账号切换、mTLS 设备证书生命周期，以及独立 `svc-rule` 消费服务的生产接入。Odoo S1/S3、B1 查询保护已有 Go/真实依赖验证记录，仍需在发布前按现场数据再次验收。
 
@@ -248,9 +248,9 @@ git ls-files | xargs sed -i 's/\r//' && git add -A
 | P1 | A4 | **压测工具已完成三个阶段**（`cmd/mqtt-bench`：阶段 1 建连/保持/资源采样/泄漏趋势判定，阶段 2 QoS1 发布路径，阶段 3 背靠背吞吐 + 接入确认延迟 P50/P95/P99 + SLO 判定；引入 `eclipse/paho.mqtt.golang` v1.5.1）。**5 万连接 24h 正式实测待跑**：需先起网关，且压测客户端**须分机部署**（同机跑会把工具开销算进网关）。冒烟：10 连接背靠背 → 13585 msg/s、P99 = 2ms、SLO ✅；200 连接 + 1s 周期发布 → 2098 条全成功 |
 | P1 | A4 补充项 | **机制性验证已完成**（`internal/gateway/a4_test.go`，不依赖真实 NATS）：PUBLISH 同步阻塞同连接的 PINGREQ，PINGRESP 推迟 ≈ `PubackTimeout`（400ms 用例实测 400ms）；阻塞**仅限该连接**。**5 万连接 24h 下的规模化影响**（连续上报 × 总线超时 → 设备侧误判重连）仍待压测观测（`03` §4.4.1 边界 1） |
 | ~~P0~~ | ~~A5 · 计量埋点原型~~ | ✅ **已完成（原型）**（见 §4 第 13 项）。遗留：每分钟落 PG（按 `(metric, ts_minute)` 幂等）+ 每小时对账、配额限流与分级预警、其余三类指标（设备数/存储量/API 调用数） |
-| ~~P1~~ | ~~D2 / D3~~ | ✅ **已完成（骨架 + 安装验证 + 已推送）**（见 §4 第 14 项）。**遗留**：D3 的完整实现（facade / 其余 IoT 路由 / cron 投递 / 视图 / `tests/` / `EXTENSIONS.md`）、S1/S3 集成场景端到端 |
+| P1 | D2 / D3 | Go 侧 JSON-2 客户端与 Odoo 侧集成骨架已完成；D3 完整 facade / 其余 IoT 路由 / 视图 / `tests/` / `EXTENSIONS.md` 和 S1/S3 端到端验收仍需逐项核对。本次发现连接器曾报告 Outbox pending 未收敛；本环境无 Odoo 服务管理权限，尚未验证 cron 配置或清空 pending。 |
 | ~~P1~~ | ~~`odoo-connector` 补充项~~ | **已完成**：编排层、两条事件入口、Odoo cron、定时对账、主数据增量拉取、`t_external_ref` 外部引用、`t_integration_issue` 未绑定待办、结构化 DLQ、聚合告警与可选重放均已完成。DLQ 默认开启；重放默认关闭，需显式设置 `-dlq-replay-interval`；聚合告警默认每 5 分钟扫描最近 15 分钟，阈值为 1 条，可用 `-dlq-alert-*` 调整；配置 `IOT_DLQ_ALERT_WEBHOOK` + `IOT_DLQ_ALERT_EGRESS_ALLOW` 后可投递飞书/钉钉机器人。**遗留**：对象存储原文、告警去重/升级策略和生产轮换自动化。|
-| P1 | 告警引擎补充项 | **五态 FSM + 去重/聚合/抑制 + PG `Store` + `svc-alarm` 服务（双通道 + 5s 扫描 + 至少一次发布）+ `svc-notify` 三通道通知均已完成**（见 §4 第 17、18、19、20 项）。**遗留**：未确认升级（30min 通知上级 / 2h P1 升级）、通知策略解析与模板渲染（需 `t_alarm_rule.notify`）、`dedup_key` 哈希分片、静默窗口的配置源、批量告警实体与通知合并路径 |
+| P1 | 告警引擎补充项 | **五态 FSM + 去重/聚合/抑制 + PG `Store` + `svc-alarm` 服务（双通道 + 5s 扫描 + 至少一次发布）+ `svc-notify` 三通道通知 + 未确认升级 + 人工确认 API 均已完成**（见 §4 第 17、18、19、20 项）。**遗留**：`dedup_key` 哈希分片、静默窗口的配置源、批量告警实体与通知合并路径 |
 | ~~P1~~ | ~~**「重启即重放」缺陷的另外 3 处**~~ | ✅ **已完成**（见 §4 第 21 项）：`svc-pipeline` / `svc-quota` / `internal/cluster` 统一走 `internal/natsjs`，且 `natsjs.Subscribe` 的返回值已收窄为不暴露 `Unsubscribe`（结构性防复发）。真 NATS 演练：`svc-quota` 的重启不再重复计数（对照实验复现了旧的 5→10） |
 | ~~P1~~ | ~~**流保留未设 `MaxAge`（`EnsureStream` 只建不校）**~~ | ✅ **已完成**（见 §4 第 22 项）：抽出 `natsjs.EnsureStream`（建或校 + WARN），`gateway` / `connector` / `svc-alarm` 三处统一；策略定为**自动校正 + 告警**，零值表示不约束，`svc-alarm` 的 subjects 仍保持严格。**遗留动作**：既存流要等**对应服务下次启动**才被校正，届时会删掉超期消息（`IOT_TELEMETRY` 当前 `max_age=0` / 57400 条） |
 | P1 | **流保留的手工校正（开发栈）** | 需在网关/连接器/告警服务下次启动时自动完成；若想立刻生效，需接受**删除超期消息**这一破坏性后果。`IOT_TELEMETRY` 的 `MaxMsgsPerSubject=1000` 还会把每个 subject 裁到 1000 条 |
@@ -496,4 +496,4 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 - 通知服务新增 `-policy-source db|file`，默认从 `t_alarm_rule.notify` 读取策略，并按角色展开用户邮箱。
 - 告警风暴升级现在发布 `iot.alarm.escalation.<project>` 事件，载荷含 `escalated=true`，不再只写日志。
 - 规则层新增内存滑动窗口聚合器，支持 `avg/max/min/count/last/p50`，窗口缓存不作为事实数据持久化。
-- 当前仍需外部配置/验收：真实飞书 Webhook、生产 Vault、mTLS、完整 Odoo 多模型字段映射和前端产品化页面。
+- 当前仍需外部配置/验收：生产 Vault、mTLS 设备证书生命周期、完整 Odoo 多模型字段映射和前端产品化页面；飞书通道代码已支持通过 `IOT_DLQ_ALERT_WEBHOOK` 或通知端点配置，真实 Webhook 联调需在不入库密钥的受控环境执行。

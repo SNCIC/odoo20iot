@@ -12,11 +12,9 @@ import (
 
 // filePolicySource 从配置文件读通知策略。
 //
-// ⚠️ **这是过渡实现**：正式实现要读 `t_alarm_rule.notify`（04 §2.4），
-// 并由 `t_user` / `t_role` 把通知组展开成收件人 —— 这几张表都还没建
-// （见 09 的遗留项）。之所以先做成配置文件：**「策略从哪来」与
-// 「怎么把通知可靠地送出去」是两件独立的事**，前者换了，分发逻辑一行都不用动；
-// 反之如果把表结构写进分发路径，等表建好时会连带改动重试与降级。
+// filePolicySource 保留为开发/联调时的文件策略源；生产默认使用
+// `t_alarm_rule.notify` 的数据库策略源，并由 `t_user` / `t_role` 展开通知组。
+// 两种策略源共享同一套可靠投递、重试和降级逻辑。
 type filePolicySource struct {
 	mu  sync.RWMutex
 	cfg policyFile
