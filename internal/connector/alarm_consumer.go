@@ -108,6 +108,9 @@ func (c *AlarmConsumer) handle(ctx context.Context, msg *nats.Msg) error {
 	if event.State != alarm.StateActive {
 		return nil
 	}
+	if strings.TrimSpace(event.AlarmID) == "" || strings.TrimSpace(event.DedupKey) == "" {
+		return fmt.Errorf("告警事件缺少 alarm_id 或 dedup_key")
+	}
 	projectID, err := strconv.ParseInt(event.ProjectID, 10, 64)
 	if err != nil || projectID <= 0 {
 		return fmt.Errorf("告警 project_id 非法: %q", event.ProjectID)
@@ -132,6 +135,15 @@ func (c *AlarmConsumer) handle(ctx context.Context, msg *nats.Msg) error {
 	if ref.Status != "active" || ref.ExtID <= 0 {
 		return nil
 	}
+	payload := AlarmMaintenancePayload(event, ref.ExtID)
+	var result map[string]any
+	if err := c.odoo.PostJSON(ctx, "/api/iot/v1/maintenance/request", payload, &result); err != nil {
+		return err
+	}
+	return nil
+}
+
+func AlarmMaintenancePayload(event alarm.Event, equipmentID int64) map[string]any {
 	severity := strings.ToLower(event.Level)
 	if severity == "warning" {
 		severity = "warn"
@@ -139,15 +151,19 @@ func (c *AlarmConsumer) handle(ctx context.Context, msg *nats.Msg) error {
 	if severity != "info" && severity != "warn" && severity != "critical" {
 		severity = "warn"
 	}
+	alarmTime := event.FirstTS
+	if alarmTime.IsZero() {
+		alarmTime = event.LastTS
+	}
 	payload := map[string]any{
-		"alarm_id": event.AlarmID, "equipment_id": ref.ExtID, "device_key": fmt.Sprintf("%d", deviceID),
-		"severity": severity, "title": event.RuleName, "description": event.Reason,
-		"metric_snapshot": json.RawMessage(event.MetricSnapshot), "alarm_ts": event.LastTS.UTC().Format("2006-01-02 15:04:05"),
-		"idempotency_key": fmt.Sprintf("idem:%s:maintenance_req:eq-%d-%s", event.ProjectID, ref.ExtID, event.DedupKey),
+		"alarm_id":        event.AlarmID,
+		"equipment_id":    equipmentID,
+		"severity":        severity,
+		"title":           event.RuleName,
+		"description":     event.Reason,
+		"metric_snapshot": json.RawMessage(event.MetricSnapshot),
+		"alarm_ts":        alarmTime.UTC().Format("2006-01-02 15:04:05"),
+		"idempotency_key": fmt.Sprintf("idem:%s:maintenance_req:eq-%d-%s", event.ProjectID, equipmentID, event.DedupKey),
 	}
-	var result map[string]any
-	if err := c.odoo.PostJSON(ctx, "/api/iot/v1/maintenance/request", payload, &result); err != nil {
-		return err
-	}
-	return nil
+	return payload
 }
