@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
@@ -44,8 +45,43 @@ func (s *Service) routes() http.Handler {
 	if s.deps.Endpoints != nil {
 		mux.Handle("/api/v1/notification-endpoints", auth(http.HandlerFunc(s.handleNotificationEndpoints)))
 	}
+	if s.deps.Alarms != nil {
+		mux.Handle("/api/v1/alarms/", auth(http.HandlerFunc(s.handleAlarmAction)))
+	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleAlarmAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || !strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/ack") {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 POST /api/v1/alarms/{id}/ack")
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if !id.Dev && !id.HasScope("alarm:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 alarm:write 权限")
+		return
+	}
+	path := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/alarms/"), "/ack")
+	path = strings.TrimSuffix(path, "/")
+	if path == "" || strings.Contains(path, "/") {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "告警 ID 非法")
+		return
+	}
+	if err := s.deps.Alarms.Acknowledge(r.Context(), id.ProjectID, path, id.ActorID, s.deps.Now()); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "告警不存在、已恢复或不属于本租户")
+			return
+		}
+		s.fail(w, "确认告警", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alarm_id": path, "acknowledged": true})
 }
 
 func (s *Service) handleSeriesMulti(w http.ResponseWriter, r *http.Request) {

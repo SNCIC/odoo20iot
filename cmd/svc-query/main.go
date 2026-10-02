@@ -1,7 +1,7 @@
-// Command svc-query 是 IoT 平台的**只读查询 API**（02 §4.3）。
+// Command svc-query 是 IoT 平台的查询与控制面 API（02 §4.3）。
 //
 // 职责边界：
-//   - 只读：时序走 `greptimedb.Store.QuerySeries`（受保护入口：行数上限 5000、自适应降采样、
+//   - 查询：时序走 `greptimedb.Store.QuerySeries`（受保护入口：行数上限 5000、自适应降采样、
 //     跨度路由到预聚合表），控制面走 `internal/catalog`；
 //   - 鉴权：JWT（05 §3.3，`internal/apiauth`）+ 可选的开发静态令牌；
 //   - 保护：每租户并发上限（默认 20）+ 有界排队、慢查询（>3s）指标与日志。
@@ -34,6 +34,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/SNCIC/odoo20iot/internal/alarm"
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
@@ -189,6 +190,10 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	alarmStore, err := alarm.NewPGStore(pool)
+	if err != nil {
+		return err
+	}
 	var endpointStore *notifyconfig.Store
 	if rawKey := os.Getenv("IOT_CONFIG_KEY"); rawKey != "" {
 		key, keyErr := secureconfig.NewKey(rawKey)
@@ -230,6 +235,7 @@ func run(cfg config) error {
 		Reader:    gres,
 		Latest:    latest.NewRedisStore(latestRedis),
 		Endpoints: endpointStore,
+		Alarms:    alarmStore,
 		Catalog:   store,
 		Verifier:  verifier,
 		Health: querysvc.Health{

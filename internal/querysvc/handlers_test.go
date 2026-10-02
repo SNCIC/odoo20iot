@@ -38,6 +38,17 @@ func (v identityVerifier) Verify(context.Context, string) (apiauth.Identity, err
 
 type fakeEndpointStore struct{}
 
+type fakeAlarmAcknowledger struct {
+	projectID int64
+	alarmID   string
+	actorID   string
+}
+
+func (f *fakeAlarmAcknowledger) Acknowledge(_ context.Context, projectID int64, alarmID, actorID string, _ time.Time) error {
+	f.projectID, f.alarmID, f.actorID = projectID, alarmID, actorID
+	return nil
+}
+
 func (fakeEndpointStore) List(context.Context, int64) ([]notifyconfig.Endpoint, error) {
 	return nil, nil
 }
@@ -223,6 +234,34 @@ func TestNotificationEndpointScopes(t *testing.T) {
 	svc.Handler().ServeHTTP(postRec, postReq)
 	if postRec.Code != http.StatusCreated {
 		t.Fatalf("notification:write 应允许 POST，得到 %d: %s", postRec.Code, postRec.Body.String())
+	}
+}
+
+func TestAlarmAcknowledgeRequiresScope(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	ack := new(fakeAlarmAcknowledger)
+	svc.deps.Alarms = ack
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, ActorID: "user-1", Scopes: []string{"telemetry:read"}}}
+	svc.mux = svc.routes()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/alarms/alarm-1/ack", nil)
+	req.Header.Set("Authorization", "Bearer scoped")
+	rec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("缺少 alarm:write 应拒绝，得到 %d", rec.Code)
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 7, ActorID: "user-2", Scopes: []string{"alarm:write"}}}
+	svc.mux = svc.routes()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/alarms/alarm-9/ack", nil)
+	req.Header.Set("Authorization", "Bearer scoped")
+	rec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alarm:write 应允许确认，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	if ack.projectID != 7 || ack.alarmID != "alarm-9" || ack.actorID != "user-2" {
+		t.Fatalf("确认参数不正确: %+v", ack)
 	}
 }
 

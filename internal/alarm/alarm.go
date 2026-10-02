@@ -99,6 +99,8 @@ type Alarm struct {
 	// NotifyCount 通知次数（聚合时累加，04 §2.2）。
 	NotifyCount     int
 	EscalationStage int
+	ConfirmedBy     string
+	AcknowledgedAt  time.Time
 	// FlapCount 抖动次数：resolved 期间再次触发。
 	FlapCount int
 

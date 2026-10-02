@@ -123,7 +123,7 @@ func (a *agent) escalateUnconfirmed(ctx context.Context) error {
 	}
 	now := a.now()
 	for _, current := range alarms {
-		if current == nil || current.NotifiedTS.IsZero() {
+		if current == nil || current.NotifiedTS.IsZero() || !current.AcknowledgedAt.IsZero() {
 			continue
 		}
 		stage := 0

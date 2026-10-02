@@ -58,7 +58,7 @@ func (m *MemStore) ClaimEscalation(_ context.Context, dedupKey string, stage int
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.byKey[dedupKey]
-	if !ok || a.State != StateActive || stage <= m.escalation[dedupKey] {
+	if !ok || a.State != StateActive || !a.AcknowledgedAt.IsZero() || stage <= m.escalation[dedupKey] {
 		return false, nil
 	}
 	m.escalation[dedupKey] = stage

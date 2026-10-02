@@ -132,6 +132,42 @@ func TestEscalateUnconfirmedClaimsStageAndPublishes(t *testing.T) {
 	}
 }
 
+func TestEscalateUnconfirmedSkipsAcknowledgedAlarm(t *testing.T) {
+	agent, pub, store := newFakeAgent()
+	current := sampleAlarm("alarm-ack", "dk-ack")
+	current.NotifiedTS = agent.now().Add(-3 * time.Hour)
+	current.AcknowledgedAt = agent.now().Add(-time.Hour)
+	store.pending = []*alarm.Alarm{current}
+	agent.notifyEscalationAfter = 30 * time.Minute
+	agent.p1EscalationAfter = 2 * time.Hour
+
+	if err := agent.escalateUnconfirmed(context.Background()); err != nil {
+		t.Fatalf("已确认告警扫描失败: %v", err)
+	}
+	if pub.count() != 0 {
+		t.Fatalf("已确认告警不应再次升级，得到 %d 条通知", pub.count())
+	}
+	if store.pending[0].EscalationStage != 0 {
+		t.Fatalf("已确认告警不应改变升级阶段，得到 %d", store.pending[0].EscalationStage)
+	}
+}
+
+func TestClaimEscalationSkipsAcknowledgedAlarm(t *testing.T) {
+	store := alarm.NewMemStore()
+	current := sampleAlarm("alarm-ack-race", "dk-ack-race")
+	current.AcknowledgedAt = time.Now()
+	if err := store.Update(context.Background(), current, alarm.StateIdle); err != nil {
+		t.Fatalf("写入测试告警失败: %v", err)
+	}
+	claimed, err := store.ClaimEscalation(context.Background(), current.DedupKey, 2)
+	if err != nil {
+		t.Fatalf("抢占升级失败: %v", err)
+	}
+	if claimed {
+		t.Fatal("已确认告警不应被抢占升级")
+	}
+}
+
 func sampleAlarm(id, dedup string) *alarm.Alarm {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	return &alarm.Alarm{

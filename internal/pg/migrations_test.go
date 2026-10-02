@@ -105,3 +105,27 @@ func TestAlarmEscalationMigrationAddsPersistentStage(t *testing.T) {
 		}
 	}
 }
+
+func TestAlarmAckMigrationAddsAuditAndActorFields(t *testing.T) {
+	migs, err := LoadMigrations()
+	if err != nil {
+		t.Fatalf("LoadMigrations: %v", err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.Version == "0016_alarm_ack" {
+			sql = m.SQL
+			break
+		}
+	}
+	for _, want := range []string{
+		"ADD COLUMN IF NOT EXISTS confirmed_by",
+		"ADD COLUMN IF NOT EXISTS acknowledged_at",
+		"CREATE TABLE IF NOT EXISTS t_audit_log",
+		"CREATE POLICY tenant_audit_log",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("0016 缺少确认审计语句 %q", want)
+		}
+	}
+}

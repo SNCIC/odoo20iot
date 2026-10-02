@@ -32,6 +32,10 @@ type NotificationEndpointStore interface {
 	Delete(context.Context, int64, int64) error
 }
 
+type AlarmAcknowledger interface {
+	Acknowledge(context.Context, int64, string, string, time.Time) error
+}
+
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
 type Health struct {
 	PingPG            func(context.Context) error
@@ -71,6 +75,7 @@ type Deps struct {
 	Reader      SeriesReader
 	Latest      LatestReader
 	Endpoints   NotificationEndpointStore
+	Alarms      AlarmAcknowledger
 	Catalog     catalog.Store
 	Verifier    apiauth.Verifier
 	Health      Health

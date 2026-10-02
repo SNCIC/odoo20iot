@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -40,7 +41,7 @@ func NewPGStore(pool *pgxpool.Pool) (*PGStore, error) {
 const alarmColumns = `dedup_key, id, project_id, device_id, device_type_id,
 	rule_id, rule_name, level, state, parent_id, timing,
 	first_ts, last_ts, state_ts, confirmed_ts, notified_ts, resolved_ts, closed_ts,
-	notify_count, escalation_stage, flap_count, suppressed, suppress_reason, batch_id, trigger_value, published_at`
+	notify_count, escalation_stage, confirmed_by, acknowledged_at, flap_count, suppressed, suppress_reason, batch_id, trigger_value, published_at`
 
 // timingJSON 是 timing 列的线上格式，用 04 §2.4 的字段名与秒为单位 ——
 // 运维会直接 `psql` 看这张表，存成 base64/二进制对排障毫无帮助。
@@ -154,7 +155,7 @@ func scanAlarm(row scanRow) (*Alarm, error) {
 		&a.DedupKey, &a.ID, &a.ProjectID, &a.DeviceID, &a.DeviceTypeID,
 		&a.RuleID, &a.RuleName, &a.Level, &a.State, &parentID, &timingRaw,
 		&a.FirstTS, &a.LastTS, &a.StateTS, &confirmedTS, &notifiedTS, &resolvedTS, &closedTS,
-		&a.NotifyCount, &a.EscalationStage, &a.FlapCount, &a.Suppressed, &a.SuppressReason, &a.BatchID,
+		&a.NotifyCount, &a.EscalationStage, &a.ConfirmedBy, &a.AcknowledgedAt, &a.FlapCount, &a.Suppressed, &a.SuppressReason, &a.BatchID,
 		&triggerRaw, &publishedTS,
 	); err != nil {
 		return nil, err
@@ -245,8 +246,8 @@ const insertAlarmSQL = `
 INSERT INTO t_alarm_active (
     dedup_key, project_id, device_id, device_type_id, rule_id, rule_name, level, state,
     parent_id, timing, first_ts, last_ts, state_ts, confirmed_ts, notified_ts, resolved_ts,
-    closed_ts, notify_count, escalation_stage, flap_count, suppressed, suppress_reason, batch_id, trigger_value, published_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+	closed_ts, notify_count, escalation_stage, confirmed_by, acknowledged_at, flap_count, suppressed, suppress_reason, batch_id, trigger_value, published_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
 RETURNING id`
 
 func (s *PGStore) insert(ctx context.Context, a *Alarm) error {
@@ -261,7 +262,7 @@ func (s *PGStore) insert(ctx context.Context, a *Alarm) error {
 		a.DedupKey, a.ProjectID, a.DeviceID, a.DeviceTypeID, a.RuleID, a.RuleName, a.Level, string(a.State),
 		nullText(a.ParentID), timing, a.FirstTS, a.LastTS, a.StateTS,
 		nullTime(a.ConfirmedTS), nullTime(a.NotifiedTS), nullTime(a.ResolvedTS), nullTime(a.ClosedTS),
-		a.NotifyCount, a.EscalationStage, a.FlapCount, a.Suppressed, a.SuppressReason, a.BatchID,
+		a.NotifyCount, a.EscalationStage, a.ConfirmedBy, nullTime(a.AcknowledgedAt), a.FlapCount, a.Suppressed, a.SuppressReason, a.BatchID,
 		string(normalizeValue(a.TriggerValue)), nullTime(a.PublishedAt),
 	).Scan(&id)
 	if err == nil {
@@ -280,7 +281,7 @@ UPDATE t_alarm_active SET
     last_ts = $7, state_ts = $8, confirmed_ts = $9, notified_ts = $10,
     resolved_ts = $11, closed_ts = $12, notify_count = $13, flap_count = $14,
     suppressed = $15, suppress_reason = $16, batch_id = $17, trigger_value = $18,
-    published_at = $19, escalation_stage = $20, updated_at = now()
+    published_at = $19, escalation_stage = $20, confirmed_by = $21, acknowledged_at = $22, updated_at = now()
 WHERE dedup_key = $1 AND state = $2`
 
 // casUpdate 只更新**会变**的字段。
@@ -294,7 +295,7 @@ func (s *PGStore) casUpdate(ctx context.Context, a *Alarm, expected State) error
 		a.LastTS, a.StateTS, nullTime(a.ConfirmedTS), nullTime(a.NotifiedTS),
 		nullTime(a.ResolvedTS), nullTime(a.ClosedTS), a.NotifyCount, a.FlapCount,
 		a.Suppressed, a.SuppressReason, a.BatchID, string(normalizeValue(a.TriggerValue)),
-		nullTime(a.PublishedAt), a.EscalationStage,
+		nullTime(a.PublishedAt), a.EscalationStage, a.ConfirmedBy, nullTime(a.AcknowledgedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("alarm: 更新告警 %s: %w", a.DedupKey, err)
@@ -345,11 +346,32 @@ func (s *PGStore) ClaimEscalation(ctx context.Context, dedupKey string, stage in
 	}
 	tag, err := s.pool.Exec(ctx, `
 UPDATE t_alarm_active SET escalation_stage=$2, updated_at=now()
-WHERE dedup_key=$1 AND state='active' AND escalation_stage < $2`, dedupKey, stage)
+WHERE dedup_key=$1 AND state='active' AND acknowledged_at IS NULL AND escalation_stage < $2`, dedupKey, stage)
 	if err != nil {
 		return false, fmt.Errorf("alarm: 抢占升级阶段 %s/%d: %w", dedupKey, stage, err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+// Acknowledge marks an active alarm as manually acknowledged and writes an audit row.
+func (s *PGStore) Acknowledge(ctx context.Context, projectID int64, alarmID, actorID string, at time.Time) error {
+	if projectID <= 0 || alarmID == "" || actorID == "" {
+		return fmt.Errorf("alarm: 确认参数非法")
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `UPDATE t_alarm_active SET confirmed_by=$2, acknowledged_at=$3, escalation_stage=2, updated_at=now() WHERE id=$1 AND project_id=$4 AND state='active'`, alarmID, actorID, at, fmt.Sprint(projectID))
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 0 {
+			return pgx.ErrNoRows
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO t_audit_log(project_id, action, actor_id, resource_type, resource_id, details) VALUES($1,$2,$3,$4,$5,$6)`, projectID, "alarm.ack", actorID, "alarm", alarmID, []byte(`{"source":"api"}`))
+		return err
+	})
 }
 
 // UnpublishedActive 返回「已进入 active 但事件尚未发布成功」的告警，供补发扫描使用。
