@@ -117,9 +117,25 @@ func (a *agent) escalateUnconfirmed(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	alarms, err := a.store.Active(ctx, alarm.StateActive)
-	if err != nil {
-		return fmt.Errorf("查询未确认告警: %w", err)
+	var alarms []*alarm.Alarm
+	if scoped, ok := a.store.(alarm.ScopedStore); ok {
+		projects, err := scoped.Projects(ctx)
+		if err != nil {
+			return fmt.Errorf("枚举升级租户: %w", err)
+		}
+		for _, projectID := range projects {
+			items, err := scoped.ActiveForProject(ctx, projectID, alarm.StateActive)
+			if err != nil {
+				return fmt.Errorf("查询租户 %s 未确认告警: %w", projectID, err)
+			}
+			alarms = append(alarms, items...)
+		}
+	} else {
+		var err error
+		alarms, err = a.store.Active(ctx, alarm.StateActive)
+		if err != nil {
+			return fmt.Errorf("查询未确认告警: %w", err)
+		}
 	}
 	now := a.now()
 	for _, current := range alarms {
@@ -135,7 +151,13 @@ func (a *agent) escalateUnconfirmed(ctx context.Context) error {
 		if stage == 0 {
 			continue
 		}
-		claimed, err := claimer.ClaimEscalation(ctx, current.DedupKey, stage)
+		var claimed bool
+		var err error
+		if scoped, ok := a.store.(alarm.ScopedStore); ok {
+			claimed, err = scoped.ClaimEscalationForProject(ctx, current.ProjectID, current.DedupKey, stage)
+		} else {
+			claimed, err = claimer.ClaimEscalation(ctx, current.DedupKey, stage)
+		}
 		if err != nil {
 			return err
 		}
@@ -210,12 +232,18 @@ func (a *agent) publishDecision(ctx context.Context, d alarm.Decision) bool {
 		return false
 	}
 
-	if err := a.store.MarkPublished(ctx, ev.DedupKey, a.now()); err != nil {
+	var markErr error
+	if scoped, ok := a.store.(alarm.ScopedStore); ok {
+		markErr = scoped.MarkPublishedForProject(ctx, ev.ProjectID, ev.DedupKey, a.now())
+	} else {
+		markErr = a.store.MarkPublished(ctx, ev.DedupKey, a.now())
+	}
+	if markErr != nil {
 		// 发布成功但标记失败 → 下一轮会**重复发布**。这是安全方向：
 		// 下游按 07 §6 S3 的幂等键与 10min 合并窗口去重。
 		// 反过来（先标记后发布）才会丢工单。
 		a.logger.Warn("事件已发布但标记失败，下轮将重复投递（下游幂等兜住）",
-			"alarm", ev.AlarmID, "error", err)
+			"alarm", ev.AlarmID, "error", markErr)
 	}
 
 	a.counts.Published.Add(1)
@@ -231,9 +259,25 @@ func (a *agent) publishDecision(ctx context.Context, d alarm.Decision) bool {
 // 这也正是 07 §6 S3 定义 `idem:{tenant}:maintenance_req:eq-{eq}-{alarm_dedup_key}`
 // 的原因 —— 幂等键不是预防性设计，而是为这一条路径存在的。
 func (a *agent) republish(ctx context.Context) error {
-	pending, err := a.store.UnpublishedActive(ctx)
-	if err != nil {
-		return fmt.Errorf("查询未发布的告警: %w", err)
+	var pending []*alarm.Alarm
+	if scoped, ok := a.store.(alarm.ScopedStore); ok {
+		projects, err := scoped.Projects(ctx)
+		if err != nil {
+			return fmt.Errorf("枚举补发租户: %w", err)
+		}
+		for _, projectID := range projects {
+			items, err := scoped.UnpublishedActiveForProject(ctx, projectID)
+			if err != nil {
+				return fmt.Errorf("查询租户 %s 未发布告警: %w", projectID, err)
+			}
+			pending = append(pending, items...)
+		}
+	} else {
+		var err error
+		pending, err = a.store.UnpublishedActive(ctx)
+		if err != nil {
+			return fmt.Errorf("查询未发布的告警: %w", err)
+		}
 	}
 	for _, al := range pending {
 		d := alarm.Decision{

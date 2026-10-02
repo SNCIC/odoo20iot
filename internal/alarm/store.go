@@ -32,6 +32,19 @@ type Store interface {
 	Active(ctx context.Context, states ...State) ([]*Alarm, error)
 }
 
+// ScopedStore is implemented by persistent stores whose database policy
+// requires an explicit tenant transaction.  The base Store interface remains
+// intentionally small for the in-memory state-machine tests.
+type ScopedStore interface {
+	Projects(ctx context.Context) ([]string, error)
+	GetForProject(ctx context.Context, projectID, dedupKey string) (*Alarm, error)
+	GetByIDForProject(ctx context.Context, projectID, id string) (*Alarm, error)
+	ActiveForProject(ctx context.Context, projectID string, states ...State) ([]*Alarm, error)
+	UnpublishedActiveForProject(ctx context.Context, projectID string) ([]*Alarm, error)
+	MarkPublishedForProject(ctx context.Context, projectID, dedupKey string, at time.Time) error
+	ClaimEscalationForProject(ctx context.Context, projectID, dedupKey string, stage int) (bool, error)
+}
+
 type EscalationClaimer interface {
 	ClaimEscalation(ctx context.Context, dedupKey string, stage int) (bool, error)
 }
@@ -75,6 +88,85 @@ func (m *MemStore) Get(_ context.Context, dedupKey string) (*Alarm, error) {
 		return nil, nil
 	}
 	return a.clone(), nil
+}
+
+func (m *MemStore) Projects(_ context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := make(map[string]struct{})
+	for _, a := range m.byKey {
+		seen[a.ProjectID] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for projectID := range seen {
+		out = append(out, projectID)
+	}
+	return out, nil
+}
+
+func (m *MemStore) GetForProject(ctx context.Context, projectID, dedupKey string) (*Alarm, error) {
+	a, err := m.Get(ctx, dedupKey)
+	if err != nil || a == nil || a.ProjectID != projectID {
+		return nil, err
+	}
+	return a, nil
+}
+
+func (m *MemStore) GetByIDForProject(ctx context.Context, projectID, id string) (*Alarm, error) {
+	a, err := m.GetByID(ctx, id)
+	if err != nil || a == nil || a.ProjectID != projectID {
+		return nil, err
+	}
+	return a, nil
+}
+
+func (m *MemStore) ActiveForProject(ctx context.Context, projectID string, states ...State) ([]*Alarm, error) {
+	items, err := m.Active(ctx, states...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Alarm, 0, len(items))
+	for _, a := range items {
+		if a.ProjectID == projectID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) UnpublishedActiveForProject(ctx context.Context, projectID string) ([]*Alarm, error) {
+	items, err := m.ActiveForProject(ctx, projectID, StateActive)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Alarm, 0, len(items))
+	for _, a := range items {
+		if a.PublishedAt.IsZero() {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) MarkPublishedForProject(ctx context.Context, projectID, dedupKey string, at time.Time) error {
+	a, err := m.GetForProject(ctx, projectID, dedupKey)
+	if err != nil || a == nil {
+		return err
+	}
+	a.PublishedAt = at
+	return m.Update(ctx, a, a.State)
+}
+
+func (m *MemStore) ClaimEscalationForProject(_ context.Context, projectID, dedupKey string, stage int) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.byKey[dedupKey]
+	if !ok || a.ProjectID != projectID || a.State != StateActive || !a.AcknowledgedAt.IsZero() || stage <= m.escalation[dedupKey] {
+		return false, nil
+	}
+	m.escalation[dedupKey] = stage
+	a.EscalationStage = stage
+	return true, nil
 }
 
 // GetByID 实现 Store。

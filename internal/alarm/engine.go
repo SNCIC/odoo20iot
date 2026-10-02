@@ -99,7 +99,7 @@ func (e *Engine) Observe(ctx context.Context, tr Trigger) (Decision, error) {
 	key := DedupKey(tr.ProjectID, tr.DeviceID, tr.RuleID)
 
 	for attempt := 0; ; attempt++ {
-		prev, err := e.store.Get(ctx, key)
+		prev, err := e.get(ctx, tr.ProjectID, key)
 		if err != nil {
 			return Decision{}, fmt.Errorf("读取告警 %s: %w", key, err)
 		}
@@ -213,7 +213,7 @@ func (e *Engine) Recover(ctx context.Context, projectID, deviceID, ruleID string
 	key := DedupKey(projectID, deviceID, ruleID)
 
 	for attempt := 0; ; attempt++ {
-		prev, err := e.store.Get(ctx, key)
+		prev, err := e.get(ctx, projectID, key)
 		if err != nil {
 			return Decision{}, fmt.Errorf("读取告警 %s: %w", key, err)
 		}
@@ -259,9 +259,25 @@ func (e *Engine) Recover(ctx context.Context, projectID, deviceID, ruleID string
 func (e *Engine) Tick(ctx context.Context) ([]Decision, error) {
 	at := e.now()
 
-	alarms, err := e.store.Active(ctx, StateDetected, StateConfirmed, StateResolved)
-	if err != nil {
-		return nil, fmt.Errorf("扫描活跃告警: %w", err)
+	var alarms []*Alarm
+	if scoped, ok := e.store.(ScopedStore); ok {
+		projects, err := scoped.Projects(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("枚举告警租户: %w", err)
+		}
+		for _, projectID := range projects {
+			items, err := scoped.ActiveForProject(ctx, projectID, StateDetected, StateConfirmed, StateResolved)
+			if err != nil {
+				return nil, fmt.Errorf("扫描租户 %s 活跃告警: %w", projectID, err)
+			}
+			alarms = append(alarms, items...)
+		}
+	} else {
+		var err error
+		alarms, err = e.store.Active(ctx, StateDetected, StateConfirmed, StateResolved)
+		if err != nil {
+			return nil, fmt.Errorf("扫描活跃告警: %w", err)
+		}
 	}
 
 	out := make([]Decision, 0, len(alarms))
@@ -370,7 +386,7 @@ func (e *Engine) suppression(ctx context.Context, a *Alarm, at time.Time) (strin
 	// 「活跃」含 detected —— 设备离线一旦被检出，其下指标告警就没有诊断价值了，
 	// 等它确认完再抑制已经晚了。
 	if a.ParentID != "" {
-		parent, err := e.store.GetByID(ctx, a.ParentID)
+		parent, err := e.getByID(ctx, a.ProjectID, a.ParentID)
 		if err != nil {
 			return "", fmt.Errorf("查询父告警 %s: %w", a.ParentID, err)
 		}
@@ -385,6 +401,20 @@ func (e *Engine) suppression(ctx context.Context, a *Alarm, at time.Time) (strin
 		return reasonStormHolding, nil
 	}
 	return "", nil
+}
+
+func (e *Engine) get(ctx context.Context, projectID, dedupKey string) (*Alarm, error) {
+	if scoped, ok := e.store.(ScopedStore); ok {
+		return scoped.GetForProject(ctx, projectID, dedupKey)
+	}
+	return e.store.Get(ctx, dedupKey)
+}
+
+func (e *Engine) getByID(ctx context.Context, projectID, id string) (*Alarm, error) {
+	if scoped, ok := e.store.(ScopedStore); ok {
+		return scoped.GetByIDForProject(ctx, projectID, id)
+	}
+	return e.store.GetByID(ctx, id)
 }
 
 // SuppressPrefix 取抑制原因的前缀（调用方可据此归类统计）。

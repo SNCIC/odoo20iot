@@ -26,6 +26,12 @@ type PGStore struct {
 	pool *pgxpool.Pool
 }
 
+type alarmDB interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
 var _ Store = (*PGStore)(nil)
 
 // NewPGStore 构造。
@@ -75,6 +81,92 @@ func (s *PGStore) Get(ctx context.Context, dedupKey string) (*Alarm, error) {
 		return nil, fmt.Errorf("alarm: 读取告警 %s: %w", dedupKey, err)
 	}
 	return a, nil
+}
+
+func (s *PGStore) Projects(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id::text FROM t_project WHERE deleted_at IS NULL ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("alarm: 枚举租户: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func (s *PGStore) GetForProject(ctx context.Context, projectID, dedupKey string) (*Alarm, error) {
+	var out *Alarm
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		a, err := scanAlarm(tx.QueryRow(ctx, `SELECT `+alarmColumns+` FROM t_alarm_active WHERE dedup_key = $1`, dedupKey))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		out = a
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("alarm: 读取告警 %s: %w", dedupKey, err)
+	}
+	return out, nil
+}
+
+func (s *PGStore) GetByIDForProject(ctx context.Context, projectID, id string) (*Alarm, error) {
+	if id == "" {
+		return nil, nil
+	}
+	var out *Alarm
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		a, err := scanAlarm(tx.QueryRow(ctx, `SELECT `+alarmColumns+` FROM t_alarm_active WHERE id = $1`, id))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		out = a
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("alarm: 按 id 读取告警 %s: %w", id, err)
+	}
+	return out, nil
+}
+
+func (s *PGStore) ActiveForProject(ctx context.Context, projectID string, states ...State) ([]*Alarm, error) {
+	var out []*Alarm
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		q := `SELECT ` + alarmColumns + ` FROM t_alarm_active`
+		var args []any
+		if len(states) > 0 {
+			ss := make([]string, len(states))
+			for i, st := range states {
+				ss[i] = string(st)
+			}
+			q += ` WHERE state = ANY($1)`
+			args = append(args, ss)
+		}
+		q += ` ORDER BY state_ts, dedup_key`
+		rows, err := tx.Query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			a, err := scanAlarm(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("alarm: 列举租户 %s 活跃告警: %w", projectID, err)
+	}
+	return out, nil
 }
 
 // GetByID 实现 Store（根因抑制要按父告警 id 反查，04 §2.2）。
@@ -233,13 +325,15 @@ func (s *PGStore) Update(ctx context.Context, a *Alarm, expected State) error {
 		// 从「无」到「无」：没有任何东西需要落库（调用方不该走到这，但不该炸）。
 		return nil
 	}
-	if a.State == StateIdle {
-		return s.delete(ctx, a, expected)
-	}
-	if expected == StateIdle {
-		return s.insert(ctx, a)
-	}
-	return s.casUpdate(ctx, a, expected)
+	return pg.WithProjectValueTx(ctx, s.pool, a.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		if a.State == StateIdle {
+			return s.deleteWith(ctx, tx, a, expected)
+		}
+		if expected == StateIdle {
+			return s.insertWith(ctx, tx, a)
+		}
+		return s.casUpdateWith(ctx, tx, a, expected)
+	})
 }
 
 const insertAlarmSQL = `
@@ -251,6 +345,10 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$
 RETURNING id`
 
 func (s *PGStore) insert(ctx context.Context, a *Alarm) error {
+	return s.insertWith(ctx, s.pool, a)
+}
+
+func (s *PGStore) insertWith(ctx context.Context, db alarmDB, a *Alarm) error {
 	timing, err := encodeTiming(a.Timing)
 	if err != nil {
 		return err
@@ -258,7 +356,7 @@ func (s *PGStore) insert(ctx context.Context, a *Alarm) error {
 	// id 让数据库生成并回传（DEFAULT nextval），而不是在 Go 侧造 ——
 	// 两个实例各自造 id 的冲突只能靠唯一约束事后发现。
 	var id string
-	err = s.pool.QueryRow(ctx, insertAlarmSQL,
+	err = db.QueryRow(ctx, insertAlarmSQL,
 		a.DedupKey, a.ProjectID, a.DeviceID, a.DeviceTypeID, a.RuleID, a.RuleName, a.Level, string(a.State),
 		nullText(a.ParentID), timing, a.FirstTS, a.LastTS, a.StateTS,
 		nullTime(a.ConfirmedTS), nullTime(a.NotifiedTS), nullTime(a.ResolvedTS), nullTime(a.ClosedTS),
@@ -290,7 +388,11 @@ WHERE dedup_key = $1 AND state = $2`
 // 一旦被写脏，告警会在无人察觉的情况下「改挂到另一台设备上」，
 // 而那比状态推进失败要难查得多。
 func (s *PGStore) casUpdate(ctx context.Context, a *Alarm, expected State) error {
-	tag, err := s.pool.Exec(ctx, casUpdateAlarmSQL,
+	return s.casUpdateWith(ctx, s.pool, a, expected)
+}
+
+func (s *PGStore) casUpdateWith(ctx context.Context, db alarmDB, a *Alarm, expected State) error {
+	tag, err := db.Exec(ctx, casUpdateAlarmSQL,
 		a.DedupKey, string(expected), string(a.State), a.Level, nullText(a.ParentID), a.RuleName,
 		a.LastTS, a.StateTS, nullTime(a.ConfirmedTS), nullTime(a.NotifiedTS),
 		nullTime(a.ResolvedTS), nullTime(a.ClosedTS), a.NotifyCount, a.FlapCount,
@@ -307,7 +409,11 @@ func (s *PGStore) casUpdate(ctx context.Context, a *Alarm, expected State) error
 }
 
 func (s *PGStore) delete(ctx context.Context, a *Alarm, expected State) error {
-	tag, err := s.pool.Exec(ctx,
+	return s.deleteWith(ctx, s.pool, a, expected)
+}
+
+func (s *PGStore) deleteWith(ctx context.Context, db alarmDB, a *Alarm, expected State) error {
+	tag, err := db.Exec(ctx,
 		`DELETE FROM t_alarm_active WHERE dedup_key = $1 AND state = $2`,
 		a.DedupKey, string(expected))
 	if err != nil {
@@ -340,6 +446,16 @@ func (s *PGStore) MarkPublished(ctx context.Context, dedupKey string, at time.Ti
 	return nil
 }
 
+func (s *PGStore) MarkPublishedForProject(ctx context.Context, projectID, dedupKey string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE t_alarm_active SET published_at = $2, updated_at = now() WHERE dedup_key = $1`, dedupKey, at)
+		return err
+	})
+}
+
 func (s *PGStore) ClaimEscalation(ctx context.Context, dedupKey string, stage int) (bool, error) {
 	if stage < 1 || stage > 2 {
 		return false, fmt.Errorf("alarm: 升级阶段必须为 1 或 2")
@@ -351,6 +467,21 @@ WHERE dedup_key=$1 AND state='active' AND acknowledged_at IS NULL AND escalation
 		return false, fmt.Errorf("alarm: 抢占升级阶段 %s/%d: %w", dedupKey, stage, err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+func (s *PGStore) ClaimEscalationForProject(ctx context.Context, projectID, dedupKey string, stage int) (bool, error) {
+	if stage < 1 || stage > 2 {
+		return false, fmt.Errorf("alarm: 升级阶段必须为 1 或 2")
+	}
+	var claimed bool
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE t_alarm_active SET escalation_stage=$2, updated_at=now() WHERE dedup_key=$1 AND state='active' AND acknowledged_at IS NULL AND escalation_stage < $2`, dedupKey, stage)
+		if err == nil {
+			claimed = tag.RowsAffected() == 1
+		}
+		return err
+	})
+	return claimed, err
 }
 
 // Acknowledge marks an active alarm as manually acknowledged and writes an audit row.
@@ -400,4 +531,24 @@ func (s *PGStore) UnpublishedActive(ctx context.Context) ([]*Alarm, error) {
 		return nil, fmt.Errorf("alarm: 遍历未发布告警: %w", err)
 	}
 	return out, nil
+}
+
+func (s *PGStore) UnpublishedActiveForProject(ctx context.Context, projectID string) ([]*Alarm, error) {
+	var out []*Alarm
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT `+alarmColumns+` FROM t_alarm_active WHERE state = 'active' AND published_at IS NULL ORDER BY state_ts, dedup_key`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			a, err := scanAlarm(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	return out, err
 }
