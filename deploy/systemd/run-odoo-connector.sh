@@ -17,5 +17,6 @@ exec /home/xfusion/projects/odoo20iot/bin/odoo-connector \
   -http-addr "${ODOO_CONNECTOR_HTTP_ADDR:-127.0.0.1:18091}" \
   -reconcile-models "${ODOO_RECONCILE_MODELS:-}" \
   -masterdata-model "${ODOO_MASTERDATA_MODEL:-}" \
+  -dlq-object-dir "${IOT_DLQ_OBJECT_DIR:-}" \
   -alarm-to-odoo="${ODOO_ALARM_TO_ODOO:-true}" \
   -log-format "${IOT_LOG_FORMAT:-json}"
