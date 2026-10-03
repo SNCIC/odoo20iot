@@ -186,6 +186,31 @@ func TestHandlers_Devices(t *testing.T) {
 	}
 }
 
+func TestReadEndpointsRequireScopes(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"device:read"}}}
+	svc.mux = svc.routes()
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{path: "/api/v1/devices", want: http.StatusOK},
+		{path: "/api/v1/series?metric=temp", want: http.StatusForbidden},
+	} {
+		rec := get(t, svc.Handler(), tc.path, "scoped")
+		if rec.Code != tc.want {
+			t.Fatalf("%s 期望 %d，得到 %d: %s", tc.path, tc.want, rec.Code, rec.Body.String())
+		}
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"telemetry:read"}}}
+	svc.mux = svc.routes()
+	if rec := get(t, svc.Handler(), "/api/v1/series?metric=temp", "scoped"); rec.Code == http.StatusForbidden {
+		t.Fatalf("telemetry:read 不应被拒绝: %s", rec.Body.String())
+	}
+}
+
 func TestHandlers_TenantParamRejected(t *testing.T) {
 	svc, _ := newTestService(t, &fakeReader{}, nil)
 	h := svc.Handler()

@@ -35,12 +35,12 @@ func (s *Service) routes() http.Handler {
 		Metrics:  s.deps.AuthMetrics,
 		Logger:   s.deps.Logger,
 	})
-	mux.Handle("/api/v1/devices", auth(http.HandlerFunc(s.handleDevices)))
-	mux.Handle("/api/v1/series", auth(http.HandlerFunc(s.handleSeries)))
-	mux.Handle("/api/v1/series/multi", auth(http.HandlerFunc(s.handleSeriesMulti)))
-	mux.Handle("/api/v1/export", auth(http.HandlerFunc(s.handleExport)))
+	mux.Handle("/api/v1/devices", requireScope(auth, "device:read", http.HandlerFunc(s.handleDevices)))
+	mux.Handle("/api/v1/series", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleSeries)))
+	mux.Handle("/api/v1/series/multi", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleSeriesMulti)))
+	mux.Handle("/api/v1/export", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleExport)))
 	if s.deps.Latest != nil {
-		mux.Handle("/api/v1/latest", auth(http.HandlerFunc(s.handleLatest)))
+		mux.Handle("/api/v1/latest", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleLatest)))
 	}
 	if s.deps.Endpoints != nil {
 		mux.Handle("/api/v1/notification-endpoints", auth(http.HandlerFunc(s.handleNotificationEndpoints)))
@@ -50,6 +50,21 @@ func (s *Service) routes() http.Handler {
 	}
 
 	return securityHeaders(mux)
+}
+
+func requireScope(auth func(http.Handler) http.Handler, scope string, next http.Handler) http.Handler {
+	return auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, ok := apiauth.IdentityFrom(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+			return
+		}
+		if !id.Dev && !id.HasScope(scope) {
+			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 "+scope+" 权限")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
 }
 
 func (s *Service) handleAlarmAction(w http.ResponseWriter, r *http.Request) {
