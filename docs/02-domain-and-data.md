@@ -515,6 +515,7 @@ make b1-bench        # → cmd/tsdb-bench，报告写到 tmp/b1-report.md
 --    不加引号建表直接失败（Cannot use keyword 'metrics' as column name）。
 CREATE TABLE IF NOT EXISTS telemetry (
   ts              TIMESTAMP TIME INDEX,
+  seq             BIGINT,
   project_id      BIGINT,
   device_id       BIGINT,
   device_type_id  BIGINT,
@@ -524,10 +525,10 @@ CREATE TABLE IF NOT EXISTS telemetry (
 WITH ('ttl' = '365d', 'append_mode' = 'true');
 
 -- 写入（多值批量，必须攒批）
-INSERT INTO telemetry (ts, project_id, device_id, device_type_id, "metrics")
+INSERT INTO telemetry (ts, seq, project_id, device_id, device_type_id, "metrics")
 VALUES
-  ('2026-10-01T08:12:33.421Z', 10231, 100234, 55, '{"temperature":25.3,"humidity":62.1}'),
-  ('2026-10-01T08:12:34.421Z', 10231, 100234, 55, '{"temperature":25.4,"humidity":62.0}');
+  ('2026-10-01T08:12:33.421Z', 1, 10231, 100234, 55, '{"temperature":25.3,"humidity":62.1}'),
+  ('2026-10-01T08:12:34.421Z', 2, 10231, 100234, 55, '{"temperature":25.4,"humidity":62.0}');
 ```
 
 > **JSON 列的传参约束（实测，见 §4.1.1）**：在 PostgreSQL wire protocol 下，GreptimeDB 把
@@ -783,4 +784,3 @@ CREATE TABLE IF NOT EXISTS telemetry_1m (
 `6h–30d` 走 1m 表，`> 30d` 走 1h 表；**仅 JSON 方案路由**（宽表聚合已达标，恒走原始表）。
 预聚合表与原始表**列结构不同**（前者是聚合值、后者是 JSON），差异全部封在适配层，业务侧无感。
 跨桶再聚合公式：`avg = SUM("sum") / NULLIF(SUM("count"), 0)`、`max = MAX("max")`、`count = SUM("count")`。
-

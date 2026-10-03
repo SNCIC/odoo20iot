@@ -86,6 +86,7 @@ func (p *Parser) Parse(env envelope.Envelope) (Record, error) {
 	return Record{
 		Row: tsdb.Row{
 			TS:           ts,
+			Seq:          body.Seq,
 			ProjectID:    env.ProjectID,
 			DeviceID:     env.DeviceID,
 			DeviceTypeID: env.DeviceTypeID,

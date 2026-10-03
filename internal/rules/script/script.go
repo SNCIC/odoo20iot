@@ -23,17 +23,23 @@ type Config struct {
 }
 
 type Input struct {
-	Msg   map[string]any
-	Meta  map[string]any
-	Prev  map[string]any
-	State map[string]any
+	Msg          map[string]any
+	Meta         map[string]any
+	Prev         map[string]any
+	State        map[string]any
+	Capabilities []string
 }
 
 type Engine struct{ cfg Config }
 
+type EmitFunc func(context.Context, string, any) error
+
 // Action 是 DAG 注册表可直接使用的 script.run 动作适配器。
 // 参数约定：source 为脚本正文，msg/meta/prev/state 为可选输入映射。
-type Action struct{ Engine *Engine }
+type Action struct {
+	Engine *Engine
+	Emit   EmitFunc
+}
 
 func (Action) Name() string     { return "script.run" }
 func (Action) Idempotent() bool { return false }
@@ -46,17 +52,32 @@ func (a Action) Do(ctx context.Context, params map[string]any) error {
 	if !ok {
 		return fmt.Errorf("rules: script.run 缺少 source")
 	}
-	value, err := a.Engine.Run(ctx, source, Input{
-		Msg:   mapParam(params, "msg"),
-		Meta:  mapParam(params, "meta"),
-		Prev:  mapParam(params, "prev"),
-		State: mapParam(params, "state"),
+	_, err := a.Engine.run(ctx, source, Input{
+		Msg:          mapParam(params, "msg"),
+		Meta:         mapParam(params, "meta"),
+		Prev:         mapParam(params, "prev"),
+		State:        mapParam(params, "state"),
+		Capabilities: stringSliceParam(params, "capabilities"),
+	}, func(ctx context.Context, kind string, value any) error {
+		if kind != "alarm" {
+			return fmt.Errorf("rules: emit 类型 %q 未实现", kind)
+		}
+		payload, ok := value.(map[string]any)
+		if !ok {
+			return fmt.Errorf("rules: emit alarm payload 必须是对象")
+		}
+		for _, key := range []string{"project_id", "device_id", "device_type_id", "rule_id", "rule_name"} {
+			if trusted, exists := params[key]; exists {
+				payload[key] = trusted
+			}
+		}
+		if a.Emit == nil {
+			return fmt.Errorf("rules: emit alarm 未配置输出处理器")
+		}
+		return a.Emit(ctx, kind, payload)
 	})
 	if err != nil {
 		return err
-	}
-	if value == nil {
-		return nil
 	}
 	return nil
 }
@@ -66,9 +87,24 @@ func mapParam(params map[string]any, key string) map[string]any {
 	return value
 }
 
+func stringSliceParam(params map[string]any, key string) []string {
+	var values []string
+	switch raw := params[key].(type) {
+	case []string:
+		return append(values, raw...)
+	case []any:
+		for _, item := range raw {
+			if value, ok := item.(string); ok {
+				values = append(values, value)
+			}
+		}
+	}
+	return values
+}
+
 func New(cfg Config) (*Engine, error) {
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 100 * time.Millisecond
+		cfg.Timeout = 50 * time.Millisecond
 	}
 	if cfg.MaxSourceLen <= 0 {
 		cfg.MaxSourceLen = 32 * 1024
@@ -80,6 +116,10 @@ func New(cfg Config) (*Engine, error) {
 }
 
 func (e *Engine) Run(ctx context.Context, source string, in Input) (any, error) {
+	return e.run(ctx, source, in, nil)
+}
+
+func (e *Engine) run(ctx context.Context, source string, in Input, emitter EmitFunc) (any, error) {
 	if !e.cfg.Enabled {
 		return nil, ErrDisabled
 	}
@@ -88,6 +128,9 @@ func (e *Engine) Run(ctx context.Context, source string, in Input) (any, error) 
 	}
 	if len(source) > e.cfg.MaxSourceLen {
 		return nil, fmt.Errorf("rules: script 超过 %d 字节", e.cfg.MaxSourceLen)
+	}
+	if err := validateCapabilities(in.Capabilities); err != nil {
+		return nil, err
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -105,7 +148,27 @@ func (e *Engine) Run(ctx context.Context, source string, in Input) (any, error) 
 	if err := vm.Set("prev", in.Prev); err != nil {
 		return nil, err
 	}
-	if err := vm.Set("state", in.State); err != nil {
+	state := in.State
+	if state == nil {
+		state = map[string]any{}
+	}
+	if hasCapability(in.Capabilities, "state") {
+		stateObject := vm.NewObject()
+		for key, value := range state {
+			if err := stateObject.Set(key, value); err != nil {
+				return nil, err
+			}
+		}
+		if err := stateObject.Set("get", func(key string) any { return state[key] }); err != nil {
+			return nil, err
+		}
+		if err := stateObject.Set("set", func(key string, value any) { state[key] = value }); err != nil {
+			return nil, err
+		}
+		if err := vm.Set("state", stateObject); err != nil {
+			return nil, err
+		}
+	} else if err := vm.Set("state", state); err != nil {
 		return nil, err
 	}
 	// L3 只允许纯计算：关闭动态代码执行入口；网络、文件和 Go 对象
@@ -114,6 +177,33 @@ func (e *Engine) Run(ctx context.Context, source string, in Input) (any, error) 
 		return nil, err
 	}
 	if err := vm.Set("Function", nil); err != nil {
+		return nil, err
+	}
+	if err := vm.Set("emit", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) != 2 {
+			panic(vm.NewGoError(fmt.Errorf("rules: emit 需要 kind 和 payload 两个参数")))
+		}
+		kindValue, ok := call.Argument(0).Export().(string)
+		if !ok || kindValue == "" {
+			panic(vm.NewGoError(fmt.Errorf("rules: emit kind 必须是非空字符串")))
+		}
+		kind := kindValue
+		capability := "emit:" + kind
+		if !hasCapability(in.Capabilities, capability) {
+			panic(vm.NewGoError(fmt.Errorf("rules: emit %q 未声明 capability %q", kind, capability)))
+		}
+		if emitter == nil {
+			panic(vm.NewGoError(fmt.Errorf("rules: emit %q 未配置输出处理器", kind)))
+		}
+		payload := call.Argument(1).Export()
+		if _, ok := payload.(map[string]any); !ok {
+			panic(vm.NewGoError(fmt.Errorf("rules: emit payload 必须是对象")))
+		}
+		if err := emitter(ctx, kind, payload); err != nil {
+			panic(vm.NewGoError(err))
+		}
+		return goja.Undefined()
+	}); err != nil {
 		return nil, err
 	}
 
@@ -138,4 +228,22 @@ func (e *Engine) Run(ctx context.Context, source string, in Input) (any, error) 
 		return nil, fmt.Errorf("rules: script 执行超时或取消: %w", ctx.Err())
 	}
 	return value.Export(), nil
+}
+
+func validateCapabilities(capabilities []string) error {
+	for _, capability := range capabilities {
+		if capability != "script.run" && capability != "state" && capability != "emit:alarm" {
+			return fmt.Errorf("rules: script capability %q 未允许", capability)
+		}
+	}
+	return nil
+}
+
+func hasCapability(capabilities []string, target string) bool {
+	for _, capability := range capabilities {
+		if capability == target {
+			return true
+		}
+	}
+	return false
 }

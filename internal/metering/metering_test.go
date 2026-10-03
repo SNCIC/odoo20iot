@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -144,6 +145,24 @@ func TestReporter_FailedReportIsRetriedWithStableReportID(t *testing.T) {
 	}
 	if pub.count() != 1 || pub.reports[0].Counters[MetricMsgCount] != 50 {
 		t.Fatalf("重试批次内容不符: %+v", pub.reports)
+	}
+}
+
+func TestReporter_PendingQueueIsBounded(t *testing.T) {
+	a := NewAccumulator()
+	pub := &fakePublisher{err: errors.New("offline")}
+	r, err := NewReporter(ReporterOptions{Accumulator: a, Publisher: pub, Logger: testLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < MaxPendingReports+1; i++ {
+		r.deferReport(UsageReport{ProjectID: int64(i + 1), ReportID: fmt.Sprintf("r-%d", i)})
+	}
+	if got := r.Metrics().PendingReports.Load(); got != MaxPendingReports {
+		t.Fatalf("pending reports=%d, want %d", got, MaxPendingReports)
+	}
+	if got := r.Metrics().PendingOverflow.Load(); got != 1 {
+		t.Fatalf("pending overflow=%d, want 1", got)
 	}
 }
 

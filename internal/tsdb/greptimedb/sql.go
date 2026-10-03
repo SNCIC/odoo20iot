@@ -26,6 +26,7 @@ import (
 // 不加引号会报 `Cannot use keyword 'metrics' as column name`。
 const createJSONTable = `CREATE TABLE IF NOT EXISTS ` + tsdb.PlanJSONTable + ` (
   ts              TIMESTAMP TIME INDEX,
+  seq             BIGINT,
   project_id      BIGINT,
   device_id       BIGINT,
   device_type_id  BIGINT,
@@ -48,6 +49,7 @@ func createWideTable() (string, error) {
 
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
   ts              TIMESTAMP TIME INDEX,
+  seq             BIGINT,
   project_id      BIGINT,
   device_id       BIGINT,
 %s,
@@ -211,9 +213,9 @@ func wideColumnType(m tsdb.Metric) (string, error) {
 func columns(p tsdb.Plan) ([]string, error) {
 	switch p {
 	case tsdb.PlanJSON:
-		return []string{"ts", "project_id", "device_id", "device_type_id", `"metrics"`}, nil
+		return []string{"ts", "seq", "project_id", "device_id", "device_type_id", `"metrics"`}, nil
 	case tsdb.PlanWide:
-		cols := []string{"ts", "project_id", "device_id"}
+		cols := []string{"ts", "seq", "project_id", "device_id"}
 		for _, m := range tsdb.BenchMetrics {
 			if _, err := wideColumnType(m); err != nil {
 				return nil, err

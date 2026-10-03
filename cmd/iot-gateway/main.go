@@ -447,6 +447,7 @@ func metricsHandler(m *gateway.Metrics, meter *metering.Metrics) http.HandlerFun
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		m.WriteProm(w)
 		_, _ = fmt.Fprintf(w, "# HELP meter_pending_reports 当前待重试的计量批次数\n# TYPE meter_pending_reports gauge\nmeter_pending_reports %d\n", meter.PendingReports.Load())
+		_, _ = fmt.Fprintf(w, "# HELP meter_pending_overflow_total 因重试队列上限拒绝的计量批次数\n# TYPE meter_pending_overflow_total counter\nmeter_pending_overflow_total %d\n", meter.PendingOverflow.Load())
 	}
 }
 

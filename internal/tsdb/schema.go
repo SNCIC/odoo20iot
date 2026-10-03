@@ -162,6 +162,7 @@ func Null() Value { return Value{Null: true} }
 // Row 是一次设备上报展开后的时序行：一个时间戳 + 一组指标值。
 type Row struct {
 	TS           time.Time
+	Seq          int64
 	ProjectID    int64
 	DeviceID     int64
 	DeviceTypeID int64

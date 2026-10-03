@@ -57,20 +57,20 @@ func TestCreateWideTableSQL(t *testing.T) {
 // TestInsertSQL_BindParamLimit 校验绑定参数上限保护：
 // PostgreSQL 协议单语句 65535 个参数，超限必须**提前报错**而不是让服务端拒绝。
 func TestInsertSQL_BindParamLimit(t *testing.T) {
-	// A 方案 5 列 → 上限 13107 行
-	if _, err := insertSQL(tsdb.PlanJSON, 13107); err != nil {
-		t.Fatalf("13107 行应在上限内: %v", err)
+	// A 方案 6 列 → 上限 10922 行
+	if _, err := insertSQL(tsdb.PlanJSON, 10922); err != nil {
+		t.Fatalf("10922 行应在上限内: %v", err)
 	}
-	if _, err := insertSQL(tsdb.PlanJSON, 13108); err == nil {
-		t.Fatal("13108 行应超限报错")
+	if _, err := insertSQL(tsdb.PlanJSON, 10923); err == nil {
+		t.Fatal("10923 行应超限报错")
 	}
 
-	// B 方案 8 列 → 上限 8191 行
-	if _, err := insertSQL(tsdb.PlanWide, 8191); err != nil {
-		t.Fatalf("8191 行应在上限内: %v", err)
+	// B 方案 9 列 → 上限 7281 行
+	if _, err := insertSQL(tsdb.PlanWide, 7281); err != nil {
+		t.Fatalf("7281 行应在上限内: %v", err)
 	}
-	if _, err := insertSQL(tsdb.PlanWide, 8192); err == nil {
-		t.Fatal("8192 行应超限报错")
+	if _, err := insertSQL(tsdb.PlanWide, 7282); err == nil {
+		t.Fatal("7282 行应超限报错")
 	}
 }
 

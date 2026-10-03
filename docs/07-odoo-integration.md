@@ -462,7 +462,7 @@ UNIQUE(company_id, integration_name, idempotency_key)
 | 项 | 取值 |
 |---|---|
 | 路径 | `POST /webhook/odoo` |
-| 鉴权 | `Authorization: Bearer <token>`，**未配置令牌则整个入口不注册**（匿名可写总线的端点比没有更危险） |
+| 鉴权 | 过渡期支持 `Authorization: Bearer <token>`；生产推荐 `X-IoT-Timestamp` + `X-IoT-Signature: sha256=<hex>`，签名为 `HMAC-SHA256(secret, timestamp + "\\n" + body)`，时间戳窗口 ±5 分钟；两者均未配置则入口不注册 |
 | 请求体 | `{model, id, write_date, company_id, data}`；`data` 原样进事件载荷；上限 **1 MiB** |
 | 去重 | 按 `(model, id, write_date)`（§4.4 口径），窗口 1 小时；**去重器故障时放行**（重复比丢失轻，下游按 `event_id` 还能去） |
 | event_id | `c2:{model}:{id}:{write_date}` |

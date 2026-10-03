@@ -1,12 +1,15 @@
 package connector
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -46,10 +49,12 @@ type WebhookOptions struct {
 	//
 	// **为空则整个入口禁用**：一个「匿名可往总线上写事件」的端点，
 	// 比没有这个端点危险得多（任何人可伪造 Odoo 事件驱动下游动作）。
-	Token   string
-	Metrics *Metrics
-	Logger  *slog.Logger
-	Now     func() time.Time
+	Token      string
+	HMACSecret string
+	HMACWindow time.Duration
+	Metrics    *Metrics
+	Logger     *slog.Logger
+	Now        func() time.Time
 }
 
 // Webhook 是 07 §4.4 的 C-2 入口：Odoo postcommit → 本入口 → NATS。
@@ -62,6 +67,8 @@ type Webhook struct {
 	dedup      Deduper
 	watermarks Watermarks
 	token      string
+	hmacSecret []byte
+	hmacWindow time.Duration
 	metrics    *Metrics
 	logger     *slog.Logger
 	now        func() time.Time
@@ -75,13 +82,17 @@ func NewWebhook(opts WebhookOptions) (*Webhook, error) {
 		return nil, fmt.Errorf("connector: webhook 需要 Publisher")
 	}
 	if opts.Token == "" {
-		return nil, fmt.Errorf("connector: webhook 需要 Token（留空即禁用该入口）")
+		if opts.HMACSecret == "" {
+			return nil, fmt.Errorf("connector: webhook 需要 Token 或 HMACSecret（均为空即禁用该入口）")
+		}
 	}
 	w := &Webhook{
 		pub:        opts.Publisher,
 		dedup:      opts.Deduper,
 		watermarks: opts.Watermarks,
 		token:      opts.Token,
+		hmacSecret: []byte(opts.HMACSecret),
+		hmacWindow: opts.HMACWindow,
 		metrics:    opts.Metrics,
 		logger:     opts.Logger,
 		now:        opts.Now,
@@ -95,6 +106,9 @@ func NewWebhook(opts WebhookOptions) (*Webhook, error) {
 	if w.now == nil {
 		w.now = time.Now
 	}
+	if w.hmacWindow <= 0 {
+		w.hmacWindow = 5 * time.Minute
+	}
 	return w, nil
 }
 
@@ -106,11 +120,6 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		w.reject(rw, http.StatusMethodNotAllowed, "只接受 POST")
 		return
 	}
-	if !w.authorized(r) {
-		w.reject(rw, http.StatusUnauthorized, "令牌无效")
-		return
-	}
-
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxWebhookBody+1))
 	if err != nil {
 		w.reject(rw, http.StatusBadRequest, "读取请求体失败")
@@ -118,6 +127,10 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 	if len(body) > MaxWebhookBody {
 		w.reject(rw, http.StatusRequestEntityTooLarge, "请求体过大")
+		return
+	}
+	if !w.authorized(r, body) {
+		w.reject(rw, http.StatusUnauthorized, "令牌无效")
 		return
 	}
 
@@ -215,7 +228,13 @@ func (w *Webhook) advanceWatermark(r *http.Request, req webhookRequest, occurred
 }
 
 // authorized 用常数时间比较 Bearer 令牌，避免时序侧信道逐字符猜出令牌。
-func (w *Webhook) authorized(r *http.Request) bool {
+func (w *Webhook) authorized(r *http.Request, body []byte) bool {
+	if w.authorizedHMAC(r, body) {
+		return true
+	}
+	if w.token == "" {
+		return false
+	}
 	raw := r.Header.Get("Authorization")
 	const prefix = "Bearer "
 	if !strings.HasPrefix(raw, prefix) {
@@ -223,6 +242,30 @@ func (w *Webhook) authorized(r *http.Request) bool {
 	}
 	got := strings.TrimSpace(strings.TrimPrefix(raw, prefix))
 	return subtle.ConstantTimeCompare([]byte(got), []byte(w.token)) == 1
+}
+
+func (w *Webhook) authorizedHMAC(r *http.Request, body []byte) bool {
+	if len(w.hmacSecret) == 0 {
+		return false
+	}
+	rawTS := strings.TrimSpace(r.Header.Get("X-IoT-Timestamp"))
+	unix, err := strconv.ParseInt(rawTS, 10, 64)
+	if err != nil || unix <= 0 {
+		return false
+	}
+	if delta := time.Duration(w.now().Unix()-unix) * time.Second; delta > w.hmacWindow || delta < -w.hmacWindow {
+		return false
+	}
+	got := strings.TrimSpace(r.Header.Get("X-IoT-Signature"))
+	if strings.HasPrefix(got, "sha256=") {
+		got = strings.TrimPrefix(got, "sha256=")
+	}
+	mac := hmac.New(sha256.New, w.hmacSecret)
+	_, _ = mac.Write([]byte(rawTS))
+	_, _ = mac.Write([]byte("\n"))
+	_, _ = mac.Write(body)
+	expected := fmt.Sprintf("%x", mac.Sum(nil))
+	return len(got) == len(expected) && subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 
 func (w *Webhook) reject(rw http.ResponseWriter, status int, msg string) {

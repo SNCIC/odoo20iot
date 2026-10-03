@@ -78,7 +78,7 @@ type config struct {
 	consumerGroup string
 	outboxBatch   int
 
-	webhookToken string
+	webhookToken, webhookHMACSecret string
 
 	reconcileModels       string
 	reconcileInterval     time.Duration
@@ -130,7 +130,9 @@ func parseFlags() config {
 	flag.IntVar(&cfg.outboxBatch, "outbox-batch", connector.DefaultOutboxBatch, "单轮拉取的事件数")
 
 	flag.StringVar(&cfg.webhookToken, "webhook-token", os.Getenv("ODOO_WEBHOOK_TOKEN"),
-		"C-2 webhook 的 Bearer 令牌；**留空即禁用该入口**")
+		"C-2 webhook 的 Bearer 令牌；可与 HMAC 双轨")
+	flag.StringVar(&cfg.webhookHMACSecret, "webhook-hmac-secret", os.Getenv("ODOO_WEBHOOK_HMAC_SECRET"),
+		"C-2 webhook HMAC 密钥（X-IoT-Timestamp/X-IoT-Signature，±5 分钟）")
 
 	flag.StringVar(&cfg.reconcileModels, "reconcile-models", "",
 		"要对账 C-2 水位差的 Odoo 模型（逗号分隔）；留空则只对账 Outbox 非终态行")
@@ -271,12 +273,13 @@ func run(cfg config) error {
 
 	// 事件入口 C-2：webhook（无令牌即禁用）。
 	var webhook *connector.Webhook
-	if cfg.webhookToken != "" {
+	if cfg.webhookToken != "" || cfg.webhookHMACSecret != "" {
 		webhook, err = connector.NewWebhook(connector.WebhookOptions{
 			Publisher:  publisher,
 			Deduper:    connector.NewRedisDeduper(rdb, connector.DefaultDedupTTL),
 			Watermarks: watermarks,
 			Token:      cfg.webhookToken,
+			HMACSecret: cfg.webhookHMACSecret,
 			Metrics:    metrics,
 			Logger:     logger,
 		})

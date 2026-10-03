@@ -74,9 +74,69 @@ func TestAction(t *testing.T) {
 		t.Fatal("script.run action metadata incorrect")
 	}
 	if err := action.Do(context.Background(), map[string]any{
-		"source": "if (msg.temperature < 20) throw new Error('bad')",
-		"msg":    map[string]any{"temperature": 25.0},
+		"source":       "if (msg.temperature < 20) throw new Error('bad')",
+		"msg":          map[string]any{"temperature": 25.0},
+		"capabilities": []any{"script.run"},
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRejectsUndeclaredCapabilities(t *testing.T) {
+	engine, err := New(Config{Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = engine.Run(context.Background(), "return 1", Input{Capabilities: []string{"script.emit.command"}})
+	if err == nil || !strings.Contains(err.Error(), "未允许") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestStateCapabilityProvidesScopedAccessors(t *testing.T) {
+	engine, err := New(Config{Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := engine.Run(context.Background(), "state.set('last', 42); return state.get('last')", Input{
+		Capabilities: []string{"script.run", "state"},
+		State:        map[string]any{},
+	})
+	if err != nil || got != int64(42) && got != float64(42) {
+		t.Fatalf("got=%v (%T) err=%v", got, got, err)
+	}
+}
+
+func TestEmitRequiresCapabilityAndHandler(t *testing.T) {
+	engine, err := New(Config{Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = engine.run(context.Background(), "emit('alarm', {level: 'critical'})", Input{Capabilities: []string{"script.run"}}, func(context.Context, string, any) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "未声明") {
+		t.Fatalf("missing capability error=%v", err)
+	}
+	_, err = engine.run(context.Background(), "emit('alarm', {level: 'critical'})", Input{Capabilities: []string{"script.run", "emit:alarm"}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "未配置") {
+		t.Fatalf("missing handler error=%v", err)
+	}
+}
+
+func TestEmitValidatesArgumentsAndPayload(t *testing.T) {
+	engine, err := New(Config{Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emitter := func(context.Context, string, any) error { return nil }
+	cases := []string{
+		"emit()",
+		"emit(1, {})",
+		"emit('alarm', 'not-an-object')",
+		"emit('command', {})",
+	}
+	for _, source := range cases {
+		if _, err := engine.run(context.Background(), source, Input{Capabilities: []string{"script.run", "emit:alarm"}}, emitter); err == nil {
+			t.Errorf("source %q unexpectedly succeeded", source)
+		}
 	}
 }

@@ -63,11 +63,18 @@ func (s *Store) Ping(ctx context.Context) error { return probe(ctx, s.pool) }
 // ResolvePrevSnapshot 返回指定设备在 at 之前最近落库的一条 JSON 快照。
 // 该方法只暴露业务需要的快照契约，SQL 细节仍封装在 GreptimeDB 适配层。
 func (s *Store) ResolvePrevSnapshot(ctx context.Context, projectID, deviceID int64, at time.Time) (map[string]any, error) {
+	return s.ResolvePrevSnapshotBefore(ctx, projectID, deviceID, at, int64(^uint64(0)>>1))
+}
+
+// ResolvePrevSnapshotBefore uses lexicographic (ts, seq) ordering to resolve
+// the previous sample, including samples sharing the same device timestamp.
+func (s *Store) ResolvePrevSnapshotBefore(ctx context.Context, projectID, deviceID int64, at time.Time, seq int64) (map[string]any, error) {
 	const query = `SELECT "metrics" FROM telemetry
-WHERE project_id = $1 AND device_id = $2 AND ts < $3
-ORDER BY ts DESC LIMIT 1`
+WHERE project_id = $1 AND device_id = $2
+	  AND (ts < $3 OR (ts = $3 AND COALESCE(seq, -1) < $4))
+ORDER BY ts DESC, COALESCE(seq, -1) DESC LIMIT 1`
 	var raw []byte
-	if err := s.pool.QueryRow(ctx, query, projectID, deviceID, at.UTC()).Scan(&raw); err != nil {
+	if err := s.pool.QueryRow(ctx, query, projectID, deviceID, at.UTC(), seq).Scan(&raw); err != nil {
 		return nil, err
 	}
 	var values map[string]any
@@ -91,6 +98,23 @@ func (s *Store) CreateTable(ctx context.Context, p tsdb.Plan) error {
 	}
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("建表 %s: %w", tsdb.TableName(p), err)
+	}
+	if err := s.ensureSequenceColumn(ctx, tsdb.TableName(p)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureSequenceColumn(ctx context.Context, table string) error {
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = 'seq'`, table).Scan(&count); err != nil {
+		return fmt.Errorf("检查 %s.seq: %w", table, err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := s.pool.Exec(ctx, "ALTER TABLE "+table+" ADD COLUMN seq BIGINT"); err != nil {
+		return fmt.Errorf("增加 %s.seq: %w", table, err)
 	}
 	return nil
 }
@@ -212,7 +236,7 @@ func (s *Store) InsertRowsWith(ctx context.Context, p tsdb.Plan, enc JSONEncodin
 // 单引号双写、反斜杠双写。
 func (s *Store) insertInlineJSON(ctx context.Context, rows []tsdb.Row) error {
 	var b strings.Builder
-	fmt.Fprintf(&b, `INSERT INTO %s (ts, project_id, device_id, device_type_id, "metrics") VALUES `,
+	fmt.Fprintf(&b, `INSERT INTO %s (ts, seq, project_id, device_id, device_type_id, "metrics") VALUES `,
 		tsdb.PlanJSONTable)
 
 	for i, r := range rows {
@@ -227,8 +251,8 @@ func (s *Store) insertInlineJSON(ctx context.Context, rows []tsdb.Row) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(&b, "('%s', %d, %d, %d, '%s')",
-			r.TS.UTC().Format("2006-01-02 15:04:05.000"), r.ProjectID, r.DeviceID, r.DeviceTypeID, lit)
+		fmt.Fprintf(&b, "('%s', %d, %d, %d, %d, '%s')",
+			r.TS.UTC().Format("2006-01-02 15:04:05.000"), r.Seq, r.ProjectID, r.DeviceID, r.DeviceTypeID, lit)
 	}
 
 	if _, err := s.pool.Exec(ctx, b.String()); err != nil {
@@ -278,7 +302,7 @@ func insertArgs(p tsdb.Plan, rows []tsdb.Row) ([]any, error) {
 
 	args := make([]any, 0, len(rows)*len(cols))
 	for _, r := range rows {
-		args = append(args, r.TS.UTC(), r.ProjectID, r.DeviceID)
+		args = append(args, r.TS.UTC(), r.Seq, r.ProjectID, r.DeviceID)
 
 		if p == tsdb.PlanJSON {
 			doc, err := jsonDoc(r)

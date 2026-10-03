@@ -2,13 +2,45 @@ package connector
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestWebhookHMACAuthentication(t *testing.T) {
+	pub := new(fakePub)
+	h, err := NewWebhook(WebhookOptions{Publisher: pub, Token: "legacy", HMACSecret: "shared-secret", Deduper: NewMemDeduper(time.Minute), Logger: testLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := webhookBody
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+	mac := hmac.New(sha256.New, []byte("shared-secret"))
+	_, _ = mac.Write([]byte(timestamp + "\n" + body))
+	req := httptest.NewRequest(http.MethodPost, WebhookPath, strings.NewReader(body))
+	req.Header.Set("X-IoT-Timestamp", timestamp)
+	req.Header.Set("X-IoT-Signature", fmt.Sprintf("sha256=%x", mac.Sum(nil)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid HMAC rejected: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	stale := httptest.NewRequest(http.MethodPost, WebhookPath, strings.NewReader(body))
+	stale.Header.Set("X-IoT-Timestamp", fmt.Sprintf("%d", time.Now().Add(-6*time.Minute).Unix()))
+	stale.Header.Set("X-IoT-Signature", fmt.Sprintf("sha256=%x", mac.Sum(nil)))
+	staleRec := httptest.NewRecorder()
+	h.ServeHTTP(staleRec, stale)
+	if staleRec.Code != http.StatusUnauthorized {
+		t.Fatalf("stale HMAC accepted: status=%d", staleRec.Code)
+	}
+}
 
 const webhookBody = `{"model":"maintenance.equipment","id":7,` +
 	`"write_date":"2026-10-01 06:30:00","company_id":1,"data":{"name":"冲床 A"}}`

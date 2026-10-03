@@ -24,6 +24,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/ruleconfig"
 	"github.com/SNCIC/odoo20iot/internal/ruleengine"
+	"github.com/SNCIC/odoo20iot/internal/tsdb"
 	"github.com/SNCIC/odoo20iot/internal/tsdb/greptimedb"
 )
 
@@ -98,6 +99,9 @@ func run(cfg config) error {
 		return err
 	}
 	defer history.Close()
+	if err := history.CreateTable(ctx, tsdb.PlanJSON); err != nil {
+		return fmt.Errorf("初始化规则历史表: %w", err)
+	}
 	latestStore := latest.NewRedisStore(rdb)
 	pub, err := gateway.NewNATSPublisher(cfg.natsURL, "IOT_RULE")
 	if err != nil {

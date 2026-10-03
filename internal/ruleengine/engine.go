@@ -75,7 +75,7 @@ func New(loader RuleLoader, cache latest.Store, history rules.PrevSnapshotStore,
 func (e *Engine) Process(ctx context.Context, env envelope.Envelope) error {
 	var body struct {
 		Ts   string         `json:"ts"`
-		Seq  int64          `json:"seq"`
+		Seq  *int64         `json:"seq"`
 		Data map[string]any `json:"data"`
 	}
 	if err := json.Unmarshal(env.Payload, &body); err != nil {
@@ -94,14 +94,24 @@ func (e *Engine) Process(ctx context.Context, env envelope.Envelope) error {
 	if err != nil {
 		return err
 	}
-	meta := rules.NewMeta(env.DeviceID, env.DeviceTypeID, env.ProjectID, 0, "", nil, nil, at, body.Seq)
-	var prevResolver rules.PrevResolver
+	seq := int64(0)
+	if body.Seq != nil {
+		seq = *body.Seq
+	}
+	meta := rules.NewMeta(env.DeviceID, env.DeviceTypeID, env.ProjectID, 0, "", nil, nil, at, seq)
+	var prevResolver rules.CachedPrevResolver
+	hasPrev := false
 	if e.latest != nil || e.cache != nil {
 		prevResolver = rules.CachedPrevResolver{Locator: fixedLocator{projectID: env.ProjectID, deviceID: env.DeviceID}, Cache: e.latest, History: e.cache}
+		hasPrev = true
 	}
 	var prev map[string]any
-	if prevResolver != nil {
-		prev, err = prevResolver.ResolvePrev(ctx, env.DeviceKey, at)
+	if hasPrev {
+		if body.Seq == nil {
+			prev, err = prevResolver.ResolvePrev(ctx, env.DeviceKey, at)
+		} else {
+			prev, err = prevResolver.ResolvePrevWithSeq(ctx, env.DeviceKey, at, seq)
+		}
 		if err != nil {
 			e.logger.Warn("读取 prev 快照失败，按空快照求值", "device_key", env.DeviceKey, "error", err)
 			prev = nil
@@ -150,7 +160,7 @@ func (e *Engine) load(ctx context.Context, projectID string) ([]ruleconfig.Rule,
 	}
 	actions := []dag.Action{dag.Func{ActionName: "alarm.raise", Idem: true, Run: e.raiseAction}}
 	if e.script != nil {
-		actions = append(actions, script.Action{Engine: e.script})
+		actions = append(actions, script.Action{Engine: e.script, Emit: e.emitScript})
 	}
 	registry, err := dag.NewRegistry(actions...)
 	if err != nil {
@@ -194,6 +204,12 @@ func (e *Engine) load(ctx context.Context, projectID string) ([]ruleconfig.Rule,
 				setDefault(node.Params, "meta", "$meta")
 				setDefault(node.Params, "prev", "$prev")
 				setDefault(node.Params, "state", "$state")
+				setDefault(node.Params, "capabilities", loaded[i].Capabilities)
+				setDefault(node.Params, "project_id", "$meta.project_id")
+				setDefault(node.Params, "device_id", "$meta.device_id")
+				setDefault(node.Params, "device_type_id", "$meta.device_type_id")
+				setDefault(node.Params, "rule_id", loaded[i].RuleID)
+				setDefault(node.Params, "rule_name", loaded[i].Name)
 			}
 		}
 		graph, err := dag.Compile(loaded[i].DAG, dag.Deps{Registry: registry, Compiler: e.compiler, Schema: schema, KeyPrefix: loaded[i].RuleID})
@@ -260,6 +276,23 @@ func (e *Engine) raiseAction(ctx context.Context, params map[string]any) error {
 		return err
 	}
 	return e.publish.Publish(ctx, alarm.TriggerSubject, data)
+}
+
+func (e *Engine) emitScript(ctx context.Context, kind string, value any) error {
+	if kind != "alarm" {
+		return fmt.Errorf("script emit 类型 %q 未实现", kind)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("script alarm 输出编码失败: %w", err)
+	}
+	if _, err := alarm.ParseTrigger(data); err != nil {
+		return fmt.Errorf("script alarm 输出契约无效: %w", err)
+	}
+	if err := e.publish.Publish(ctx, alarm.TriggerSubject, data); err != nil {
+		return fmt.Errorf("script alarm 输出发布失败: %w", err)
+	}
+	return nil
 }
 
 func metricSchema() map[string]rules.Kind {

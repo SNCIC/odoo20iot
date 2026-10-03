@@ -3,12 +3,18 @@ package rules
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/latest"
 )
+
+var prevTiebreakDegradedTotal atomic.Int64
+
+// PrevTiebreakDegradedTotal reports history stores that cannot compare seq.
+func PrevTiebreakDegradedTotal() int64 { return prevTiebreakDegradedTotal.Load() }
 
 // PrevResolver supplies the previous snapshot for a device. Production
 // implementations may use Redis first and a time-series store as fallback.
@@ -47,6 +53,15 @@ type CachedPrevResolver struct {
 }
 
 func (r CachedPrevResolver) ResolvePrev(ctx context.Context, deviceKey string, at time.Time) (map[string]any, error) {
+	return r.resolvePrev(ctx, deviceKey, at, int64(^uint64(0)>>1))
+}
+
+// ResolvePrevWithSeq applies the full (timestamp, sequence) predecessor order.
+func (r CachedPrevResolver) ResolvePrevWithSeq(ctx context.Context, deviceKey string, at time.Time, seq int64) (map[string]any, error) {
+	return r.resolvePrev(ctx, deviceKey, at, seq)
+}
+
+func (r CachedPrevResolver) resolvePrev(ctx context.Context, deviceKey string, at time.Time, seq int64) (map[string]any, error) {
 	if r.Locator == nil {
 		return nil, fmt.Errorf("rules: prev 缺少设备定位器")
 	}
@@ -56,14 +71,23 @@ func (r CachedPrevResolver) ResolvePrev(ctx context.Context, deviceKey string, a
 	}
 	if r.Cache != nil {
 		snapshot, cacheErr := r.Cache.Get(ctx, projectID, deviceID)
-		if cacheErr == nil && snapshot.TS.Before(at) {
+		if cacheErr == nil && (snapshot.TS.Before(at) || (seq != int64(^uint64(0)>>1) && snapshot.TS.Equal(at) && snapshot.Seq < seq)) {
 			return snapshot.Values, nil
 		}
 	}
 	if r.History == nil {
 		return nil, nil
 	}
-	values, historyErr := r.History.ResolvePrevSnapshot(ctx, projectID, deviceID, at)
+	var values map[string]any
+	var historyErr error
+	if exact, ok := r.History.(interface {
+		ResolvePrevSnapshotBefore(context.Context, int64, int64, time.Time, int64) (map[string]any, error)
+	}); ok {
+		values, historyErr = exact.ResolvePrevSnapshotBefore(ctx, projectID, deviceID, at, seq)
+	} else {
+		prevTiebreakDegradedTotal.Add(1)
+		values, historyErr = r.History.ResolvePrevSnapshot(ctx, projectID, deviceID, at)
+	}
 	if historyErr != nil {
 		if historyErr == redis.Nil {
 			return nil, nil
