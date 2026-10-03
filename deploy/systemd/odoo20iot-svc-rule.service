@@ -1,0 +1,15 @@
+[Unit]
+Description=Odoo20IoT rule evaluation service
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/xfusion/projects/odoo20iot/deploy/systemd/run-svc-rule.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=mixed
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

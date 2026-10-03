@@ -167,6 +167,7 @@ func TestRuleRuntimeContractMigration(t *testing.T) {
 		`ADD COLUMN IF NOT EXISTS "window"`,
 		`ADD COLUMN IF NOT EXISTS dag`,
 		`ADD COLUMN IF NOT EXISTS capabilities`,
+		`ADD COLUMN IF NOT EXISTS error_policy`,
 		`ck_alarm_rule_error_policy`,
 		`idx_alarm_rule_runtime_active`,
 	} {
