@@ -156,7 +156,7 @@ func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Wate
 		if categoryID <= 0 {
 			res.Skipped++
 			res.Unbound++
-			if err := s.refs.RecordIssue(ctx, extref.IntegrationIssue{System: "odoo", Model: model, ExternalID: row.ID, Type: "unbound", Details: map[string]any{"reason": "missing_category", "company_id": companyID}}); err != nil {
+			if err := s.refs.RecordIssue(ctx, extref.IntegrationIssue{System: "odoo20tbb", Model: model, ExternalID: row.ID, Type: "unbound", Details: map[string]any{"reason": "missing_category", "company_id": companyID}}); err != nil {
 				return next, res, err
 			}
 			s.logger.Warn("Odoo 设备缺少设备类型映射，跳过", "odoo_id", row.ID, "company_id", companyID)
@@ -167,7 +167,7 @@ func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Wate
 			if errors.Is(err, pgx.ErrNoRows) {
 				res.Skipped++
 				res.Unbound++
-				if issueErr := s.refs.RecordIssue(ctx, extref.IntegrationIssue{System: "odoo", Model: model, ExternalID: row.ID, Type: "unbound", Details: map[string]any{"reason": "missing_project", "company_id": companyID}}); issueErr != nil {
+				if issueErr := s.refs.RecordIssue(ctx, extref.IntegrationIssue{System: "odoo20tbb", Model: model, ExternalID: row.ID, Type: "unbound", Details: map[string]any{"reason": "missing_project", "company_id": companyID}}); issueErr != nil {
 					return next, res, issueErr
 				}
 				s.logger.Warn("Odoo 设备无 IoT 租户映射", "company_id", companyID, "odoo_id", row.ID)
@@ -179,7 +179,7 @@ func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Wate
 		if _, err := s.catalog.UpsertDeviceType(ctx, catalog.DeviceType{ID: categoryID, ProjectID: project.ID, TypeKey: "odoo-category:" + strconv.FormatInt(categoryID, 10), Name: "Odoo category " + strconv.FormatInt(categoryID, 10), Category: "odoo"}); err != nil {
 			return next, res, fmt.Errorf("写入设备类型 %d: %w", categoryID, err)
 		}
-		ref, err := s.refs.FindByRemote(ctx, project.ID, "odoo", "maintenance.equipment", row.ID)
+		ref, err := s.refs.FindByRemote(ctx, project.ID, "odoo20tbb", "maintenance.equipment", row.ID)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return next, res, fmt.Errorf("读取设备外部引用 %d: %w", row.ID, err)
 		}
@@ -199,7 +199,7 @@ func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Wate
 		if err != nil {
 			return next, res, fmt.Errorf("写入 IoT 设备 %d: %w", row.ID, err)
 		}
-		if _, err := s.refs.Upsert(ctx, extref.Ref{ProjectID: project.ID, OdooCompanyID: &project.OdooCompanyID, ExtSystem: "odoo", ExtModel: model, ExtID: row.ID, LocalEntity: "device", LocalID: localID, BindSource: "masterdata", BindConfidence: 100, ExtVersion: row.WriteDate, SyncedAt: ptr(s.now())}); err != nil {
+		if _, err := s.refs.Upsert(ctx, extref.Ref{ProjectID: project.ID, OdooCompanyID: &project.OdooCompanyID, ExtSystem: "odoo20tbb", ExtModel: model, ExtID: row.ID, LocalEntity: "device", LocalID: localID, BindSource: "masterdata", BindConfidence: 100, ExtVersion: row.WriteDate, SyncedAt: ptr(s.now())}); err != nil {
 			return next, res, fmt.Errorf("写入设备外部引用 %d: %w", row.ID, err)
 		}
 		res.Upserted++

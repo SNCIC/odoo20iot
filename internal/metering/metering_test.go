@@ -62,6 +62,14 @@ func TestAccumulator_DrainAndSnapshot(t *testing.T) {
 	if s[1][MetricConnPeak] != 10 {
 		t.Errorf("project 1 连接峰值应为 10，得到 %d", s[1][MetricConnPeak])
 	}
+	a.Add(1, MetricConnPeak, 7)
+	if got := a.Snapshot()[1][MetricConnPeak]; got != 10 {
+		t.Fatalf("连接峰值不应累加，期望保留 10，得到 %d", got)
+	}
+	a.Add(1, MetricConnPeak, 12)
+	if got := a.Snapshot()[1][MetricConnPeak]; got != 12 {
+		t.Fatalf("连接峰值应取窗口最大值，得到 %d", got)
+	}
 
 	// Drain 取出并清零。
 	d := a.Drain()

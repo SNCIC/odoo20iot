@@ -309,7 +309,7 @@ func TestQuotaPolicyScopesAndValidation(t *testing.T) {
 	postReq.Header.Set("Authorization", "Bearer scoped")
 	postRec = httptest.NewRecorder()
 	svc.Handler().ServeHTTP(postRec, postReq)
-	if postRec.Code != http.StatusOK || store.saved.Metric != "api_calls" {
+	if postRec.Code != http.StatusOK || store.saved.Metric != "api_calls" || store.saved.SoftLimit != 10 || store.saved.WarningLimit != 18 {
 		t.Fatalf("quota:write 应保存策略，得到 %d: %s", postRec.Code, postRec.Body.String())
 	}
 }

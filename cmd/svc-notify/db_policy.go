@@ -35,9 +35,9 @@ func (s *dbPolicySource) Resolve(ctx context.Context, req notify.Request) (notif
 	}
 	var queryErr error
 	err := pg.WithProjectTx(ctx, s.pool, project, func(ctx context.Context, tx pgx.Tx) error {
-		queryErr = tx.QueryRow(ctx, `SELECT notify FROM t_alarm_rule WHERE project_id=$1 AND rule_id=$2 AND enabled ORDER BY version DESC LIMIT 1`, project, req.RuleID).Scan(&raw)
+		queryErr = tx.QueryRow(ctx, `SELECT notify FROM t_alarm_rule WHERE project_id=$1 AND rule_id=$2 AND enabled ORDER BY version DESC LIMIT 1`, req.ProjectID, req.RuleID).Scan(&raw)
 		if errors.Is(queryErr, pgx.ErrNoRows) {
-			queryErr = tx.QueryRow(ctx, `SELECT notify FROM t_alarm_rule WHERE project_id=$1 AND rule_id='' AND enabled ORDER BY version DESC LIMIT 1`, project).Scan(&raw)
+			queryErr = tx.QueryRow(ctx, `SELECT notify FROM t_alarm_rule WHERE project_id=$1 AND rule_id='' AND enabled ORDER BY version DESC LIMIT 1`, req.ProjectID).Scan(&raw)
 		}
 		if errors.Is(queryErr, pgx.ErrNoRows) {
 			return nil

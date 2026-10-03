@@ -64,6 +64,12 @@ func (a *Accumulator) Add(projectID int64, metric string, delta int64) {
 		m = make(map[string]int64, 4)
 		a.counters[projectID] = m
 	}
+	if metric == MetricConnPeak {
+		if delta > m[metric] {
+			m[metric] = delta
+		}
+		return
+	}
 	m[metric] += delta
 }
 

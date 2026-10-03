@@ -31,3 +31,19 @@ func TestQuotaWindowBounds(t *testing.T) {
 		t.Fatalf("unknown window should be rejected: %s", start)
 	}
 }
+
+func TestQuotaAlertLevelThreeStages(t *testing.T) {
+	p := Policy{SoftLimit: 80, WarningLimit: 90, HardLimit: 100}
+	for _, tc := range []struct {
+		total int64
+		level string
+		limit int64
+	}{
+		{79, "", 0}, {80, "info", 80}, {90, "warning", 90}, {100, "critical", 100},
+	} {
+		level, limit := quotaAlertLevel(tc.total, p)
+		if level != tc.level || limit != tc.limit {
+			t.Fatalf("total=%d got %s/%d want %s/%d", tc.total, level, limit, tc.level, tc.limit)
+		}
+	}
+}

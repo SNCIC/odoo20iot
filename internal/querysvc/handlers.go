@@ -99,10 +99,11 @@ func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Metric    string `json:"metric"`
-		SoftLimit int64  `json:"soft_limit"`
-		HardLimit int64  `json:"hard_limit"`
-		Window    string `json:"window"`
+		Metric       string `json:"metric"`
+		SoftLimit    int64  `json:"soft_limit"`
+		WarningLimit int64  `json:"warning_limit"`
+		HardLimit    int64  `json:"hard_limit"`
+		Window       string `json:"window"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "请求体非法")
@@ -112,7 +113,7 @@ func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "路径 metric 与请求体不一致")
 		return
 	}
-	p := quota.Policy{ProjectID: id.ProjectID, Metric: req.Metric, SoftLimit: req.SoftLimit, HardLimit: req.HardLimit, Window: req.Window}
+	p := quota.NormalizePolicy(quota.Policy{ProjectID: id.ProjectID, Metric: req.Metric, SoftLimit: req.SoftLimit, WarningLimit: req.WarningLimit, HardLimit: req.HardLimit, Window: req.Window})
 	if err := s.deps.Quota.SetPolicy(r.Context(), p, id.ActorID); err != nil {
 		writeError(w, http.StatusBadRequest, CodeInvalidArgument, err.Error())
 		return

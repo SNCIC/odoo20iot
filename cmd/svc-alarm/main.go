@@ -176,6 +176,7 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	go reloadSilences(ctx, pool, engine, logger)
 	app := &agent{
 		engine:                engine,
 		store:                 store,
@@ -255,6 +256,25 @@ func serveHTTP(srv *http.Server, logger *slog.Logger) error {
 		return fmt.Errorf("HTTP 服务: %w", err)
 	}
 	return nil
+}
+
+func reloadSilences(ctx context.Context, pool *pgxpool.Pool, engine *alarm.Engine, logger *slog.Logger) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			windows, err := alarm.LoadSilences(ctx, pool)
+			if err != nil {
+				logger.Error("热加载静默窗口失败", "error", err)
+				continue
+			}
+			engine.ReloadSilences(windows)
+			logger.Info("静默窗口已热加载")
+		}
+	}
 }
 
 // scanLoop 是定时扫描通道（04 §2.1）。

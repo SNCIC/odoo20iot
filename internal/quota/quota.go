@@ -84,6 +84,19 @@ func (c *RedisCounter) IncrBy(ctx context.Context, projectID int64, metric strin
 
 func (c *RedisCounter) IncrReport(ctx context.Context, projectID int64, reportID, metric string, delta int64) (int64, error) {
 	key := CounterKey(projectID, metric, c.now())
+	if metric == metering.MetricConnPeak {
+		script := redis.NewScript(`
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local delta = tonumber(ARGV[1])
+if delta > current then current = delta; redis.call('SET', KEYS[1], current); redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+return current
+`)
+		value, err := script.Run(ctx, c.rdb, []string{key}, delta, int64(c.ttl.Seconds())).Int64()
+		if err != nil {
+			return 0, fmt.Errorf("幂等更新连接峰值 %s: %w", key, err)
+		}
+		return value, nil
+	}
 	dedupeKey := fmt.Sprintf("quota:report:%d:%s:%s", projectID, metric, reportID)
 	script := redis.NewScript(`
 if redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[2]) then

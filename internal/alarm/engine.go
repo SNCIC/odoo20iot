@@ -87,6 +87,20 @@ func New(opts Options) (*Engine, error) {
 	return e, nil
 }
 
+// ReloadSilences 原子替换维护窗口配置，供控制面定时热加载使用。
+func (e *Engine) ReloadSilences(windows *Silences) {
+	if windows == nil {
+		windows = NewSilences()
+	}
+	windows.mu.RLock()
+	copyWindows := append([]Silence(nil), windows.windows...)
+	windows.mu.RUnlock()
+	if e.silence == nil {
+		e.silence = NewSilences()
+	}
+	e.silence.Replace(copyWindows)
+}
+
 // Metrics 返回指标计数器。
 func (e *Engine) Metrics() *Metrics { return e.metrics }
 
