@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/pg"
@@ -12,6 +13,32 @@ import (
 )
 
 type PGStore struct{ pool *pgxpool.Pool }
+
+type Policy struct {
+	ProjectID int64
+	Metric    string
+	SoftLimit int64
+	HardLimit int64
+	Window    string
+}
+
+type Alert struct {
+	ProjectID   int64
+	Metric      string
+	Level       string
+	Usage       int64
+	Limit       int64
+	WindowStart time.Time
+}
+
+type ReconcileResult struct {
+	ProjectID  int64
+	Metric     string
+	Day        time.Time
+	PGTotal    int64
+	RedisTotal int64
+	Delta      int64
+}
 
 func NewPGStore(pool *pgxpool.Pool) (*PGStore, error) {
 	if pool == nil {
@@ -32,8 +59,7 @@ func (s *PGStore) Record(ctx context.Context, report metering.UsageReport, metri
 		_, err := tx.Exec(ctx, `
 INSERT INTO t_quota_usage(project_id, metric, window_start, report_id, delta, node_id)
 VALUES ($1, $2, date_trunc('minute', $3::timestamptz), $4, $5, $6)
-ON CONFLICT (project_id, metric, report_id)
-DO UPDATE SET delta=EXCLUDED.delta, window_start=EXCLUDED.window_start, node_id=EXCLUDED.node_id, updated_at=now()`,
+ON CONFLICT (project_id, metric, report_id) DO NOTHING`,
 			report.ProjectID, metric, report.Window, reportID, delta, report.NodeID)
 		return err
 	})
@@ -48,6 +74,115 @@ func (s *PGStore) Total(ctx context.Context, projectID int64, metric string) (in
 		return tx.QueryRow(ctx, `SELECT COALESCE(sum(delta),0) FROM t_quota_usage WHERE project_id=$1 AND metric=$2`, projectID, metric).Scan(&total)
 	})
 	return total, err
+}
+
+func (s *PGStore) Policy(ctx context.Context, projectID int64, metric string) (Policy, error) {
+	var p Policy
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT project_id, metric, soft_limit, hard_limit, window_kind FROM t_quota_policy WHERE project_id=$1 AND metric=$2 AND enabled`, projectID, metric).Scan(&p.ProjectID, &p.Metric, &p.SoftLimit, &p.HardLimit, &p.Window)
+	})
+	return p, err
+}
+
+func (s *PGStore) RecordAlert(ctx context.Context, alert Alert) (bool, error) {
+	created := false
+	err := pg.WithProjectTx(ctx, s.pool, alert.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `INSERT INTO t_quota_alert(project_id, metric, level, window_start, usage, limit_value) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, alert.ProjectID, alert.Metric, alert.Level, alert.WindowStart, alert.Usage, alert.Limit)
+		created = result.RowsAffected() == 1
+		return err
+	})
+	return created, err
+}
+
+func (s *PGStore) Evaluate(ctx context.Context, report metering.UsageReport, metric string) (*Alert, error) {
+	p, err := s.Policy(ctx, report.ProjectID, metric)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	windowStart, windowEnd := quotaWindow(report.Window, p.Window)
+	if windowStart.IsZero() {
+		return nil, nil
+	}
+	total, err := s.dailyTotal(ctx, report.ProjectID, metric, windowStart, windowEnd)
+	if err != nil {
+		return nil, err
+	}
+	level, limit := "", int64(0)
+	if p.HardLimit > 0 && total >= p.HardLimit {
+		level, limit = "critical", p.HardLimit
+	} else if p.SoftLimit > 0 && total >= p.SoftLimit {
+		level, limit = "warning", p.SoftLimit
+	}
+	if level == "" {
+		return nil, nil
+	}
+	return &Alert{ProjectID: report.ProjectID, Metric: metric, Level: level, Usage: total, Limit: limit, WindowStart: windowStart}, nil
+}
+
+func quotaWindow(at time.Time, window string) (time.Time, time.Time) {
+	at = at.UTC()
+	switch window {
+	case "day":
+		start := at.Truncate(24 * time.Hour)
+		return start, start.Add(24 * time.Hour)
+	case "month":
+		start := time.Date(at.Year(), at.Month(), 1, 0, 0, 0, 0, time.UTC)
+		return start, start.AddDate(0, 1, 0)
+	default:
+		return time.Time{}, time.Time{}
+	}
+}
+
+func (s *PGStore) ReconcileDay(ctx context.Context, redisStore *RedisCounter, projectID int64, metric string, day time.Time) (ReconcileResult, error) {
+	dayStart := day.UTC().Truncate(24 * time.Hour)
+	pgTotal, err := s.dailyTotal(ctx, projectID, metric, dayStart, dayStart.Add(24*time.Hour))
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	redisTotal, err := redisStore.Daily(ctx, projectID, metric, day)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	return ReconcileResult{ProjectID: projectID, Metric: metric, Day: dayStart, PGTotal: pgTotal, RedisTotal: redisTotal, Delta: pgTotal - redisTotal}, nil
+}
+
+func (s *PGStore) Projects(ctx context.Context) ([]int64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id FROM t_project WHERE status='active' AND deleted_at IS NULL ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func (s *PGStore) DailyTotal(ctx context.Context, projectID int64, metric string, since time.Time) (int64, error) {
+	return s.dailyTotal(ctx, projectID, metric, since, time.Time{})
+}
+
+func (s *PGStore) dailyTotal(ctx context.Context, projectID int64, metric string, since, until time.Time) (int64, error) {
+	var total int64
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COALESCE(sum(delta),0) FROM t_quota_usage WHERE project_id=$1 AND metric=$2 AND window_start >= $3 AND ($4::timestamptz IS NULL OR window_start < $4)`, projectID, metric, since, nullableTime(until)).Scan(&total)
+	})
+	return total, err
+}
+
+func nullableTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value
 }
 
 var _ DurableStore = (*PGStore)(nil)

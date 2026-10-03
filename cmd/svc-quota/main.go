@@ -10,8 +10,7 @@
 //   - 非法上报 → 计数后 ACK 释放（毒消息不重投）；
 //   - Redis 不可用 → NAK 重投（恢复后补上计数，不丢用量）。
 //
-// ⚠️ 本轮范围（Phase 0 计量埋点原型）：只做 Redis 计数器累加。
-// 文档 §6 的「每分钟落 PG（按 (metric, ts_minute) 幂等）+ 每小时对账」是后续工作。
+// PG 是计量事实账本，Redis 是 7 天快速计数层；服务启动和每小时执行一次两侧对账。
 package main
 
 import (
@@ -30,23 +29,25 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/natsjs"
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
 type config struct {
-	natsURL          string
-	redisURL         string
-	pgDSN            string
-	stream           string
-	subject          string
-	durable          string
-	counterTTL       time.Duration
-	fetchBatch       int
-	ackWait          time.Duration
-	consumerInactive time.Duration
-	logJSON          bool
+	natsURL           string
+	redisURL          string
+	pgDSN             string
+	stream            string
+	subject           string
+	durable           string
+	counterTTL        time.Duration
+	fetchBatch        int
+	ackWait           time.Duration
+	consumerInactive  time.Duration
+	reconcileInterval time.Duration
+	logJSON           bool
 }
 
 func main() {
@@ -70,6 +71,7 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.ackWait, "ack-wait", 30*time.Second, "总线等待 ACK 的上限")
 	flag.DurationVar(&cfg.consumerInactive, "consumer-inactive", 24*time.Hour,
 		"消费者空闲回收阈值（须 ≥ 流保留时长，见 internal/natsjs）")
+	flag.DurationVar(&cfg.reconcileInterval, "reconcile-interval", time.Hour, "PG/Redis 用量对账周期；0 表示关闭")
 	flag.BoolVar(&cfg.logJSON, "log-json", true, "日志输出为 JSON")
 	flag.Parse()
 	return cfg
@@ -133,6 +135,9 @@ func run(cfg config) error {
 		}
 		agg.WithDurableStore(pgStore)
 		logger.Info("PG 用量事实账本已启用")
+		if cfg.reconcileInterval > 0 {
+			go reconcileLoop(ctx, pgStore, quota.NewRedisCounter(rdb, cfg.counterTTL), cfg.reconcileInterval, logger)
+		}
 	}
 
 	// 4) 消费。
@@ -164,6 +169,46 @@ func run(cfg config) error {
 		"poison", metrics.PermanentTotal.Load(),
 		"errors", metrics.Errors.Load())
 	return nil
+}
+
+func reconcileLoop(ctx context.Context, store *quota.PGStore, redisStore *quota.RedisCounter, interval time.Duration, logger *slog.Logger) {
+	check := func() {
+		var projects []int64
+		rows, err := storeProjects(ctx, store)
+		if err != nil {
+			logger.Error("枚举计量租户失败", "error", err)
+			return
+		}
+		projects = rows
+		metrics := []string{metering.MetricMsgCount, metering.MetricConnPeak, metering.MetricDeviceCount, metering.MetricStorageBytes, metering.MetricAPICalls}
+		for _, projectID := range projects {
+			for _, metric := range metrics {
+				result, err := store.ReconcileDay(ctx, redisStore, projectID, metric, time.Now().UTC())
+				if err != nil {
+					logger.Error("计量对账失败", "project_id", projectID, "metric", metric, "error", err)
+					continue
+				}
+				if result.Delta != 0 {
+					logger.Warn("PG/Redis 计量不一致", "project_id", projectID, "metric", metric, "pg", result.PGTotal, "redis", result.RedisTotal, "delta", result.Delta)
+				}
+			}
+		}
+	}
+	check()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
+}
+
+func storeProjects(ctx context.Context, store *quota.PGStore) ([]int64, error) {
+	return store.Projects(ctx)
 }
 
 func pendingMigrations(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {

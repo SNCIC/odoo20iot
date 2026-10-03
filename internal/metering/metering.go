@@ -25,7 +25,10 @@ const (
 	// MetricMsgCount 是消息数（计费口径，±0.1%）。
 	MetricMsgCount = "msg_count"
 	// MetricConnPeak 是连接峰值（近似，套餐校验）。
-	MetricConnPeak = "conn_peak"
+	MetricConnPeak     = "conn_peak"
+	MetricDeviceCount  = "device_count"
+	MetricStorageBytes = "storage_bytes"
+	MetricAPICalls     = "api_calls"
 )
 
 // UsageSubject 是计量上报的 NATS subject（04 §6）。

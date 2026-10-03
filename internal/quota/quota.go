@@ -34,6 +34,11 @@ type DurableStore interface {
 	Record(context.Context, metering.UsageReport, string, int64) error
 }
 
+type PolicyEvaluator interface {
+	Evaluate(context.Context, metering.UsageReport, string) (*Alert, error)
+	RecordAlert(context.Context, Alert) (bool, error)
+}
+
 type IdempotentCounterStore interface {
 	IncrReport(context.Context, int64, string, string, int64) (int64, error)
 }
@@ -91,6 +96,17 @@ return redis.call('GET', KEYS[1]) or '0'
 	value, err := script.Run(ctx, c.rdb, []string{key, dedupeKey}, delta, int64(c.ttl.Seconds())).Int64()
 	if err != nil {
 		return 0, fmt.Errorf("幂等累加计数器 %s: %w", key, err)
+	}
+	return value, nil
+}
+
+func (c *RedisCounter) Daily(ctx context.Context, projectID int64, metric string, day time.Time) (int64, error) {
+	value, err := c.rdb.Get(ctx, CounterKey(projectID, metric, day)).Int64()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
 	}
 	return value, nil
 }
@@ -161,10 +177,31 @@ func (a *Aggregator) Apply(ctx context.Context, data []byte) error {
 		if delta == 0 {
 			continue
 		}
+		if delta < 0 || !validMetric(metric) {
+			a.metrics.PermanentTotal.Add(1)
+			return fmt.Errorf("%w: metric 或 delta 非法: %q=%d", ErrPermanent, metric, delta)
+		}
 		if a.durable != nil {
 			if err := a.durable.Record(ctx, report, metric, delta); err != nil {
 				a.metrics.Errors.Add(1)
 				return fmt.Errorf("持久化 %s（project=%d）: %w", metric, report.ProjectID, err)
+			}
+			if evaluator, ok := a.durable.(PolicyEvaluator); ok {
+				alert, err := evaluator.Evaluate(ctx, report, metric)
+				if err != nil {
+					a.metrics.Errors.Add(1)
+					return fmt.Errorf("评估配额 %s: %w", metric, err)
+				}
+				if alert != nil {
+					created, err := evaluator.RecordAlert(ctx, *alert)
+					if err != nil {
+						a.metrics.Errors.Add(1)
+						return fmt.Errorf("记录配额告警 %s: %w", metric, err)
+					}
+					if created {
+						a.logger.Warn("配额阈值告警", "project_id", alert.ProjectID, "metric", alert.Metric, "level", alert.Level, "usage", alert.Usage, "limit", alert.Limit)
+					}
+				}
 			}
 		}
 		var err error
@@ -182,4 +219,13 @@ func (a *Aggregator) Apply(ctx context.Context, data []byte) error {
 
 	a.metrics.ReportsTotal.Add(1)
 	return nil
+}
+
+func validMetric(metric string) bool {
+	switch metric {
+	case metering.MetricMsgCount, metering.MetricConnPeak, metering.MetricDeviceCount, metering.MetricStorageBytes, metering.MetricAPICalls:
+		return true
+	default:
+		return false
+	}
 }
