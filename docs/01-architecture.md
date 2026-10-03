@@ -305,7 +305,7 @@ svc-rule（expr 条件匹配 + 自研 DAG 编排）──► svc-alarm / svc-aut
 ```
 调用方(svc-automation / odoo-connector / 场景)
   │ 1. 生成 idem_key，写 t_idem_registry(scope='command') + t_command(status=pending)
-  │ 2. 查 Redis  cache:{project}:{co}:device:conn:v1:{deviceID} → nodeID（会话定位）
+  │ 2. 通过 `cluster.Node.Route()` 查询 Redis `gw:client:{device_key}` → nodeID（会话定位）
   ▼
 NATS  publish  iot.route.{nodeID}        ← 直接发路由 subject，不发设备级 subject
   │ 3. 目标 gw-mqtt 节点在本地连接表中定位连接并投递
@@ -320,7 +320,7 @@ svc-pipeline 解析回复 → NATS publish iot.cmd.reply.{project}.{deviceID}
 
 > **为什么用 `iot.route.{nodeID}` 而不是设备级 subject（评审 R-13）**：若发布到 `iot.cmd.{project}.{deviceID}`，则每个 `gw-mqtt` 节点都要维护「本节点上所有设备的 subject 订阅集合」，订阅表随设备数线性膨胀（100 万设备 = 100 万订阅）。既然步骤 2 已经通过 Redis 拿到了 `nodeID`，就直接投递到该节点的路由 subject，**订阅表变成 O(节点数)**。
 
-**离线设备**：`d:conn` 无节点 → 不投递，只写 `t_command(status=queued)`，并写 NATS **分片离线流** `offline.shard.{hash(device_id)%N}`（TTL = 物模型 `offlineTTL`，默认 24h）；设备重连后由 `svc-device` 触发补发。
+**离线设备**：`gw:client:{device_key}` 无节点 → 不投递，只写 `t_command(status=queued)`，并写 NATS **分片离线流** `offline.shard.{hash(device_id)%N}`（TTL = 物模型 `offlineTTL`，默认 24h）；设备重连后由 `svc-device` 触发补发。
 
 ### 6.3 设备上下线（在线状态）
 
@@ -332,7 +332,7 @@ svc-pipeline 解析回复 → NATS publish iot.cmd.reply.{project}.{deviceID}
 
 - 设备 CONNECT 成功 → 网关会话 Hook 发布 `iot.device.online`；正常与异常断开统一由 `OnDisconnect` 发布 `iot.device.offline`。事件进入 JetStream `IOT_DEVICE_EVENTS`，字段为 `event_id/event/device_key/occurred_at`。当前 Redis 在线状态仍由 A3 的 `gw:client:{device_key}` 位置键表达；不再使用旧的 `cache:*:online:v1:*` 键。
 - `svc-device` 消费 `iot.device.*` 后更新 PG `last_seen_at`（**仅作审计与历史摘要**）。
-- **实时在线判定以会话注册表（Redis `d:conn` / Broker 会话状态）为事实**，不用 PG 判定在线（评审 R-14）。LWT 的三个语义边界详见 03 文档 §5.2。
+- **实时在线判定以会话注册表（Redis `gw:client:{device_key}` / Broker 会话状态）为事实**，不用 PG 判定在线（评审 R-14）。LWT 的三个语义边界详见 03 文档 §5.2。
 
 ---
 

@@ -82,15 +82,15 @@ ok, err := runner.Eval(prog, env)  // P50 ≈ 0.6 µs，P99 ≈ 1.3 µs（实测
 | 同 `ts` 重复 | 取 `seq` 最大者；`seq` 相同则取 `ingested_at` 最晚者 | 设备时钟回拨时可能出现同 `ts` |
 | `seq` 回绕 | **不作为跨 `ts` 的排序依据**，仅用于两处：① 幂等去重（见 03 §4.3）；② **同一 `ts` 内的并列裁决**（见上方「同 `ts` 重复」行）。`prev` 的**主序只看 `ts`** | `seq` 是设备本地单调计数，重启后从 0 开始，不能作为全局序；但**同一设备、同一 `ts`** 的两条消息用 `seq` 区分是安全的 |
 | **乱序到达**（新消息 `ts` < 已落库最新 `ts`） | **`prev` 取「按 `ts` 排序时位于当前消息之前的那条」**，即历史插入位置的前一条，**不是最新一条** | 这是 `prev` 语义的关键：迟到数据必须插入到正确的时间位置，而不是当成"最新的下一条" |
-| 首条消息 | `prev` = `null`；表达式必须能处理 `null`（`prev == null ? 0 : ...`） | — |
+| 首条消息 | `prev` = `nil`；表达式必须能处理 `nil`（`prev == nil ? 0 : ...`） | — |
 | 跨重启 / 跨分片迁移 | `prev` 从**持久化数据**重建，不依赖内存 | 分片接管后语义不变 |
 
 **表达式写法约束**：
 
 ```
-✅ 允许：  prev.temperature != null && msg.temperature - prev.temperature > 5
-✅ 允许：  prev == null || msg.temperature > prev.temperature
-❌ 禁止：  prev.temperature > 5        // 未处理 null，首条消息会求值失败
+✅ 允许：  prev.temperature != nil && msg.temperature - prev.temperature > 5
+✅ 允许：  prev == nil || msg.temperature > prev.temperature
+❌ 禁止：  prev.temperature > 5        // 未处理 nil，首条消息会求值失败
 ```
 
 `prev` 是**只读快照**（当前消息的部分字段副本），不是可变对象；写入 `prev.*` 编译期报错。
@@ -674,7 +674,7 @@ shadow = {
    │  写入 PG（事务, 乐观锁）+ Redis 同步
    │  version++ → 计算 delta
    ▼
-   delta 非空 → ① 查 Redis cache:{pid}:{co}:device:conn:v1:{did} → nodeID
+   delta 非空 → ① 查 Redis gw:client:{device_key} → nodeID
                 ② publish iot.route.{nodeID}（携带目标 device_key + shadow/desired 载荷）
    ▼
 gw-mqtt（该节点）在本地连接表定位连接 → 投递 MQTT 主题 v1/devices/{key}/shadow/desired
@@ -686,7 +686,7 @@ svc-device 更新 reported → 重算 delta → 若为空，desired 与 reported
 
 > ⚠️ **链路修正（评审 P1）**：早期此处写 `publish iot.cmd.{pid}.{did}`，与 01 文档 §6.2「**不存在设备级命令 subject，统一走 `iot.route.{nodeID}`**」冲突 —— 影子下发链路实际是断的。现统一为「查会话 → 发 `iot.route.{nodeID}`」，与命令下发同一条路径。
 >
-> 设备离线时（`d:conn` 无 nodeID）：**不投递**，desired 已持久化在 PG；设备上线后由 `svc-device` 检测 delta 非空并补推（对应 §5.3 的「离线设备」策略）。
+> 设备离线时（`gw:client:{device_key}` 无 nodeID）：**不投递**，desired 已持久化在 PG；设备上线后由 `svc-device` 检测 delta 非空并补推（对应 §5.3 的「离线设备」策略）。
 
 ### 5.3 冲突与离线
 
@@ -736,7 +736,7 @@ Client-side  → shadow.reported（单向，只由设备写）
 
 **实现**：网关/管道本地累加 → 每 10s 通过 NATS 批量上报 `iot.quota.usage` → `svc-quota` 写 Redis 计数器（`INCRBY`）→ 每分钟落 PG（幂等：按 `(metric, ts_minute)` 去重）→ 每小时与原始数据抽样对账 → 差异 > 1% 告警。
 
-**超配额处理**：分级预警（80% / 90% / 100%），100% 后按租户策略（`throttle` / `reject`）执行；`cmd` 与状态查询永不被配额拒绝（保证可运维性）。
+**超配额处理**：分级预警（80% / 90% / 100%）。Phase 1 只做阈值告警；Phase 2 接入 `quota.Reserve` 业务路径并按租户策略执行 `throttle` / `reject`；`cmd` 与状态查询永不被配额拒绝（保证可运维性）。
 
 ---
 

@@ -170,6 +170,7 @@ func main() {
 	if err := quotaPub.EnsureStream(gateway.StreamSpec{
 		Subjects: []string{"iot.quota.>"},
 		Replicas: 1,
+		MaxAge:   7 * 24 * time.Hour,
 	}); err != nil {
 		logger.Fatal("确保计量 Stream 存在失败", zap.Error(err))
 	}
@@ -222,7 +223,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
-	mux.HandleFunc("/metrics", metricsHandler(metrics))
+	mux.HandleFunc("/metrics", metricsHandler(metrics, meterReporter.Metrics()))
 
 	srv := &http.Server{
 		Addr:              *httpAddr,
@@ -441,10 +442,12 @@ func splitNonEmpty(value string) []string {
 	return result
 }
 
-func metricsHandler(m *gateway.Metrics) http.HandlerFunc {
+func metricsHandler(m *gateway.Metrics, meter *metering.Metrics) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		m.WriteProm(w)
+		_, _ = fmt.Fprintf(w, "# HELP meter_pending_reports 当前待重试的计量批次数\n# TYPE meter_pending_reports gauge\nmeter_pending_reports %d\n", meter.PendingReports.Load())
+		_, _ = fmt.Fprintf(w, "# HELP meter_pending_reports_dropped_total 因重试队列达到上限而丢弃的计量批次数\n# TYPE meter_pending_reports_dropped_total counter\nmeter_pending_reports_dropped_total %d\n", meter.PendingReportsDropped.Load())
 	}
 }
 
