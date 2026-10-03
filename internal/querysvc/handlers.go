@@ -17,6 +17,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -45,11 +46,78 @@ func (s *Service) routes() http.Handler {
 	if s.deps.Endpoints != nil {
 		mux.Handle("/api/v1/notification-endpoints", auth(http.HandlerFunc(s.handleNotificationEndpoints)))
 	}
+	if s.deps.Quota != nil {
+		mux.Handle("/api/v1/quota/policies", auth(http.HandlerFunc(s.handleQuotaPolicies)))
+		mux.Handle("/api/v1/quota/policies/", auth(http.HandlerFunc(s.handleQuotaPolicies)))
+	}
 	if s.deps.Alarms != nil {
 		mux.Handle("/api/v1/alarms/", auth(http.HandlerFunc(s.handleAlarmAction)))
 	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if r.Method == http.MethodGet {
+		if !id.Dev && !id.HasScope("quota:read") {
+			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 quota:read 权限")
+			return
+		}
+		items, err := s.deps.Quota.Policies(r.Context(), id.ProjectID)
+		if err != nil {
+			s.fail(w, "读取配额策略", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "policies": items})
+		return
+	}
+	if !id.Dev && !id.HasScope("quota:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 quota:write 权限")
+		return
+	}
+	metric := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/quota/policies/"), "/")
+	if r.Method == http.MethodDelete {
+		if _, ok := quota.AllowedMetrics[metric]; !ok {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "metric 非法")
+			return
+		}
+		if err := s.deps.Quota.DeletePolicy(r.Context(), id.ProjectID, metric, id.ActorID); err != nil {
+			s.fail(w, "删除配额策略", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		w.Header().Set("Allow", "GET, POST, PUT, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "不支持的 HTTP 方法")
+		return
+	}
+	var req struct {
+		Metric    string `json:"metric"`
+		SoftLimit int64  `json:"soft_limit"`
+		HardLimit int64  `json:"hard_limit"`
+		Window    string `json:"window"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "请求体非法")
+		return
+	}
+	if r.Method == http.MethodPut && metric != "" && metric != req.Metric {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "路径 metric 与请求体不一致")
+		return
+	}
+	p := quota.Policy{ProjectID: id.ProjectID, Metric: req.Metric, SoftLimit: req.SoftLimit, HardLimit: req.HardLimit, Window: req.Window}
+	if err := s.deps.Quota.SetPolicy(r.Context(), p, id.ActorID); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "policy": p})
 }
 
 func requireScope(auth func(http.Handler) http.Handler, scope string, next http.Handler) http.Handler {

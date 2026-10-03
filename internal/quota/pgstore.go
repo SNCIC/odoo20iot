@@ -22,6 +22,59 @@ type Policy struct {
 	Window    string
 }
 
+var AllowedMetrics = map[string]struct{}{
+	"msg_count": {}, "conn_peak": {}, "device_count": {}, "storage_bytes": {}, "api_calls": {},
+}
+
+func (s *PGStore) Policies(ctx context.Context, projectID int64) ([]Policy, error) {
+	var out []Policy
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT project_id,metric,soft_limit,hard_limit,window_kind FROM t_quota_policy WHERE project_id=$1 AND enabled ORDER BY metric`, projectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p Policy
+			if err := rows.Scan(&p.ProjectID, &p.Metric, &p.SoftLimit, &p.HardLimit, &p.Window); err != nil {
+				return err
+			}
+			out = append(out, p)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+func (s *PGStore) SetPolicy(ctx context.Context, p Policy, actor string) error {
+	if p.ProjectID <= 0 || p.Metric == "" || p.SoftLimit < 0 || p.HardLimit < p.SoftLimit || (p.Window != "day" && p.Window != "month") {
+		return fmt.Errorf("quota: 策略字段非法")
+	}
+	if _, ok := AllowedMetrics[p.Metric]; !ok {
+		return fmt.Errorf("quota: 不支持的计量项 %q", p.Metric)
+	}
+	return pg.WithProjectTx(ctx, s.pool, p.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO t_quota_policy(project_id,metric,soft_limit,hard_limit,window_kind,enabled,updated_at) VALUES($1,$2,$3,$4,$5,true,now()) ON CONFLICT(project_id,metric) DO UPDATE SET soft_limit=EXCLUDED.soft_limit,hard_limit=EXCLUDED.hard_limit,window_kind=EXCLUDED.window_kind,enabled=true,updated_at=now()`, p.ProjectID, p.Metric, p.SoftLimit, p.HardLimit, p.Window); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO t_audit_log(project_id,action,actor_id,resource_type,resource_id,details) VALUES($1,'quota.policy.upsert',$2,'quota_policy',$3,jsonb_build_object('soft_limit',$4,'hard_limit',$5,'window',$6))`, p.ProjectID, actor, p.Metric, p.SoftLimit, p.HardLimit, p.Window)
+		return err
+	})
+}
+
+func (s *PGStore) DeletePolicy(ctx context.Context, projectID int64, metric, actor string) error {
+	if _, ok := AllowedMetrics[metric]; !ok {
+		return fmt.Errorf("quota: 不支持的计量项 %q", metric)
+	}
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE t_quota_policy SET enabled=false,updated_at=now() WHERE project_id=$1 AND metric=$2`, projectID, metric); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO t_audit_log(project_id,action,actor_id,resource_type,resource_id) VALUES($1,'quota.policy.delete',$2,'quota_policy',$3)`, projectID, actor, metric)
+		return err
+	})
+}
+
 type Alert struct {
 	ProjectID   int64
 	Metric      string

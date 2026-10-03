@@ -18,6 +18,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -42,6 +43,23 @@ type fakeAlarmAcknowledger struct {
 	projectID int64
 	alarmID   string
 	actorID   string
+}
+
+type fakeQuotaPolicyStore struct {
+	saved   quota.Policy
+	deleted string
+}
+
+func (f *fakeQuotaPolicyStore) Policies(context.Context, int64) ([]quota.Policy, error) {
+	return []quota.Policy{f.saved}, nil
+}
+func (f *fakeQuotaPolicyStore) SetPolicy(_ context.Context, p quota.Policy, _ string) error {
+	f.saved = p
+	return nil
+}
+func (f *fakeQuotaPolicyStore) DeletePolicy(_ context.Context, _ int64, metric, _ string) error {
+	f.deleted = metric
+	return nil
 }
 
 func (f *fakeAlarmAcknowledger) Acknowledge(_ context.Context, projectID int64, alarmID, actorID string, _ time.Time) error {
@@ -259,6 +277,40 @@ func TestNotificationEndpointScopes(t *testing.T) {
 	svc.Handler().ServeHTTP(postRec, postReq)
 	if postRec.Code != http.StatusCreated {
 		t.Fatalf("notification:write 应允许 POST，得到 %d: %s", postRec.Code, postRec.Body.String())
+	}
+}
+
+func TestQuotaPolicyScopesAndValidation(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	store := &fakeQuotaPolicyStore{}
+	svc.deps.Quota = store
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, ActorID: "user-1", Scopes: []string{"quota:read"}}}
+	svc.mux = svc.routes()
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/quota/policies", nil)
+	getReq.Header.Set("Authorization", "Bearer scoped")
+	getRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("quota:read 应允许 GET，得到 %d", getRec.Code)
+	}
+
+	postReq := httptest.NewRequest(http.MethodPost, "/api/v1/quota/policies", strings.NewReader(`{"metric":"api_calls","soft_limit":10,"hard_limit":20,"window":"day"}`))
+	postReq.Header.Set("Authorization", "Bearer scoped")
+	postRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusForbidden {
+		t.Fatalf("缺少 quota:write 应拒绝，得到 %d", postRec.Code)
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, ActorID: "user-1", Scopes: []string{"quota:write"}}}
+	svc.mux = svc.routes()
+	postReq = httptest.NewRequest(http.MethodPost, "/api/v1/quota/policies", strings.NewReader(`{"metric":"api_calls","soft_limit":10,"hard_limit":20,"window":"day"}`))
+	postReq.Header.Set("Authorization", "Bearer scoped")
+	postRec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusOK || store.saved.Metric != "api_calls" {
+		t.Fatalf("quota:write 应保存策略，得到 %d: %s", postRec.Code, postRec.Body.String())
 	}
 }
 

@@ -181,15 +181,22 @@ func reconcileLoop(ctx context.Context, store *quota.PGStore, redisStore *quota.
 		}
 		projects = rows
 		metrics := []string{metering.MetricMsgCount, metering.MetricConnPeak, metering.MetricDeviceCount, metering.MetricStorageBytes, metering.MetricAPICalls}
+		// 只修正已关闭的昨天窗口，当前窗口继续只观测，避免覆盖并发写入。
+		closedDay := time.Now().UTC().AddDate(0, 0, -1)
 		for _, projectID := range projects {
 			for _, metric := range metrics {
-				result, err := store.ReconcileDay(ctx, redisStore, projectID, metric, time.Now().UTC())
+				result, err := store.ReconcileDay(ctx, redisStore, projectID, metric, closedDay)
 				if err != nil {
 					logger.Error("计量对账失败", "project_id", projectID, "metric", metric, "error", err)
 					continue
 				}
 				if result.Delta != 0 {
 					logger.Warn("PG/Redis 计量不一致", "project_id", projectID, "metric", metric, "pg", result.PGTotal, "redis", result.RedisTotal, "delta", result.Delta)
+					if err := redisStore.ReplaceDaily(ctx, projectID, metric, closedDay, result.PGTotal, quota.DefaultCounterTTL); err != nil {
+						logger.Error("自动修正 Redis 计量失败", "project_id", projectID, "metric", metric, "error", err)
+					} else {
+						logger.Info("已按 PG 事实值修正 Redis 计量", "project_id", projectID, "metric", metric, "day", result.Day, "value", result.PGTotal)
+					}
 				}
 			}
 		}

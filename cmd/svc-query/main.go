@@ -42,6 +42,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/querysvc"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/secureconfig"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 	"github.com/SNCIC/odoo20iot/internal/tsdb/greptimedb"
@@ -194,6 +195,10 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	quotaStore, err := quota.NewPGStore(pool)
+	if err != nil {
+		return err
+	}
 	var endpointStore *notifyconfig.Store
 	if rawKey := os.Getenv("IOT_CONFIG_KEY"); rawKey != "" {
 		key, keyErr := secureconfig.NewKey(rawKey)
@@ -236,6 +241,7 @@ func run(cfg config) error {
 		Latest:    latest.NewRedisStore(latestRedis),
 		Endpoints: endpointStore,
 		Alarms:    alarmStore,
+		Quota:     quotaStore,
 		Catalog:   store,
 		Verifier:  verifier,
 		Health: querysvc.Health{

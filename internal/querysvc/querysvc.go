@@ -11,6 +11,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -34,6 +35,12 @@ type NotificationEndpointStore interface {
 
 type AlarmAcknowledger interface {
 	Acknowledge(context.Context, int64, string, string, time.Time) error
+}
+
+type QuotaPolicyStore interface {
+	Policies(context.Context, int64) ([]quota.Policy, error)
+	SetPolicy(context.Context, quota.Policy, string) error
+	DeletePolicy(context.Context, int64, string, string) error
 }
 
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
@@ -76,6 +83,7 @@ type Deps struct {
 	Latest      LatestReader
 	Endpoints   NotificationEndpointStore
 	Alarms      AlarmAcknowledger
+	Quota       QuotaPolicyStore
 	Catalog     catalog.Store
 	Verifier    apiauth.Verifier
 	Health      Health

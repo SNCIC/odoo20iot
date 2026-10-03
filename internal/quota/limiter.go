@@ -45,3 +45,20 @@ return {1, next}
 	}
 	return Decision{Allowed: values[0] == 1, Current: values[1], Limit: limit}, nil
 }
+
+// ReplaceDaily 将已关闭日窗口的 Redis 加速桶修正为 PG 事实值。
+// 仅供对账器使用；当前窗口不应调用此方法，避免覆盖并发写入。
+func (c *RedisCounter) ReplaceDaily(ctx context.Context, projectID int64, metric string, day time.Time, value int64, ttl time.Duration) error {
+	if projectID <= 0 || metric == "" || value < 0 {
+		return fmt.Errorf("quota: 修正参数非法")
+	}
+	if ttl <= 0 {
+		ttl = c.ttl
+	}
+	key := CounterKey(projectID, metric, day)
+	script := redis.NewScript(`redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]); return 1`)
+	if err := script.Run(ctx, c.rdb, []string{key}, value, int64(ttl.Seconds())).Err(); err != nil {
+		return fmt.Errorf("quota: 修正计数器 %s: %w", key, err)
+	}
+	return nil
+}
