@@ -97,14 +97,33 @@ func NewMasterDataSync(opts MasterDataOptions) (*MasterDataSync, error) {
 // SyncOnce 同步一个 Odoo 模型的一个增量窗口。
 // cursor 是上一条已成功写入的 (write_date,id)；只有整条记录完成后才推进返回值。
 func (s *MasterDataSync) SyncOnce(ctx context.Context, model string, cursor Watermark) (Watermark, MasterDataResult, error) {
+	return s.syncOnce(ctx, model, cursor, 0)
+}
+
+func (s *MasterDataSync) SyncOnceForCompany(ctx context.Context, model string, companyID int64, cursor Watermark) (Watermark, MasterDataResult, error) {
+	if companyID <= 0 {
+		return cursor, MasterDataResult{}, fmt.Errorf("connector: Odoo company_id 必须为正数")
+	}
+	return s.syncOnce(ctx, model, cursor, companyID)
+}
+
+func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Watermark, companyID int64) (Watermark, MasterDataResult, error) {
 	if strings.TrimSpace(model) == "" {
 		model = DefaultMasterDataModel
 	}
 	var rows []equipmentRow
 	wm := cursor.WriteDate.UTC().Format(odooDatetimeLayout)
 	domain := []any{}
+	if companyID > 0 {
+		domain = append(domain, []any{"company_id", "=", companyID})
+	}
 	if !cursor.WriteDate.IsZero() {
-		domain = []any{"|", "&", []any{"write_date", "=", wm}, []any{"id", ">", cursor.ID}, []any{"write_date", ">", wm}}
+		cursorDomain := []any{"|", "&", []any{"write_date", "=", wm}, []any{"id", ">", cursor.ID}, []any{"write_date", ">", wm}}
+		if len(domain) > 0 {
+			domain = append(domain, cursorDomain)
+		} else {
+			domain = cursorDomain
+		}
 	}
 	err := s.caller.Call(ctx, Request{Model: model, Method: "search_read", Params: map[string]any{
 		"domain": domain,

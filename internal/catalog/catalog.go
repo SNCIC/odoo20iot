@@ -139,3 +139,7 @@ type Store interface {
 type ProjectByOdooCompany interface {
 	FindProjectByOdooCompany(ctx context.Context, companyID int64) (Project, error)
 }
+
+type ProjectLister interface {
+	ListProjects(ctx context.Context) ([]Project, error)
+}

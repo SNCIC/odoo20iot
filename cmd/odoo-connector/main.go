@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -306,11 +307,13 @@ func run(cfg config) error {
 	}
 
 	var masterSync *connector.MasterDataSync
+	var masterCatalog *catalog.PGStore
 	if strings.TrimSpace(cfg.masterDataModel) != "" {
 		cat, err := catalog.NewPGStore(businessPool)
 		if err != nil {
 			return err
 		}
+		masterCatalog = cat
 		masterSync, err = connector.NewMasterDataSync(connector.MasterDataOptions{
 			Caller: conn, Catalog: cat, Projects: cat, Refs: extref.NewStore(businessPool),
 			Batch: cfg.masterDataBatch, Logger: logger,
@@ -386,7 +389,7 @@ func run(cfg config) error {
 	}()
 	if masterSync != nil {
 		go func() {
-			if err := runMasterDataLoop(ctx, masterSync, watermarks, cfg.masterDataModel, cfg.masterDataInterval, logger); err != nil {
+			if err := runMasterDataLoop(ctx, masterSync, watermarks, cfg.masterDataModel, cfg.masterDataInterval, logger, masterCatalog); err != nil {
 				errCh <- fmt.Errorf("主数据同步异常退出: %w", err)
 			}
 		}()
@@ -443,12 +446,39 @@ func run(cfg config) error {
 	return nil
 }
 
-func runMasterDataLoop(ctx context.Context, syncer *connector.MasterDataSync, watermarks connector.Watermarks, model string, interval time.Duration, logger *slog.Logger) error {
+func runMasterDataLoop(ctx context.Context, syncer *connector.MasterDataSync, watermarks connector.Watermarks, model string, interval time.Duration, logger *slog.Logger, projects catalog.ProjectLister) error {
 	if interval <= 0 {
 		interval = time.Minute
 	}
-	key := "masterdata:" + model
 	run := func() error {
+		if scoped, ok := watermarks.(connector.TenantWatermarks); ok && projects != nil {
+			items, err := projects.ListProjects(ctx)
+			if err != nil {
+				return err
+			}
+			for _, project := range items {
+				tenant := strconv.FormatInt(project.ID, 10)
+				cursor, found, err := scoped.GetForTenant(ctx, tenant, model)
+				if err != nil {
+					return err
+				}
+				if !found {
+					cursor = connector.Watermark{}
+				}
+				next, result, err := syncer.SyncOnceForCompany(ctx, model, project.OdooCompanyID, cursor)
+				if err != nil {
+					return err
+				}
+				if next.After(cursor) {
+					if err := scoped.AdvanceForTenant(ctx, tenant, model, next); err != nil {
+						return err
+					}
+				}
+				logger.Info("主数据租户同步完成", "project_id", project.ID, "company_id", project.OdooCompanyID, "model", model, "read", result.Read, "upserted", result.Upserted, "skipped", result.Skipped, "unbound", result.Unbound, "cursor", next)
+			}
+			return nil
+		}
+		key := "masterdata:" + model
 		cursor, ok, err := watermarks.Get(ctx, key)
 		if err != nil {
 			return err

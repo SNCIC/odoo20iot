@@ -39,6 +39,23 @@ FROM t_project WHERE odoo_company_id=$1 AND deleted_at IS NULL`, companyID).Scan
 	return p, err
 }
 
+func (s *PGStore) ListProjects(ctx context.Context) ([]Project, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, project_key, name, status, odoo_company_id, timezone, version, created_at, updated_at, deleted_at FROM t_project WHERE deleted_at IS NULL AND status='active' AND odoo_company_id > 0 ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: 列出租户: %w", err)
+	}
+	defer rows.Close()
+	var out []Project
+	for rows.Next() {
+		var p Project
+		if err := rows.Scan(&p.ID, &p.ProjectKey, &p.Name, &p.Status, &p.OdooCompanyID, &p.Timezone, &p.Version, &p.CreatedAt, &p.UpdatedAt, &p.DeletedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // deviceColumns 是设备读取列（顺序与 scanDevice 严格一致）。
 const deviceColumns = `id, project_id, device_type_id, device_key, name, auth_mode, status, online,
        last_seen_at, thing_model_version, config_template_id, tags, version, created_at, updated_at, deleted_at`

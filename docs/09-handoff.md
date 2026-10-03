@@ -37,11 +37,13 @@
 
 **连接器 watermark 租户增量（2026-10-03）**：新增迁移 `0022_connector_watermark_tenant`，将 `t_connector_watermark` 主键从 `model` 扩展为 `(project_id, model)`，旧数据迁移到兼容作用域 `project_id=0`。C-2 webhook 若携带数字 `tenant_id`，Redis key 与 PG fallback 均按租户隔离，并在 PG fallback 读写时使用事务级租户上下文；无租户来源的主数据同步继续使用 `project_id=0` 兼容作用域。新增内存租户隔离测试，全量 Go 测试、迁移检查、`odoo-connector` 重建重启和 `18091/readyz` 验证通过。由于主数据同步尚未贯穿真实 project_id，`t_connector_watermark` 暂不启用 FORCE RLS，待该调用链补齐后再启用。
 
+**主数据同步租户增量（2026-10-03）**：新增 `catalog.ListProjects`，连接器按每个 active IoT project 的 `odoo_company_id` 分别向 Odoo 查询 `maintenance.equipment`，并使用 `tenant:{project_id}:{model}` 的 Redis watermark 与 `(project_id, model)` 的 PG fallback；不再把多个租户设备混在一个全局主数据游标中。开发库实测 `project_id=1/company_id=1` 读取 3 条、写入 3 条，连接器重启和 readiness 均通过。C-2 对账仍保留无租户来源的兼容作用域，故 watermark FORCE RLS 待对账路径也完成租户化后启用。
+
 **升级通知增量（2026-10-02）**：`svc-notify` 识别告警事件的 `escalated=true`，通知策略可配置 `escalated_recipients` 按通道替换普通收件人；未配置时保持原收件人，兼容现有策略。`svc-alarm` 已持久化升级阶段并支持人工确认；确认后的升级抑制通过 `acknowledged_at` 闭环。
 
 **未确认升级增量（2026-10-02）**：`svc-alarm` 扫描 `active` 告警的 `notified_ts`，默认 30 分钟发布阶段 1 上级通知，默认 2 小时发布阶段 2 P1 通知；`t_alarm_active.escalation_stage` 通过迁移 `0015_alarm_escalation` 持久化，并用条件更新原子抢占，重启和多副本不会重复升级。策略支持 `ack_escalated_recipients`（阶段 1）与 `escalated_recipients`（阶段 2）。控制台人工确认 API 已实现：`POST /api/v1/alarms/{alarm_id}/ack`，需要 `alarm:write` scope；确认写入 `t_audit_log` 并抑制后续升级。
 
-下一步：A4 连接压测明确暂缓；继续贯通主数据同步的真实 `project_id`，再对 `t_connector_watermark` 启用 FORCE RLS；随后为 DLQ 补齐 project_id 契约、切换非 owner 应用账号，并接入独立 `svc-rule` 消费服务。mTLS 已具备签发和负面校验工具，仍需现场设备逐台切换与网关端到端启用验收。Odoo S1/S3 已完成本轮真实链路验收：手工触发 Outbox cron 投递 2 条 pending 事件，Redis Stream consumer `odoo-connector` 的 `pending=0、lag=0`，设备主数据同步和 `t_external_ref` 均已核验；定时 cron 仍保持关闭，避免开发环境自动对外通知。
+下一步：A4 连接压测明确暂缓；继续将 C-2 对账路径改为按租户查询，完成后对 `t_connector_watermark` 启用 FORCE RLS；随后为 DLQ 补齐 project_id 契约、切换非 owner 应用账号，并接入独立 `svc-rule` 消费服务。mTLS 已具备签发和负面校验工具，仍需现场设备逐台切换与网关端到端启用验收。Odoo S1/S3 已完成本轮真实链路验收：手工触发 Outbox cron 投递 2 条 pending 事件，Redis Stream consumer `odoo-connector` 的 `pending=0、lag=0`，设备主数据同步和 `t_external_ref` 均已核验；定时 cron 仍保持关闭，避免开发环境自动对外通知。
 
 ---
 
