@@ -97,17 +97,21 @@ func NewMasterDataSync(opts MasterDataOptions) (*MasterDataSync, error) {
 // SyncOnce 同步一个 Odoo 模型的一个增量窗口。
 // cursor 是上一条已成功写入的 (write_date,id)；只有整条记录完成后才推进返回值。
 func (s *MasterDataSync) SyncOnce(ctx context.Context, model string, cursor Watermark) (Watermark, MasterDataResult, error) {
-	return s.syncOnce(ctx, model, cursor, 0)
+	return s.syncOnce(ctx, model, cursor, 0, 0)
 }
 
 func (s *MasterDataSync) SyncOnceForCompany(ctx context.Context, model string, companyID int64, cursor Watermark) (Watermark, MasterDataResult, error) {
+	return s.SyncOnceForProjectCompany(ctx, model, 0, companyID, cursor)
+}
+
+func (s *MasterDataSync) SyncOnceForProjectCompany(ctx context.Context, model string, projectID, companyID int64, cursor Watermark) (Watermark, MasterDataResult, error) {
 	if companyID <= 0 {
 		return cursor, MasterDataResult{}, fmt.Errorf("connector: Odoo company_id 必须为正数")
 	}
-	return s.syncOnce(ctx, model, cursor, companyID)
+	return s.syncOnce(ctx, model, cursor, projectID, companyID)
 }
 
-func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Watermark, companyID int64) (Watermark, MasterDataResult, error) {
+func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Watermark, projectID, companyID int64) (Watermark, MasterDataResult, error) {
 	if strings.TrimSpace(model) == "" {
 		model = DefaultMasterDataModel
 	}
@@ -126,7 +130,7 @@ func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Wate
 			domain = cursorDomain
 		}
 	}
-	err := s.caller.Call(ctx, Request{Model: model, Method: "search_read", Params: map[string]any{
+	err := s.caller.Call(ctx, Request{ProjectID: projectID, Model: model, Method: "search_read", Params: map[string]any{
 		"domain": domain,
 		"fields": []string{"id", "name", "serial_no", "model", "write_date", "active", "company_id", "category_id"},
 		"order":  "write_date asc, id asc", "limit": s.batch,

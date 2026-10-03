@@ -6,12 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/SNCIC/odoo20iot/internal/dlq"
 )
+
+func projectID(raw string) int64 {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return 0
+	}
+	return id
+}
 
 // RetryDelays 是重试阶梯（04 §3.3：重试 1 +500ms / 重试 2 +2s / 重试 3 +8s）。
 var RetryDelays = []time.Duration{500 * time.Millisecond, 2 * time.Second, 8 * time.Second}
@@ -283,6 +292,7 @@ func (d *Dispatcher) recordDLQ(ctx context.Context, msg Message, policy Policy, 
 		return fmt.Errorf("notify: 序列化死信载荷: %w", err)
 	}
 	entry := dlq.Entry{
+		ProjectID:      projectID(msg.ProjectID),
 		Service:        "svc-notify",
 		Subject:        channel,
 		EntityType:     "notification",

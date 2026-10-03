@@ -405,7 +405,7 @@ func run(cfg config) error {
 	}
 	if replayer != nil {
 		go func() {
-			if err := runOdooDLQReplay(ctx, replayer, cfg.dlqReplayInterval, cfg.dlqReplayBatch, logger); err != nil {
+			if err := runOdooDLQReplay(ctx, replayer, cfg.dlqReplayInterval, cfg.dlqReplayBatch, catalogStore, logger); err != nil {
 				errCh <- fmt.Errorf("Odoo DLQ 重放异常退出: %w", err)
 			}
 		}()
@@ -467,7 +467,7 @@ func runMasterDataLoop(ctx context.Context, syncer *connector.MasterDataSync, wa
 				if !found {
 					cursor = connector.Watermark{}
 				}
-				next, result, err := syncer.SyncOnceForCompany(ctx, model, project.OdooCompanyID, cursor)
+				next, result, err := syncer.SyncOnceForProjectCompany(ctx, model, project.ID, project.OdooCompanyID, cursor)
 				if err != nil {
 					return err
 				}
@@ -517,17 +517,42 @@ func runMasterDataLoop(ctx context.Context, syncer *connector.MasterDataSync, wa
 	}
 }
 
-func runOdooDLQReplay(ctx context.Context, replayer *dlq.Replayer, interval time.Duration, batch int, logger *slog.Logger) error {
+func runOdooDLQReplay(ctx context.Context, replayer *dlq.Replayer, interval time.Duration, batch int, projects catalog.ProjectLister, logger *slog.Logger) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	replay := func() {
-		result, err := replayer.Replay(ctx, "odoo-connector", "", batch)
-		if err != nil {
-			logger.Error("Odoo DLQ 扫描失败", "error", err)
+		if projects == nil {
+			result, err := replayer.Replay(ctx, "odoo-connector", "", batch)
+			if err != nil {
+				logger.Error("Odoo DLQ 扫描失败", "error", err)
+				return
+			}
+			if result.Scanned > 0 {
+				logger.Info("Odoo DLQ 扫描完成", "scanned", result.Scanned, "succeeded", result.Succeeded, "failed", result.Failed, "skipped", result.Skipped)
+			}
 			return
 		}
-		if result.Scanned > 0 {
-			logger.Info("Odoo DLQ 扫描完成", "scanned", result.Scanned, "succeeded", result.Succeeded, "failed", result.Failed, "skipped", result.Skipped)
+		items, err := projects.ListProjects(ctx)
+		if err != nil {
+			logger.Error("Odoo DLQ 租户枚举失败", "error", err)
+			return
+		}
+		for _, project := range items {
+			result, err := replayer.ReplayForProject(ctx, project.ID, "odoo-connector", "", batch)
+			if err != nil {
+				logger.Error("Odoo DLQ 租户扫描失败", "project_id", project.ID, "error", err)
+				continue
+			}
+			if result.Scanned > 0 {
+				logger.Info("Odoo DLQ 租户扫描完成", "project_id", project.ID, "scanned", result.Scanned, "succeeded", result.Succeeded, "failed", result.Failed, "skipped", result.Skipped)
+			}
+		}
+		// 兼容租户传播改造前写入的 project_id=0 死信，避免永久滞留。
+		result, err := replayer.ReplayForProject(ctx, 0, "odoo-connector", "", batch)
+		if err != nil {
+			logger.Error("Odoo DLQ 兼容范围扫描失败", "project_id", 0, "error", err)
+		} else if result.Scanned > 0 {
+			logger.Info("Odoo DLQ 兼容范围扫描完成", "project_id", 0, "scanned", result.Scanned, "succeeded", result.Succeeded, "failed", result.Failed, "skipped", result.Skipped)
 		}
 	}
 	for {
@@ -562,6 +587,7 @@ func runDLQAlertLoop(ctx context.Context, store *dlq.Store, interval, window tim
 				continue
 			}
 			logger.Warn("P2：DLQ 聚合告警",
+				"project_id", aggregate.ProjectID,
 				"service", aggregate.Service,
 				"subject", aggregate.Subject,
 				"entity_type", aggregate.EntityType,
@@ -570,9 +596,10 @@ func runDLQAlertLoop(ctx context.Context, store *dlq.Store, interval, window tim
 			)
 			if sender != nil {
 				msg := notify.Message{
-					TraceID: "dlq-alert", AlarmID: fmt.Sprintf("dlq:%s:%s:%s", aggregate.Service, aggregate.Subject, aggregate.EntityType),
+					ProjectID: strconv.FormatInt(aggregate.ProjectID, 10),
+					TraceID:   "dlq-alert", AlarmID: fmt.Sprintf("dlq:%d:%s:%s:%s", aggregate.ProjectID, aggregate.Service, aggregate.Subject, aggregate.EntityType),
 					Level: "critical", Subject: "IoT DLQ 聚合告警",
-					Body: fmt.Sprintf("服务=%s\n主题=%s\n实体=%s\n数量=%d\n窗口=%s", aggregate.Service, aggregate.Subject, aggregate.EntityType, aggregate.Count, window),
+					Body: fmt.Sprintf("项目=%d\n服务=%s\n主题=%s\n实体=%s\n数量=%d\n窗口=%s", aggregate.ProjectID, aggregate.Service, aggregate.Subject, aggregate.EntityType, aggregate.Count, window),
 				}
 				if err := sender.Send(ctx, msg, []string{webhookURL}); err != nil {
 					logger.Error("DLQ 聚合告警 Webhook 投递失败", "error", err, "service", aggregate.Service, "subject", aggregate.Subject)

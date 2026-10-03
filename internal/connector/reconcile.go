@@ -38,6 +38,14 @@ const (
 	gapKeyOutbox = "outbox"
 )
 
+func parseProjectID(raw string) int64 {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return 0
+	}
+	return id
+}
+
 // caller 是 Reconciler 对编排层的依赖（收窄接口，便于测试注入）。
 //
 // 对账必须**走编排层**：它同样是在打 Odoo，不能绕开限流与熔断 ——
@@ -387,9 +395,10 @@ func (r *Reconciler) reconcileModelScoped(ctx context.Context, model, tenantID s
 
 	var rows []c2Row
 	err = r.caller.Call(ctx, Request{
-		Model:   model,
-		Method:  "search_read",
-		TraceID: "reconcile",
+		ProjectID: parseProjectID(tenantID),
+		Model:     model,
+		Method:    "search_read",
+		TraceID:   "reconcile",
 		Params: map[string]any{
 			// `(write_date, id) > (水位.write_date, 水位.id)`：
 			// 时间戳严格更大，**或**时间戳相等但 id 更大。
@@ -512,9 +521,10 @@ func (r *Reconciler) baseline(ctx context.Context, model string) error {
 func (r *Reconciler) baselineScoped(ctx context.Context, model, tenantID string, companyID int64, advance func(context.Context, Watermark) error) error {
 	var rows []c2Row
 	err := r.caller.Call(ctx, Request{
-		Model:   model,
-		Method:  "search_read",
-		TraceID: "reconcile",
+		ProjectID: parseProjectID(tenantID),
+		Model:     model,
+		Method:    "search_read",
+		TraceID:   "reconcile",
 		Params: map[string]any{
 			"domain": func() []any {
 				if companyID > 0 {

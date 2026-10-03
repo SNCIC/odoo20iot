@@ -16,6 +16,11 @@ type replayStore interface {
 	MarkReplayed(context.Context, int64, time.Time, bool, string) error
 }
 
+type projectReplayStore interface {
+	ListPendingForProject(context.Context, int64, string, string, int) ([]Record, error)
+	MarkReplayedForProject(context.Context, int64, int64, time.Time, bool, string) error
+}
+
 // Replayer 按 entity_type 分发死信重放。
 type Replayer struct {
 	store       replayStore
@@ -87,6 +92,49 @@ func (r *Replayer) Replay(ctx context.Context, service, subject string, limit in
 		}
 		result.Succeeded++
 		if err := r.store.MarkReplayed(ctx, row.ID, row.CreatedAt, true, ""); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+func (r *Replayer) ReplayForProject(ctx context.Context, projectID int64, service, subject string, limit int) (ReplayResult, error) {
+	store, ok := r.store.(projectReplayStore)
+	if !ok {
+		return ReplayResult{}, fmt.Errorf("dlq: 存储不支持租户重放")
+	}
+	rows, err := store.ListPendingForProject(ctx, projectID, service, subject, limit)
+	if err != nil {
+		return ReplayResult{}, err
+	}
+	result := ReplayResult{Scanned: len(rows)}
+	mark := func(row Record, success bool, reason string) error {
+		return store.MarkReplayedForProject(ctx, projectID, row.ID, row.CreatedAt, success, reason)
+	}
+	for _, row := range rows {
+		r.mu.RLock()
+		h := r.handlers[row.EntityType]
+		r.mu.RUnlock()
+		if h == nil {
+			result.Skipped++
+			if err := mark(row, false, "没有匹配的 DLQ 重放处理器"); err != nil {
+				return result, err
+			}
+			continue
+		}
+		if row.ReplayCount >= r.maxAttempts {
+			result.Skipped++
+			continue
+		}
+		if err := h(ctx, row); err != nil {
+			result.Failed++
+			if markErr := mark(row, false, err.Error()); markErr != nil {
+				return result, markErr
+			}
+			continue
+		}
+		result.Succeeded++
+		if err := mark(row, true, ""); err != nil {
 			return result, err
 		}
 	}

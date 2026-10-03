@@ -31,10 +31,11 @@ func SuppressDLQ(ctx context.Context) context.Context {
 
 // Request 是一次写回 / 查询请求。
 type Request struct {
-	Scope  string
-	Model  string
-	Method string
-	Params any
+	ProjectID int64
+	Scope     string
+	Model     string
+	Method    string
+	Params    any
 	// IdempotencyKey 非空表示携带幂等键（§4.3.1）。它影响两件事：
 	//   - **下游超时是否可重试**（§4.3.2「仅在携带幂等键时重试」）；
 	//   - 是否走 Guard 的并发重复拦截。
@@ -202,6 +203,7 @@ func (c *Connector) recordDLQ(ctx context.Context, req Request, callErr error) {
 		return
 	}
 	entry := dlq.Entry{
+		ProjectID:      req.ProjectID,
 		Service:        "odoo-connector",
 		Subject:        req.Model + "." + req.Method,
 		EntityType:     "odoo_call",
