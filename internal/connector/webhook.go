@@ -202,7 +202,13 @@ func (w *Webhook) advanceWatermark(r *http.Request, req webhookRequest, occurred
 		return
 	}
 	wm := Watermark{WriteDate: occurred, ID: req.ID}
-	if err := w.watermarks.Advance(r.Context(), req.Model, wm); err != nil {
+	var err error
+	if scoped, ok := w.watermarks.(TenantWatermarks); ok && strings.TrimSpace(req.TenantID) != "" {
+		err = scoped.AdvanceForTenant(r.Context(), strings.TrimSpace(req.TenantID), req.Model, wm)
+	} else {
+		err = w.watermarks.Advance(r.Context(), req.Model, wm)
+	}
+	if err != nil {
 		w.logger.Warn("记录 C-2 水位失败（下轮对账可能重复补投一次）",
 			"model", req.Model, "id", req.ID, "error", err)
 	}

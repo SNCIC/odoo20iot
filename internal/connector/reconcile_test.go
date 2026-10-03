@@ -151,6 +151,22 @@ func TestMemWatermarks_只进不退(t *testing.T) {
 	}
 }
 
+func TestMemWatermarks_租户隔离(t *testing.T) {
+	wm := NewMemWatermarks()
+	ctx := context.Background()
+	value := Watermark{WriteDate: testNow, ID: 10}
+	if err := wm.AdvanceForTenant(ctx, "101", "maintenance.equipment", value); err != nil {
+		t.Fatalf("租户水位推进失败: %v", err)
+	}
+	if _, ok, err := wm.GetForTenant(ctx, "202", "maintenance.equipment"); err != nil || ok {
+		t.Fatalf("不同租户不应读到水位: ok=%v err=%v", ok, err)
+	}
+	got, ok, err := wm.GetForTenant(ctx, "101", "maintenance.equipment")
+	if err != nil || !ok || got.ID != value.ID {
+		t.Fatalf("同租户应读回水位: %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ① Outbox 非终态行
 // ---------------------------------------------------------------------------
