@@ -8,7 +8,15 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/SNCIC/odoo20iot/internal/catalog"
 )
+
+type fakeProjectLister struct{ projects []catalog.Project }
+
+func (f fakeProjectLister) ListProjects(context.Context) ([]catalog.Project, error) {
+	return f.projects, nil
+}
 
 // testNow 是测试用的固定时钟，让 domain 里的 cutoff 可精确断言。
 var testNow = time.Date(2026, 10, 1, 8, 0, 0, 0, time.UTC)
@@ -164,6 +172,41 @@ func TestMemWatermarks_租户隔离(t *testing.T) {
 	got, ok, err := wm.GetForTenant(ctx, "101", "maintenance.equipment")
 	if err != nil || !ok || got.ID != value.ID {
 		t.Fatalf("同租户应读回水位: %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
+func TestReconciler_按租户过滤C2并隔离水位(t *testing.T) {
+	caller := newFakeCaller()
+	caller.push("maintenance.equipment", []map[string]any{{"id": 11, "write_date": "2026-10-01 07:00:00"}})
+	caller.push("maintenance.equipment", []map[string]any{{"id": 22, "write_date": "2026-10-01 07:01:00"}})
+	wm := NewMemWatermarks()
+	r, err := NewReconciler(ReconcileOptions{
+		Caller: caller, Publisher: new(fakePub), Watermarks: wm,
+		Models: []string{"maintenance.equipment"}, Projects: fakeProjectLister{projects: []catalog.Project{
+			{ID: 101, OdooCompanyID: 1}, {ID: 202, OdooCompanyID: 2},
+		}}, Logger: testLogger(), Now: func() time.Time { return testNow },
+	})
+	if err != nil {
+		t.Fatalf("构造对账器失败: %v", err)
+	}
+	if _, err := r.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("对账失败: %v", err)
+	}
+	calls := caller.callsFor("maintenance.equipment")
+	if len(calls) != 2 {
+		t.Fatalf("应按两个租户分别查询，得到 %d 次", len(calls))
+	}
+	for _, call := range calls {
+		domain := call.Params.(map[string]any)["domain"].([]any)
+		if !(len(domain) == 1 && fmt.Sprint(domain[0]) != "") && !(len(domain) == 2 && domain[0] == "&") {
+			t.Fatalf("租户查询应带 company domain: %#v", domain)
+		}
+	}
+	if _, ok, _ := wm.GetForTenant(context.Background(), "101", "maintenance.equipment"); !ok {
+		t.Fatal("租户 101 应建立独立水位")
+	}
+	if _, ok, _ := wm.GetForTenant(context.Background(), "202", "maintenance.equipment"); !ok {
+		t.Fatal("租户 202 应建立独立水位")
 	}
 }
 

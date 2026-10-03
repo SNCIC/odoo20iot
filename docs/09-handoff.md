@@ -39,11 +39,13 @@
 
 **主数据同步租户增量（2026-10-03）**：新增 `catalog.ListProjects`，连接器按每个 active IoT project 的 `odoo_company_id` 分别向 Odoo 查询 `maintenance.equipment`，并使用 `tenant:{project_id}:{model}` 的 Redis watermark 与 `(project_id, model)` 的 PG fallback；不再把多个租户设备混在一个全局主数据游标中。开发库实测 `project_id=1/company_id=1` 读取 3 条、写入 3 条，连接器重启和 readiness 均通过。C-2 对账仍保留无租户来源的兼容作用域，故 watermark FORCE RLS 待对账路径也完成租户化后启用。
 
+**C-2 对账租户增量（2026-10-03）**：对账器按 active IoT project 的 `odoo_company_id` 分别执行 `search_read`，C-2 查询 domain 使用扁平 Odoo 前缀表达式，避免 Odoo 20 的嵌套 domain 解析错误；每个租户独立读取/推进 `(project_id, model)` watermark，补投事件携带 `tenant_id` 与 `company_id`。新增租户过滤和水位隔离回归测试；迁移 `0023_force_connector_watermark_rls` 已应用，`t_connector_watermark` 已启用 `FORCE ROW LEVEL SECURITY`。全量 Go 测试、连接器重建重启、Odoo 真实查询和 `18091/readyz` 验证通过。
+
 **升级通知增量（2026-10-02）**：`svc-notify` 识别告警事件的 `escalated=true`，通知策略可配置 `escalated_recipients` 按通道替换普通收件人；未配置时保持原收件人，兼容现有策略。`svc-alarm` 已持久化升级阶段并支持人工确认；确认后的升级抑制通过 `acknowledged_at` 闭环。
 
 **未确认升级增量（2026-10-02）**：`svc-alarm` 扫描 `active` 告警的 `notified_ts`，默认 30 分钟发布阶段 1 上级通知，默认 2 小时发布阶段 2 P1 通知；`t_alarm_active.escalation_stage` 通过迁移 `0015_alarm_escalation` 持久化，并用条件更新原子抢占，重启和多副本不会重复升级。策略支持 `ack_escalated_recipients`（阶段 1）与 `escalated_recipients`（阶段 2）。控制台人工确认 API 已实现：`POST /api/v1/alarms/{alarm_id}/ack`，需要 `alarm:write` scope；确认写入 `t_audit_log` 并抑制后续升级。
 
-下一步：A4 连接压测明确暂缓；继续将 C-2 对账路径改为按租户查询，完成后对 `t_connector_watermark` 启用 FORCE RLS；随后为 DLQ 补齐 project_id 契约、切换非 owner 应用账号，并接入独立 `svc-rule` 消费服务。mTLS 已具备签发和负面校验工具，仍需现场设备逐台切换与网关端到端启用验收。Odoo S1/S3 已完成本轮真实链路验收：手工触发 Outbox cron 投递 2 条 pending 事件，Redis Stream consumer `odoo-connector` 的 `pending=0、lag=0`，设备主数据同步和 `t_external_ref` 均已核验；定时 cron 仍保持关闭，避免开发环境自动对外通知。
+下一步：A4 连接压测明确暂缓；继续为 DLQ 补齐 `project_id` 契约、切换非 owner 应用账号，并接入独立 `svc-rule` 消费服务。mTLS 已具备签发和负面校验工具，仍需现场设备逐台切换与网关端到端启用验收。Odoo S1/S3 已完成本轮真实链路验收：手工触发 Outbox cron 投递 2 条 pending 事件，Redis Stream consumer `odoo-connector` 的 `pending=0、lag=0`，设备主数据同步和 `t_external_ref` 均已核验；定时 cron 仍保持关闭，避免开发环境自动对外通知。
 
 ---
 

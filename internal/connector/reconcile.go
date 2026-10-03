@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/SNCIC/odoo20iot/internal/catalog"
 )
 
 // 对账（07 §4.4「定时对账（必做）」）的默认参数。
@@ -59,6 +62,7 @@ type ReconcileOptions struct {
 	ExternalRefs interface {
 		ReconcileUnbound(context.Context) (int, error)
 	}
+	Projects catalog.ProjectLister
 }
 
 // ReconcileResult 是单轮对账的统计。
@@ -96,6 +100,7 @@ type Reconciler struct {
 	externalRefs interface {
 		ReconcileUnbound(context.Context) (int, error)
 	}
+	projects catalog.ProjectLister
 
 	// gapStreak 记录每个来源「连续多少轮发现遗漏」。key 为 gapKeyOutbox 或模型名。
 	mu        sync.Mutex
@@ -126,6 +131,7 @@ func NewReconciler(opts ReconcileOptions) (*Reconciler, error) {
 		logger:       opts.Logger,
 		now:          opts.Now,
 		externalRefs: opts.ExternalRefs,
+		projects:     opts.Projects,
 		gapStreak:    make(map[string]int, 4),
 	}
 	if r.interval <= 0 {
@@ -195,6 +201,18 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (ReconcileResult, error)
 		return res, err
 	}
 	for _, model := range r.models {
+		if scoped, ok := r.watermarks.(TenantWatermarks); ok && r.projects != nil {
+			projects, err := r.projects.ListProjects(ctx)
+			if err != nil {
+				return res, fmt.Errorf("对账②：枚举租户: %w", err)
+			}
+			for _, project := range projects {
+				if err := r.reconcileModelScoped(ctx, model, strconv.FormatInt(project.ID, 10), project.OdooCompanyID, scoped, &res); err != nil {
+					return res, err
+				}
+			}
+			continue
+		}
 		if err := r.reconcileModel(ctx, model, &res); err != nil {
 			return res, err
 		}
@@ -336,12 +354,33 @@ type c2Row struct {
 }
 
 func (r *Reconciler) reconcileModel(ctx context.Context, model string, res *ReconcileResult) error {
-	wm, ok, err := r.watermarks.Get(ctx, model)
+	return r.reconcileModelScoped(ctx, model, "", 0, nil, res)
+}
+
+func (r *Reconciler) reconcileModelScoped(ctx context.Context, model, tenantID string, companyID int64, scoped TenantWatermarks, res *ReconcileResult) error {
+	gapKey := model
+	if tenantID != "" {
+		gapKey = tenantID + ":" + model
+	}
+	get := func(ctx context.Context) (Watermark, bool, error) {
+		if scoped != nil {
+			return scoped.GetForTenant(ctx, tenantID, model)
+		}
+		return r.watermarks.Get(ctx, model)
+	}
+	advance := func(ctx context.Context, wm Watermark) error {
+		if scoped != nil {
+			return scoped.AdvanceForTenant(ctx, tenantID, model, wm)
+		}
+		return r.watermarks.Advance(ctx, model, wm)
+	}
+
+	wm, ok, err := get(ctx)
 	if err != nil {
 		return fmt.Errorf("对账②：读取 %s 水位: %w", model, err)
 	}
 	if !ok {
-		return r.baseline(ctx, model)
+		return r.baselineScoped(ctx, model, tenantID, companyID, advance)
 	}
 
 	wmStr := wm.WriteDate.UTC().Format(odooDatetimeLayout)
@@ -355,11 +394,17 @@ func (r *Reconciler) reconcileModel(ctx context.Context, model string, res *Reco
 			// `(write_date, id) > (水位.write_date, 水位.id)`：
 			// 时间戳严格更大，**或**时间戳相等但 id 更大。
 			// 少了后半个条件，同一秒内写入的多条记录会永远漏在边界外。
-			"domain": []any{
-				"|",
-				"&", []any{"write_date", "=", wmStr}, []any{"id", ">", wm.ID},
-				[]any{"write_date", ">", wmStr},
-			},
+			"domain": func() []any {
+				cursorDomain := []any{
+					"|",
+					"&", []any{"write_date", "=", wmStr}, []any{"id", ">", wm.ID},
+					[]any{"write_date", ">", wmStr},
+				}
+				if companyID > 0 {
+					return append([]any{"&", []any{"company_id", "=", companyID}}, cursorDomain...)
+				}
+				return cursorDomain
+			}(),
 			"fields": []string{"id", "write_date"},
 			"order":  "write_date asc, id asc",
 			"limit":  r.batch,
@@ -376,7 +421,7 @@ func (r *Reconciler) reconcileModel(ctx context.Context, model string, res *Reco
 		// 一个一周没变的模型会让这个指标一直报警（实测踩过：基线落在 8 天前的
 		// 记录上，指标直接报 693941 秒）。
 		r.observeLag(0)
-		r.clearGap(model)
+		r.clearGap(gapKey)
 		return nil
 	}
 
@@ -386,7 +431,7 @@ func (r *Reconciler) reconcileModel(ctx context.Context, model string, res *Reco
 	}
 
 	res.CursorModels++
-	if streak := r.noteGap(model); streak >= ReconcileAlertStreak {
+	if streak := r.noteGap(gapKey); streak >= ReconcileAlertStreak {
 		res.Alerts++
 		r.logger.Error("对账②：同一模型连续多轮存在水位差，补投未收敛 —— 需人工介入",
 			"model", model, "streak", streak, "gap", len(rows))
@@ -410,6 +455,8 @@ func (r *Reconciler) reconcileModel(ctx context.Context, model string, res *Reco
 			// 与 webhook 路径同一口径（07 §4.4.1）：那条 webhook 若其实到达过，
 			// 下游按 event_id 去重即可，补投不会变成重复。
 			EventID:        fmt.Sprintf("c2:%s:%d:%s", model, row.ID, row.WriteDate),
+			TenantID:       tenantID,
+			CompanyID:      companyID,
 			AggregateModel: model,
 			AggregateID:    row.ID,
 			Version:        1,
@@ -442,11 +489,11 @@ func (r *Reconciler) reconcileModel(ctx context.Context, model string, res *Reco
 
 	// 只把水位推进到**已成功补投**的位置。
 	if last.After(wm) {
-		if err := r.watermarks.Advance(ctx, model, last); err != nil {
+		if err := advance(ctx, last); err != nil {
 			return fmt.Errorf("对账②：推进 %s 水位: %w", model, err)
 		}
 		r.logger.Warn("对账②：补投水位差",
-			"model", model, "republished", republished, "watermark", last.WriteDate)
+			"model", model, "tenant_id", tenantID, "republished", republished, "watermark", last.WriteDate)
 	}
 	return nil
 }
@@ -457,13 +504,24 @@ func (r *Reconciler) reconcileModel(ctx context.Context, model string, res *Reco
 // 补投 —— 那是全量同步，不是对账，会把总线和下游一次打爆。
 // 首次对账的正确动作是「记住现在在哪」，从这一刻起才开始负责。
 func (r *Reconciler) baseline(ctx context.Context, model string) error {
+	return r.baselineScoped(ctx, model, "", 0, func(ctx context.Context, wm Watermark) error {
+		return r.watermarks.Advance(ctx, model, wm)
+	})
+}
+
+func (r *Reconciler) baselineScoped(ctx context.Context, model, tenantID string, companyID int64, advance func(context.Context, Watermark) error) error {
 	var rows []c2Row
 	err := r.caller.Call(ctx, Request{
 		Model:   model,
 		Method:  "search_read",
 		TraceID: "reconcile",
 		Params: map[string]any{
-			"domain": []any{},
+			"domain": func() []any {
+				if companyID > 0 {
+					return []any{[]any{"company_id", "=", companyID}}
+				}
+				return []any{}
+			}(),
 			"fields": []string{"id", "write_date"},
 			"order":  "write_date desc, id desc",
 			"limit":  1,
@@ -482,11 +540,11 @@ func (r *Reconciler) baseline(ctx context.Context, model string) error {
 		return fmt.Errorf("对账②：%s 基线 write_date 无法解析: %w", model, err)
 	}
 	wm := Watermark{WriteDate: ts, ID: rows[0].ID}
-	if err := r.watermarks.Advance(ctx, model, wm); err != nil {
+	if err := advance(ctx, wm); err != nil {
 		return err
 	}
 	r.logger.Info("对账②：建立水位基线（避免首轮把历史记录全量当成遗漏）",
-		"model", model, "watermark", wm.WriteDate, "id", wm.ID)
+		"model", model, "tenant_id", tenantID, "watermark", wm.WriteDate, "id", wm.ID)
 	return nil
 }
 

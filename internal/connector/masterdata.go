@@ -119,8 +119,9 @@ func (s *MasterDataSync) syncOnce(ctx context.Context, model string, cursor Wate
 	}
 	if !cursor.WriteDate.IsZero() {
 		cursorDomain := []any{"|", "&", []any{"write_date", "=", wm}, []any{"id", ">", cursor.ID}, []any{"write_date", ">", wm}}
-		if len(domain) > 0 {
-			domain = append(domain, cursorDomain)
+		if companyID > 0 {
+			domain = []any{"&", []any{"company_id", "=", companyID}}
+			domain = append(domain, cursorDomain...)
 		} else {
 			domain = cursorDomain
 		}

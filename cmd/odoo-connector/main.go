@@ -287,6 +287,13 @@ func run(cfg config) error {
 
 	// 定时对账（§4.4）。Caller 传的是编排层本身，
 	// 这样对账的 Odoo 查询同样受限流与熔断保护。
+	var catalogStore *catalog.PGStore
+	if businessPool != nil {
+		catalogStore, err = catalog.NewPGStore(businessPool)
+		if err != nil {
+			return err
+		}
+	}
 	reconcileOpts := connector.ReconcileOptions{
 		Caller:     conn,
 		Publisher:  publisher,
@@ -297,6 +304,7 @@ func run(cfg config) error {
 		Batch:      cfg.reconcileBatch,
 		Metrics:    metrics,
 		Logger:     logger,
+		Projects:   catalogStore,
 	}
 	if refs != nil {
 		reconcileOpts.ExternalRefs = refs
@@ -307,15 +315,9 @@ func run(cfg config) error {
 	}
 
 	var masterSync *connector.MasterDataSync
-	var masterCatalog *catalog.PGStore
 	if strings.TrimSpace(cfg.masterDataModel) != "" {
-		cat, err := catalog.NewPGStore(businessPool)
-		if err != nil {
-			return err
-		}
-		masterCatalog = cat
 		masterSync, err = connector.NewMasterDataSync(connector.MasterDataOptions{
-			Caller: conn, Catalog: cat, Projects: cat, Refs: extref.NewStore(businessPool),
+			Caller: conn, Catalog: catalogStore, Projects: catalogStore, Refs: extref.NewStore(businessPool),
 			Batch: cfg.masterDataBatch, Logger: logger,
 		})
 		if err != nil {
@@ -389,7 +391,7 @@ func run(cfg config) error {
 	}()
 	if masterSync != nil {
 		go func() {
-			if err := runMasterDataLoop(ctx, masterSync, watermarks, cfg.masterDataModel, cfg.masterDataInterval, logger, masterCatalog); err != nil {
+			if err := runMasterDataLoop(ctx, masterSync, watermarks, cfg.masterDataModel, cfg.masterDataInterval, logger, catalogStore); err != nil {
 				errCh <- fmt.Errorf("主数据同步异常退出: %w", err)
 			}
 		}()
