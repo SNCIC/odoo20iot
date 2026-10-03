@@ -149,6 +149,33 @@ func TestGatewayDeviceTypeMigrationAddsFlag(t *testing.T) {
 	}
 }
 
+func TestRuleRuntimeContractMigration(t *testing.T) {
+	migs, err := LoadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.Version == "0031_rule_runtime_contract" {
+			sql = m.SQL
+			break
+		}
+	}
+	for _, want := range []string{
+		`ADD COLUMN IF NOT EXISTS priority`,
+		`ADD COLUMN IF NOT EXISTS "match"`,
+		`ADD COLUMN IF NOT EXISTS "window"`,
+		`ADD COLUMN IF NOT EXISTS dag`,
+		`ADD COLUMN IF NOT EXISTS capabilities`,
+		`ck_alarm_rule_error_policy`,
+		`idx_alarm_rule_runtime_active`,
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("0031 缺少规则运行时契约语句 %q", want)
+		}
+	}
+}
+
 func TestConnectorWatermarkMigration(t *testing.T) {
 	migs, err := LoadMigrations()
 	if err != nil {

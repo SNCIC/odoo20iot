@@ -511,3 +511,4 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 - 当前仍需外部配置/验收：生产 Vault、mTLS 设备证书生命周期、完整 Odoo 多模型字段映射和前端产品化页面；飞书通道代码已支持通过 `IOT_DLQ_ALERT_WEBHOOK` 或通知端点配置，真实 Webhook 联调需在不入库密钥的受控环境执行。
 
 - **2026-10-03 第四版复核修复**：通知策略读取按 `t_alarm_rule.project_id TEXT` 绑定字符串参数，用户组展开仍按 `t_user.project_id BIGINT` 绑定整数；配额迁移 `0029_quota_three_levels` 落地 80/90/100 三档（info/warning/critical）；迁移 `0030_ext_system_consistency` 将 Odoo 外部系统标识统一为 `odoo20tbb` 并加约束；`svc-alarm` 静默窗口按租户事务加载并每 60 秒热加载；`conn_peak` 改为窗口最大值语义。
+- **2026-10-03 规则运行时契约准备**：迁移 `0031_rule_runtime_contract` 为 `t_alarm_rule` 增加 `priority`、`match`、`window`、`dag`、`capabilities`、`error_policy`、`effective_from` 字段及索引，兼容现有通知策略字段；这是 `svc-rule` 接入前置，不代表规则消费服务已完成。
