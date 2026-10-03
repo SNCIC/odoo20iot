@@ -147,26 +147,6 @@ func TestReporter_FailedReportIsRetriedWithStableReportID(t *testing.T) {
 	}
 }
 
-func TestReporter_PendingReportsHaveBoundedQueue(t *testing.T) {
-	a := NewAccumulator()
-	r, err := NewReporter(ReporterOptions{
-		Accumulator: a, Publisher: &fakePublisher{}, Logger: testLogger(),
-	})
-	if err != nil {
-		t.Fatalf("构造上报器失败: %v", err)
-	}
-
-	for i := 0; i < MaxPendingReports+1; i++ {
-		r.deferReport(UsageReport{ProjectID: int64(i + 1), ReportID: "report"})
-	}
-	if got := r.Metrics().PendingReports.Load(); got != MaxPendingReports {
-		t.Fatalf("待重试批次应限制为 %d，得到 %d", MaxPendingReports, got)
-	}
-	if got := r.Metrics().PendingReportsDropped.Load(); got != 1 {
-		t.Fatalf("应丢弃 1 个最旧批次，得到 %d", got)
-	}
-}
-
 // TestReporter_UsesUsageSubject 确认上报落在文档约定的 subject 上。
 func TestReporter_UsesUsageSubject(t *testing.T) {
 	a := NewAccumulator()

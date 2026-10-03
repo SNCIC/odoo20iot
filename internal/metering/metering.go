@@ -37,9 +37,6 @@ const UsageSubject = "iot.quota.usage"
 // DefaultWindow 是上报窗口（04 §6：网关每 10s 上报）。
 const DefaultWindow = 10 * time.Second
 
-// MaxPendingReports 限制 NATS 长时间不可用时的内存重试队列。
-const MaxPendingReports = 1000
-
 // Accumulator 是本地累加器：热路径只做一次加锁自增。
 //
 // 用普通 map + mutex 而非分片：单条消息一次无竞争 lock 的开销在纳秒级，
@@ -129,8 +126,6 @@ type Metrics struct {
 	CountersReported atomic.Int64
 	// PendingReports 当前待重试批次数。
 	PendingReports atomic.Int64
-	// PendingReportsDropped 因队列达到上限而丢弃的批次数。
-	PendingReportsDropped atomic.Int64
 }
 
 // Reporter 周期性把累加器的计数批量上报到总线。
@@ -275,11 +270,6 @@ func (r *Reporter) Flush(ctx context.Context) int {
 
 func (r *Reporter) deferReport(report UsageReport) {
 	r.mu.Lock()
-	if len(r.pending) >= MaxPendingReports {
-		r.pending = r.pending[1:]
-		r.metrics.PendingReportsDropped.Add(1)
-		r.logger.Error("计量重试队列已满，丢弃最旧批次", "project_id", report.ProjectID, "report_id", report.ReportID, "pending_limit", MaxPendingReports)
-	}
 	r.pending = append(r.pending, report)
 	r.metrics.PendingReports.Store(int64(len(r.pending)))
 	r.mu.Unlock()
