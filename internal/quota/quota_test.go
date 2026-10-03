@@ -23,6 +23,15 @@ type fakeStore struct {
 	err    error
 }
 
+type fakeDurableStore struct {
+	records []string
+}
+
+func (f *fakeDurableStore) Record(_ context.Context, report metering.UsageReport, metric string, delta int64) error {
+	f.records = append(f.records, fmt.Sprintf("%s:%s:%d", report.ReportID, metric, delta))
+	return nil
+}
+
 func (f *fakeStore) IncrBy(_ context.Context, projectID int64, metric string, delta int64) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -52,9 +61,10 @@ func TestAggregator_ApplyAccumulates(t *testing.T) {
 	agg := NewAggregator(store, nil, testLogger())
 
 	// 同一租户、同一指标，两个窗口。
-	for _, v := range []int64{100, 50} {
+	for index, v := range []int64{100, 50} {
 		data := report(t, metering.UsageReport{
 			ProjectID: 7,
+			ReportID:  fmt.Sprintf("report-%d", index),
 			Counters:  map[string]int64{metering.MetricMsgCount: v},
 		})
 		if err := agg.Apply(context.Background(), data); err != nil {
@@ -77,6 +87,7 @@ func TestAggregator_SkipsZeroDelta(t *testing.T) {
 
 	data := report(t, metering.UsageReport{
 		ProjectID: 1,
+		ReportID:  "report-zero",
 		Counters:  map[string]int64{metering.MetricMsgCount: 0},
 	})
 	if err := agg.Apply(context.Background(), data); err != nil {
@@ -110,6 +121,7 @@ func TestAggregator_StoreErrorIsRetryable(t *testing.T) {
 
 	data := report(t, metering.UsageReport{
 		ProjectID: 1,
+		ReportID:  "report-error",
 		Counters:  map[string]int64{metering.MetricMsgCount: 10},
 	})
 	err := agg.Apply(context.Background(), data)
@@ -121,6 +133,28 @@ func TestAggregator_StoreErrorIsRetryable(t *testing.T) {
 	}
 	if got := agg.Metrics().Errors.Load(); got != 1 {
 		t.Fatalf("应记录 1 次错误，得到 %d", got)
+	}
+}
+
+func TestAggregator_DurableStoreReceivesStableReportID(t *testing.T) {
+	store := new(fakeStore)
+	durable := new(fakeDurableStore)
+	agg := NewAggregator(store, nil, testLogger()).WithDurableStore(durable)
+	data := report(t, metering.UsageReport{
+		ProjectID: 7,
+		NodeID:    "gw-1",
+		Window:    time.Date(2026, 10, 3, 1, 2, 0, 0, time.UTC),
+		ReportID:  "report-1",
+		Counters:  map[string]int64{metering.MetricMsgCount: 10},
+	})
+	if err := agg.Apply(context.Background(), data); err != nil {
+		t.Fatal(err)
+	}
+	if err := agg.Apply(context.Background(), data); err != nil {
+		t.Fatal(err)
+	}
+	if len(durable.records) != 2 || durable.records[0] != durable.records[1] {
+		t.Fatalf("report id must remain stable: %v", durable.records)
 	}
 }
 

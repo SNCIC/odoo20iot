@@ -10,6 +10,8 @@ package metering
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -96,6 +98,7 @@ type UsageReport struct {
 	ProjectID int64            `json:"project_id"`
 	NodeID    string           `json:"node_id,omitempty"`
 	Window    time.Time        `json:"window"`
+	ReportID  string           `json:"report_id,omitempty"`
 	Counters  map[string]int64 `json:"counters"`
 }
 
@@ -211,6 +214,13 @@ func (r *Reporter) Flush(ctx context.Context) int {
 			Window:    window,
 			Counters:  counters,
 		}
+		var reportID [16]byte
+		if _, err := rand.Read(reportID[:]); err != nil {
+			r.metrics.ReportErrors.Add(1)
+			r.logger.Error("生成计量批次标识失败", "project_id", pid, "error", err)
+			continue
+		}
+		report.ReportID = hex.EncodeToString(reportID[:])
 		data, err := json.Marshal(report)
 		if err != nil {
 			r.metrics.ReportErrors.Add(1)

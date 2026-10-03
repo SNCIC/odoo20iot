@@ -33,6 +33,7 @@ systemctl --user enable --now odoo20iot-svc-alarm.service
 systemctl --user enable --now odoo20iot-odoo-connector.service
 systemctl --user enable --now odoo20iot-svc-notify.service
 systemctl --user enable --now odoo20iot-iot-gateway.service
+systemctl --user enable --now odoo20iot-svc-quota.service
 ```
 
 真实密钥禁止写入 unit、命令行、Git 或日志。

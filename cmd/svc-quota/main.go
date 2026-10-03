@@ -25,17 +25,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
 	"github.com/SNCIC/odoo20iot/internal/natsjs"
+	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
 type config struct {
 	natsURL          string
 	redisURL         string
+	pgDSN            string
 	stream           string
 	subject          string
 	durable          string
@@ -58,6 +61,7 @@ func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.natsURL, "nats-url", "nats://100.64.0.3:28222", "NATS JetStream 地址")
 	flag.StringVar(&cfg.redisURL, "redis-url", "redis://100.64.0.3:28637/0", "Redis 地址（用量计数器）")
+	flag.StringVar(&cfg.pgDSN, "pg-dsn", envOrDefault("IOT_PG_DSN", pg.DefaultDSN), "PG 用量事实账本 DSN（默认开发库，可由 IOT_PG_DSN 覆盖）")
 	flag.StringVar(&cfg.stream, "stream", "IOT_QUOTA", "计量 Stream 名称（须与网关上一致）")
 	flag.StringVar(&cfg.subject, "subject", "iot.quota.usage", "消费的 subject")
 	flag.StringVar(&cfg.durable, "durable", "svc-quota", "durable consumer 名")
@@ -110,6 +114,26 @@ func run(cfg config) error {
 	// 3) 聚合器。
 	metrics := new(quota.Metrics)
 	agg := quota.NewAggregator(quota.NewRedisCounter(rdb, cfg.counterTTL), metrics, logger)
+	if cfg.pgDSN != "" {
+		pgPool, err := pg.Open(ctx, pg.Config{DSN: cfg.pgDSN})
+		if err != nil {
+			return fmt.Errorf("连接 PG 用量事实库: %w", err)
+		}
+		defer pgPool.Close()
+		pending, err := pendingMigrations(ctx, pgPool)
+		if err != nil {
+			return fmt.Errorf("检查 PG 用量事实库迁移: %w", err)
+		}
+		if len(pending) > 0 {
+			return fmt.Errorf("PG 用量事实库有未应用迁移: %v", pending)
+		}
+		pgStore, err := quota.NewPGStore(pgPool)
+		if err != nil {
+			return err
+		}
+		agg.WithDurableStore(pgStore)
+		logger.Info("PG 用量事实账本已启用")
+	}
 
 	// 4) 消费。
 	//
@@ -140,6 +164,31 @@ func run(cfg config) error {
 		"poison", metrics.PermanentTotal.Load(),
 		"errors", metrics.Errors.Load())
 	return nil
+}
+
+func pendingMigrations(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {
+	migrations, err := pg.LoadMigrations()
+	if err != nil {
+		return nil, err
+	}
+	applied, err := pg.AppliedVersions(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	var pending []string
+	for _, migration := range migrations {
+		if _, ok := applied[migration.Version]; !ok {
+			pending = append(pending, migration.Version)
+		}
+	}
+	return pending, nil
+}
+
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 // nakDelay 是可重试错误的退避重投间隔。
