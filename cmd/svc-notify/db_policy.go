@@ -47,20 +47,28 @@ func (s *dbPolicySource) Resolve(ctx context.Context, req notify.Request) (notif
 	if err != nil {
 		return notify.Policy{}, fmt.Errorf("读取租户通知策略: %w", err)
 	}
+	p := s.fallback
+	if queryErr != nil && !errors.Is(queryErr, pgx.ErrNoRows) {
+		return notify.Policy{}, fmt.Errorf("读取通知策略: %w", queryErr)
+	}
 	if errors.Is(queryErr, pgx.ErrNoRows) {
 		if s.logger != nil {
 			s.logger.Info("未找到数据库通知策略，使用默认策略", "project_id", project, "rule_id", req.RuleID)
 		}
-		return s.fallback, nil
+	} else {
+		var spec policySpec
+		if err := json.Unmarshal(raw, &spec); err != nil {
+			return notify.Policy{}, fmt.Errorf("解析数据库通知策略: %w", err)
+		}
+		p = spec.toPolicy()
 	}
-	if queryErr != nil {
-		return notify.Policy{}, fmt.Errorf("读取通知策略: %w", queryErr)
+	if p.Recipients != nil {
+		copyRecipients := make(map[string][]string, len(p.Recipients))
+		for channel, recipients := range p.Recipients {
+			copyRecipients[channel] = append([]string(nil), recipients...)
+		}
+		p.Recipients = copyRecipients
 	}
-	var spec policySpec
-	if err := json.Unmarshal(raw, &spec); err != nil {
-		return notify.Policy{}, fmt.Errorf("解析数据库通知策略: %w", err)
-	}
-	p := spec.toPolicy()
 	if len(p.Channels) == 0 {
 		p.Channels = s.fallback.Channels
 	}

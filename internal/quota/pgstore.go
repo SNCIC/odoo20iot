@@ -84,6 +84,42 @@ type Alert struct {
 	WindowStart time.Time
 }
 
+func (s *PGStore) MarkAlertPublished(ctx context.Context, alert Alert) error {
+	return pg.WithProjectTx(ctx, s.pool, alert.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE t_quota_alert SET published_at=now() WHERE project_id=$1 AND metric=$2 AND level=$3 AND window_start=$4 AND published_at IS NULL`, alert.ProjectID, alert.Metric, alert.Level, alert.WindowStart)
+		return err
+	})
+}
+
+func (s *PGStore) PendingAlerts(ctx context.Context) ([]Alert, error) {
+	projects, err := s.Projects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []Alert
+	for _, projectID := range projects {
+		err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+			rows, err := tx.Query(ctx, `SELECT project_id,metric,level,usage,limit_value,window_start FROM t_quota_alert WHERE project_id=$1 AND published_at IS NULL ORDER BY created_at LIMIT 100`, projectID)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var a Alert
+				if err := rows.Scan(&a.ProjectID, &a.Metric, &a.Level, &a.Usage, &a.Limit, &a.WindowStart); err != nil {
+					return err
+				}
+				out = append(out, a)
+			}
+			return rows.Err()
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 type ReconcileResult struct {
 	ProjectID  int64
 	Metric     string

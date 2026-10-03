@@ -8,9 +8,9 @@
 //     语音需要运营商语音网关，本期不做（如实留白，不做假实现）。
 //   - 死信落 `t_dlq`（04 §3.3），条目含原文、失败原因、重试历史与 trace_id。
 //
-// 订阅：`iot.alarm.>`（svc-alarm 的对外事件）。与 odoo-connector **共用同一个
-// subject、各用各的 durable** —— 一份事件、多个消费者，比给每个下游发明一个
-// 私有 subject 更不容易漏发。
+// 订阅：`iot.alarm.>`（svc-alarm 对外事件）与 `iot.quota.alert.>`（svc-quota 阈值事件），
+// 两者各用自己的 stream 绑定和 durable；配额事件与 usage 共用 `IOT_QUOTA` 流，靠 subject 隔离。
+// 告警事件仍与 odoo-connector 共用 subject、使用各自 durable。
 //
 // 未实现（如实留白）：
 //   - 通知策略来自配置文件而非 `t_alarm_rule.notify`（该表尚未建立）；
@@ -58,6 +58,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/notify"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/pg"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/secureconfig"
 )
 
@@ -67,11 +68,14 @@ type config struct {
 	pgDSN   string
 	natsURL string
 	// 订阅
-	subject   string
-	stream    string
-	durable   string
-	ackWait   time.Duration
-	fetchWait time.Duration
+	subject      string
+	stream       string
+	durable      string
+	quotaSubject string
+	quotaStream  string
+	quotaDurable string
+	ackWait      time.Duration
+	fetchWait    time.Duration
 	// consumerInactive 是消费者的空闲回收阈值（见 natsjs.Subscribe 的说明）。
 	consumerInactive time.Duration
 	batch            int
@@ -128,6 +132,9 @@ func parseFlags() config {
 	flag.StringVar(&cfg.subject, "subject", alarm.AlarmSubjectPrefix+".>", "订阅的告警事件 subject")
 	flag.StringVar(&cfg.stream, "stream", "IOT_ALARM", "告警事件的流名")
 	flag.StringVar(&cfg.durable, "durable", "svc-notify", "durable consumer 名")
+	flag.StringVar(&cfg.quotaSubject, "quota-subject", quota.QuotaAlertSubjectPrefix+".>", "配额告警 subject")
+	flag.StringVar(&cfg.quotaStream, "quota-stream", "IOT_QUOTA", "配额告警流名")
+	flag.StringVar(&cfg.quotaDurable, "quota-durable", "svc-notify-quota", "配额告警 durable consumer 名")
 	flag.DurationVar(&cfg.ackWait, "ack-wait", 30*time.Second, "总线等待 ACK 的上限")
 	flag.DurationVar(&cfg.consumerInactive, "consumer-inactive", 24*time.Hour,
 		"消费者空闲回收阈值；**必须 ≥ 服务可能的最长停机**，否则停机超过它就会重放整个保留窗口")
@@ -313,6 +320,13 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	quotaSub, err := natsjs.Subscribe(js, natsjs.Options{
+		Subject: cfg.quotaSubject, Durable: cfg.quotaDurable, Stream: cfg.quotaStream,
+		AckWait: cfg.ackWait, Inactive: cfg.consumerInactive,
+	})
+	if err != nil {
+		return err
+	}
 
 	counts := new(counters)
 	app := &notifier{
@@ -341,9 +355,10 @@ func run(cfg config) error {
 		"allow_loopback", cfg.allowLoopback,
 		"version", buildinfo.Version, "commit", buildinfo.Commit)
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	go func() { errCh <- serveHTTP(srv, logger) }()
-	go func() { errCh <- consumeLoop(ctx, sub, app, cfg, logger) }()
+	go func() { errCh <- consumeLoop(ctx, sub, app, cfg, logger, app.handleEvent, "告警") }()
+	go func() { errCh <- consumeLoop(ctx, quotaSub, app, cfg, logger, app.handleQuotaEvent, "配额告警") }()
 	if cfg.dlqReplayInterval > 0 {
 		go func() { errCh <- runNotifyDLQReplay(ctx, replayer, cfg.dlqReplayInterval, cfg.dlqReplayBatch, logger) }()
 	}
@@ -446,7 +461,7 @@ type notifier struct {
 	logger     *slog.Logger
 }
 
-func consumeLoop(ctx context.Context, sub *natsjs.Subscription, app *notifier, cfg config, logger *slog.Logger) error {
+func consumeLoop(ctx context.Context, sub *natsjs.Subscription, app *notifier, cfg config, logger *slog.Logger, handle func(context.Context, []byte) error, kind string) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -459,13 +474,13 @@ func consumeLoop(ctx context.Context, sub *natsjs.Subscription, app *notifier, c
 			if ctx.Err() != nil {
 				return nil
 			}
-			logger.Warn("拉取告警事件失败", "error", err)
+			logger.Warn("拉取通知事件失败", "kind", kind, "error", err)
 			continue
 		}
 
 		for _, m := range msgs {
 			app.counts.Received.Add(1)
-			err := app.handleEvent(ctx, m.Data)
+			err := handle(ctx, m.Data)
 
 			switch {
 			case err == nil:
@@ -477,10 +492,10 @@ func consumeLoop(ctx context.Context, sub *natsjs.Subscription, app *notifier, c
 				// 表现成「积压」，把注意力引向完全错误的方向。
 				if errors.Is(err, errNoPolicy) {
 					app.counts.Skipped.Add(1)
-					logger.Warn("该告警没有匹配的通知策略，已跳过（不重试、不进死信）", "error", err)
+					logger.Warn("该通知没有匹配的通知策略，已跳过（不重试、不进死信）", "kind", kind, "error", err)
 				} else {
 					app.counts.Poison.Add(1)
-					logger.Error("丢弃非法告警事件（重投无意义）", "error", err, "subject", m.Subject)
+					logger.Error("丢弃非法通知事件（重投无意义）", "kind", kind, "error", err, "subject", m.Subject)
 				}
 				_ = m.Ack()
 
@@ -569,6 +584,44 @@ func (n *notifier) handleEvent(ctx context.Context, data []byte) error {
 		if r.DegradedFrom != "" {
 			n.logger.Warn("通知靠降级送达",
 				"alarm", ev.AlarmID, "degraded_from", r.DegradedFrom, "via", r.Channel)
+		}
+	}
+	if err == nil {
+		n.counts.Delivered.Add(1)
+	}
+	return err
+}
+
+func (n *notifier) handleQuotaEvent(ctx context.Context, data []byte) error {
+	var ev quota.AlertEvent
+	if err := json.Unmarshal(data, &ev); err != nil {
+		return notify.Permanent("配额告警事件解析失败: %v", err)
+	}
+	if ev.ProjectID <= 0 || ev.Metric == "" || ev.Level == "" {
+		return notify.Permanent("配额告警事件缺少 project_id / metric / level")
+	}
+	policy, err := n.policies.Resolve(ctx, notify.Request{
+		ProjectID: ev.Project(), RuleID: ev.RuleID(), Level: ev.Level,
+	})
+	if err != nil {
+		if notify.IsPermanent(err) {
+			return fmt.Errorf("%w: %w", errNoPolicy, err)
+		}
+		return err
+	}
+	at := ev.WindowStart
+	msg := notify.Message{
+		TraceID:   ev.Project() + ":quota:" + ev.Metric + ":" + ev.Level + ":" + at.UTC().Format(time.RFC3339),
+		ProjectID: ev.Project(), RuleID: ev.RuleID(), Level: ev.Level,
+		Subject: "配额阈值告警 - " + ev.Metric,
+		At:      at,
+		Payload: map[string]any{"metric": ev.Metric, "usage": ev.Usage, "limit": ev.Limit, "window_start": ev.WindowStart},
+	}
+	msg.Body = fmt.Sprintf("配额指标 %s 达到%s阈值：当前用量 %d，阈值 %d，窗口开始 %s", ev.Metric, ev.Level, ev.Usage, ev.Limit, ev.WindowStart.Format(time.RFC3339))
+	results, err := n.dispatcher.Dispatch(ctx, msg, policy)
+	for _, r := range results {
+		if r.OK() {
+			n.metrics.RecordChannel(r.Channel)
 		}
 	}
 	if err == nil {

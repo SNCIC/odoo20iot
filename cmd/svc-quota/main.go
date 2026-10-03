@@ -35,6 +35,40 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
+const quotaAlertStream = "IOT_QUOTA"
+
+type alertPublisher struct {
+	js    nats.JetStreamContext
+	store *quota.PGStore
+}
+
+func (p alertPublisher) publishPending(ctx context.Context, logger *slog.Logger) {
+	alerts, err := p.store.PendingAlerts(ctx)
+	if err != nil {
+		logger.Error("读取待投递配额告警失败", "error", err)
+		return
+	}
+	for _, alert := range alerts {
+		data, err := alert.Event().Data()
+		if err != nil {
+			logger.Error("编码配额告警失败", "error", err)
+			continue
+		}
+		msg := nats.NewMsg(alert.Event().Subject())
+		msg.Data = data
+		msg.Header.Set(nats.MsgIdHdr, fmt.Sprintf("quota:%d:%s:%s:%s", alert.ProjectID, alert.Metric, alert.Level, alert.WindowStart.UTC().Format(time.RFC3339Nano)))
+		if _, err := p.js.PublishMsg(msg, nats.Context(ctx)); err != nil {
+			logger.Error("发布配额告警失败", "project_id", alert.ProjectID, "metric", alert.Metric, "error", err)
+			continue
+		}
+		if err := p.store.MarkAlertPublished(ctx, alert); err != nil {
+			logger.Error("标记配额告警已投递失败", "project_id", alert.ProjectID, "metric", alert.Metric, "error", err)
+			continue
+		}
+		logger.Info("配额告警已发布", "project_id", alert.ProjectID, "metric", alert.Metric, "level", alert.Level)
+	}
+}
+
 type config struct {
 	natsURL           string
 	redisURL          string
@@ -112,6 +146,9 @@ func run(cfg config) error {
 	if err != nil {
 		return fmt.Errorf("初始化 JetStream: %w", err)
 	}
+	if err := natsjs.EnsureStream(js, natsjs.StreamSpec{Name: quotaAlertStream, Subjects: []string{quota.QuotaAlertSubjectPrefix + ".>"}, Replicas: 1, MaxAge: 7 * 24 * time.Hour, StrictSubjects: true}); err != nil {
+		return fmt.Errorf("确保配额告警流: %w", err)
+	}
 
 	// 3) 聚合器。
 	metrics := new(quota.Metrics)
@@ -134,6 +171,20 @@ func run(cfg config) error {
 			return err
 		}
 		agg.WithDurableStore(pgStore)
+		publisher := alertPublisher{js: js, store: pgStore}
+		go func() {
+			publisher.publishPending(ctx, logger)
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					publisher.publishPending(ctx, logger)
+				}
+			}
+		}()
 		logger.Info("PG 用量事实账本已启用")
 		if cfg.reconcileInterval > 0 {
 			go reconcileLoop(ctx, pgStore, quota.NewRedisCounter(rdb, cfg.counterTTL), cfg.reconcileInterval, logger)
