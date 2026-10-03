@@ -734,7 +734,7 @@ Client-side  → shadow.reported（单向，只由设备写）
 | API 调用数 | api-gateway 采样 + 批量 | ±1% | 计费、限流 |
 | 连接峰值 | 网关每 10s 上报 | 近似 | 套餐校验 |
 
-**实现**：网关/管道本地累加 → 每 10s 通过 NATS 批量上报 `iot.quota.usage` → `svc-quota` 写 Redis 计数器（`INCRBY`）→ 每分钟落 PG（幂等：按 `(metric, ts_minute)` 去重）→ 每小时与原始数据抽样对账 → 差异 > 1% 告警。
+**实现**：网关/查询服务/管道本地累加 → 每 10s 通过 NATS 批量上报 `iot.quota.usage`（每批带稳定 `report_id`）→ `svc-quota` 用 `report_id` 幂等写 Redis 计数器并按批次落 PG（幂等键为 `(project_id, metric, report_id)`）→ 每小时执行对账；只修正已关闭的昨天窗口，当前窗口只观测，差异 > 1% 告警。
 
 **超配额处理**：分级预警（80% / 90% / 100%）。Phase 1 只做阈值告警；Phase 2 接入 `quota.Reserve` 业务路径并按租户策略执行 `throttle` / `reject`；`cmd` 与状态查询永不被配额拒绝（保证可运维性）。
 
