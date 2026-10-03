@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/SNCIC/odoo20iot/internal/pg"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -107,18 +109,25 @@ func (s *Store) Put(ctx context.Context, e Entry) error {
 		}
 		e.PayloadRef = ref
 	}
-	if _, err := s.pool.Exec(ctx, `
+	if err := pg.WithProjectTx(ctx, s.pool, e.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
 		INSERT INTO t_dlq (project_id, service, subject, entity_type, idempotency_key, reason, attempts, history, trace_id, payload, payload_ref, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-		e.ProjectID, e.Service, e.Subject, e.EntityType, e.IdempotencyKey, e.Reason, e.Attempts, string(history),
-		e.TraceID, e.Payload, e.PayloadRef, e.CreatedAt,
-	); err != nil {
+			e.ProjectID, e.Service, e.Subject, e.EntityType, e.IdempotencyKey, e.Reason, e.Attempts, string(history),
+			e.TraceID, e.Payload, e.PayloadRef, e.CreatedAt,
+		)
+		return err
+	}); err != nil {
 		return fmt.Errorf("dlq: 写入死信: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) ListPending(ctx context.Context, service, subject string, limit int) ([]Record, error) {
+	return s.ListPendingForProject(ctx, 0, service, subject, limit)
+}
+
+func (s *Store) listPendingTx(ctx context.Context, tx pgx.Tx, projectID int64, service, subject string, limit int) ([]Record, error) {
 	if service == "" {
 		return nil, fmt.Errorf("dlq: service 不能为空")
 	}
@@ -128,15 +137,15 @@ func (s *Store) ListPending(ctx context.Context, service, subject string, limit 
 	if limit > 1000 {
 		limit = 1000
 	}
-	q := `SELECT id, project_id, service, subject, entity_type, idempotency_key, reason, attempts, history, trace_id, payload, created_at, replay_count, last_replayed_at, resolved_at FROM t_dlq WHERE service=$1 AND resolved_at IS NULL`
-	args := []any{service}
+	q := `SELECT id, project_id, service, subject, entity_type, idempotency_key, reason, attempts, history, trace_id, payload, created_at, replay_count, last_replayed_at, resolved_at FROM t_dlq WHERE project_id=$1 AND service=$2 AND resolved_at IS NULL`
+	args := []any{projectID, service}
 	if subject != "" {
-		q += ` AND subject=$2`
+		q += ` AND subject=$3`
 		args = append(args, subject)
 	}
 	q += ` ORDER BY created_at, id LIMIT $` + fmt.Sprint(len(args)+1)
 	args = append(args, limit)
-	rows, err := s.pool.Query(ctx, q, args...)
+	rows, err := tx.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("dlq: 查询待重放: %w", err)
 	}
@@ -174,53 +183,27 @@ func (s *Store) ListPendingForProject(ctx context.Context, projectID int64, serv
 	if limit > 1000 {
 		limit = 1000
 	}
-	q := `SELECT id, project_id, service, subject, entity_type, idempotency_key, reason, attempts, history, trace_id, payload, created_at, replay_count, last_replayed_at, resolved_at FROM t_dlq WHERE project_id=$1 AND service=$2 AND resolved_at IS NULL`
-	args := []any{projectID, service}
-	if subject != "" {
-		q += ` AND subject=$3`
-		args = append(args, subject)
-	}
-	q += ` ORDER BY created_at, id LIMIT $` + fmt.Sprint(len(args)+1)
-	args = append(args, limit)
-	rows, err := s.pool.Query(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("dlq: 查询租户待重放: %w", err)
-	}
-	defer rows.Close()
 	var out []Record
-	for rows.Next() {
-		var r Record
-		var history []byte
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Service, &r.Subject, &r.EntityType, &r.IdempotencyKey, &r.Reason, &r.Attempts, &history, &r.TraceID, &r.Payload, &r.CreatedAt, &r.ReplayCount, &r.LastReplayedAt, &r.ResolvedAt); err != nil {
-			return nil, fmt.Errorf("dlq: 扫描租户待重放: %w", err)
-		}
-		if err := json.Unmarshal(history, &r.History); err != nil {
-			return nil, fmt.Errorf("dlq: 解析重试历史: %w", err)
-		}
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("dlq: 遍历租户待重放: %w", err)
-	}
-	return out, nil
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		out, err = s.listPendingTx(ctx, tx, projectID, service, subject, limit)
+		return err
+	})
+	return out, err
 }
 
 func (s *Store) MarkReplayed(ctx context.Context, id int64, createdAt time.Time, success bool, reason string) error {
-	if id <= 0 || createdAt.IsZero() {
-		return fmt.Errorf("dlq: id 和 created_at 必填")
-	}
-	_, err := s.pool.Exec(ctx, `UPDATE t_dlq SET replay_count=replay_count+1, last_replayed_at=now(), resolved_at=CASE WHEN $3 THEN now() ELSE resolved_at END, reason=CASE WHEN $4<>'' THEN $4 ELSE reason END WHERE id=$1 AND created_at=$2`, id, createdAt, success, reason)
-	if err != nil {
-		return fmt.Errorf("dlq: 更新重放状态: %w", err)
-	}
-	return nil
+	return s.MarkReplayedForProject(ctx, 0, id, createdAt, success, reason)
 }
 
 func (s *Store) MarkReplayedForProject(ctx context.Context, projectID, id int64, createdAt time.Time, success bool, reason string) error {
 	if projectID < 0 || id <= 0 || createdAt.IsZero() {
 		return fmt.Errorf("dlq: project_id、id 和 created_at 必填")
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE t_dlq SET replay_count=replay_count+1, last_replayed_at=now(), resolved_at=CASE WHEN $4 THEN now() ELSE resolved_at END, reason=CASE WHEN $5<>'' THEN $5 ELSE reason END WHERE project_id=$1 AND id=$2 AND created_at=$3`, projectID, id, createdAt, success, reason)
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE t_dlq SET replay_count=replay_count+1, last_replayed_at=now(), resolved_at=CASE WHEN $4 THEN now() ELSE resolved_at END, reason=CASE WHEN $5<>'' THEN $5 ELSE reason END WHERE project_id=$1 AND id=$2 AND created_at=$3`, projectID, id, createdAt, success, reason)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("dlq: 更新租户重放状态: %w", err)
 	}
@@ -228,20 +211,52 @@ func (s *Store) MarkReplayedForProject(ctx context.Context, projectID, id int64,
 }
 
 func (s *Store) AggregateSince(ctx context.Context, since time.Time) ([]Aggregate, error) {
-	rows, err := s.pool.Query(ctx, `SELECT project_id, service, subject, entity_type, count(*) FROM t_dlq WHERE created_at >= $1 GROUP BY project_id, service, subject, entity_type ORDER BY count(*) DESC`, since)
+	var out []Aggregate
+	err := pg.WithProjectTx(ctx, s.pool, 0, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT project_id, service, subject, entity_type, count(*) FROM t_dlq WHERE project_id=$1 AND created_at >= $2 GROUP BY project_id, service, subject, entity_type ORDER BY count(*) DESC`, 0, since)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a Aggregate
+			if err := rows.Scan(&a.ProjectID, &a.Service, &a.Subject, &a.EntityType, &a.Count); err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, fmt.Errorf("dlq: 聚合统计: %w", err)
 	}
-	defer rows.Close()
-	var out []Aggregate
-	for rows.Next() {
-		var a Aggregate
-		if err := rows.Scan(&a.ProjectID, &a.Service, &a.Subject, &a.EntityType, &a.Count); err != nil {
-			return nil, err
-		}
-		out = append(out, a)
+	return out, nil
+}
+
+func (s *Store) AggregateSinceForProject(ctx context.Context, projectID int64, since time.Time) ([]Aggregate, error) {
+	if projectID < 0 {
+		return nil, fmt.Errorf("dlq: project_id 不能为负数")
 	}
-	return out, rows.Err()
+	var out []Aggregate
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT project_id, service, subject, entity_type, count(*) FROM t_dlq WHERE project_id=$1 AND created_at >= $2 GROUP BY project_id, service, subject, entity_type ORDER BY count(*) DESC`, projectID, since)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a Aggregate
+			if err := rows.Scan(&a.ProjectID, &a.Service, &a.Subject, &a.EntityType, &a.Count); err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dlq: 聚合租户统计: %w", err)
+	}
+	return out, nil
 }
 
 // ensurePartition 保证目标月份的分区存在（幂等）。
@@ -275,14 +290,7 @@ func (s *Store) ensurePartition(ctx context.Context, at time.Time) error {
 // 供「DLQ 增长」这类告警使用（06 §：DLQ 增长属 P2）。
 // 没有这个读数，「死信在涨」就只能靠人偶尔去翻表 —— 而没人会翻。
 func (s *Store) CountSince(ctx context.Context, service string, since time.Time) (int64, error) {
-	var n int64
-	err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM t_dlq WHERE service = $1 AND created_at >= $2`,
-		service, since).Scan(&n)
-	if err != nil {
-		return 0, fmt.Errorf("dlq: 统计死信: %w", err)
-	}
-	return n, nil
+	return s.CountSinceForProject(ctx, 0, service, since)
 }
 
 func (s *Store) CountSinceForProject(ctx context.Context, projectID int64, service string, since time.Time) (int64, error) {
@@ -290,9 +298,11 @@ func (s *Store) CountSinceForProject(ctx context.Context, projectID int64, servi
 		return 0, fmt.Errorf("dlq: project_id 不能为负数")
 	}
 	var n int64
-	err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM t_dlq WHERE project_id = $1 AND service = $2 AND created_at >= $3`,
-		projectID, service, since).Scan(&n)
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT count(*) FROM t_dlq WHERE project_id = $1 AND service = $2 AND created_at >= $3`,
+			projectID, service, since).Scan(&n)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("dlq: 统计租户死信: %w", err)
 	}

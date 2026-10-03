@@ -421,7 +421,7 @@ func run(cfg config) error {
 			dlqAlertSender = notify.NewWebhookChannel(guard, 5*time.Second)
 		}
 		go func() {
-			if err := runDLQAlertLoop(ctx, dlqStoreInstance, cfg.dlqAlertInterval, cfg.dlqAlertWindow, cfg.dlqAlertThreshold, dlqAlertSender, cfg.dlqAlertWebhookURL, logger); err != nil {
+			if err := runDLQAlertLoop(ctx, dlqStoreInstance, catalogStore, cfg.dlqAlertInterval, cfg.dlqAlertWindow, cfg.dlqAlertThreshold, dlqAlertSender, cfg.dlqAlertWebhookURL, logger); err != nil {
 				errCh <- fmt.Errorf("DLQ 聚合告警异常退出: %w", err)
 			}
 		}()
@@ -565,7 +565,7 @@ func runOdooDLQReplay(ctx context.Context, replayer *dlq.Replayer, interval time
 	}
 }
 
-func runDLQAlertLoop(ctx context.Context, store *dlq.Store, interval, window time.Duration, threshold int64, sender *notify.WebhookChannel, webhookURL string, logger *slog.Logger) error {
+func runDLQAlertLoop(ctx context.Context, store *dlq.Store, projects catalog.ProjectLister, interval, window time.Duration, threshold int64, sender *notify.WebhookChannel, webhookURL string, logger *slog.Logger) error {
 	if interval <= 0 {
 		return nil
 	}
@@ -577,10 +577,34 @@ func runDLQAlertLoop(ctx context.Context, store *dlq.Store, interval, window tim
 	}
 	alert := func() {
 		since := time.Now().Add(-window)
-		aggregates, err := store.AggregateSince(ctx, since)
-		if err != nil {
-			logger.Error("DLQ 聚合查询失败", "error", err)
-			return
+		var aggregates []dlq.Aggregate
+		if projects == nil {
+			var err error
+			aggregates, err = store.AggregateSince(ctx, since)
+			if err != nil {
+				logger.Error("DLQ 聚合查询失败", "error", err)
+				return
+			}
+		} else {
+			items, err := projects.ListProjects(ctx)
+			if err != nil {
+				logger.Error("DLQ 聚合租户枚举失败", "error", err)
+				return
+			}
+			for _, project := range items {
+				part, err := store.AggregateSinceForProject(ctx, project.ID, since)
+				if err != nil {
+					logger.Error("DLQ 租户聚合查询失败", "project_id", project.ID, "error", err)
+					continue
+				}
+				aggregates = append(aggregates, part...)
+			}
+			legacy, err := store.AggregateSinceForProject(ctx, 0, since)
+			if err != nil {
+				logger.Error("DLQ 兼容范围聚合查询失败", "project_id", 0, "error", err)
+			} else {
+				aggregates = append(aggregates, legacy...)
+			}
 		}
 		for _, aggregate := range aggregates {
 			if aggregate.Count < threshold {
