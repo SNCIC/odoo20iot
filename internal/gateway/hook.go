@@ -173,7 +173,7 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 
 	// 计量：只有**已持久化**的消息才计入（04 §6「每条消息可归属到 project_id」）。
 	// 热路径只做一次加锁自增，无 IO。
-	if h.meter != nil {
+	if h.meter != nil && !pk.FixedHeader.Dup {
 		h.meter.Add(h.projectID, metering.MetricMsgCount, 1)
 	}
 

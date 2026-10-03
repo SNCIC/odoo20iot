@@ -35,8 +35,6 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
-const quotaAlertStream = "IOT_QUOTA"
-
 type alertPublisher struct {
 	js    nats.JetStreamContext
 	store *quota.PGStore
@@ -146,10 +144,6 @@ func run(cfg config) error {
 	if err != nil {
 		return fmt.Errorf("初始化 JetStream: %w", err)
 	}
-	if err := natsjs.EnsureStream(js, natsjs.StreamSpec{Name: quotaAlertStream, Subjects: []string{quota.QuotaAlertSubjectPrefix + ".>"}, Replicas: 1, MaxAge: 7 * 24 * time.Hour, StrictSubjects: true}); err != nil {
-		return fmt.Errorf("确保配额告警流: %w", err)
-	}
-
 	// 3) 聚合器。
 	metrics := new(quota.Metrics)
 	agg := quota.NewAggregator(quota.NewRedisCounter(rdb, cfg.counterTTL), metrics, logger)

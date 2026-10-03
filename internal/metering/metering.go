@@ -135,6 +135,8 @@ type Reporter struct {
 	window  time.Duration
 	logger  *slog.Logger
 	metrics *Metrics
+	mu      sync.Mutex
+	pending []UsageReport
 }
 
 // ReporterOptions 是上报器配置。
@@ -206,46 +208,52 @@ func (r *Reporter) Run(ctx context.Context) {
 
 // Flush 取出当前计数并立即上报（导出以便测试与优雅退出调用）。
 func (r *Reporter) Flush(ctx context.Context) int {
-	pending := r.acc.Drain()
-	if len(pending) == 0 {
+	r.mu.Lock()
+	deferred := r.pending
+	r.pending = nil
+	r.mu.Unlock()
+	current := r.acc.Drain()
+	if len(deferred) == 0 && len(current) == 0 {
 		return 0
 	}
 
+	reports := append([]UsageReport(nil), deferred...)
 	window := time.Now().UTC().Truncate(r.window)
-	sent := 0
-	for pid, counters := range pending {
+	for pid, counters := range current {
 		if len(counters) == 0 {
 			continue
 		}
-		report := UsageReport{
-			ProjectID: pid,
-			NodeID:    r.nodeID,
-			Window:    window,
-			Counters:  counters,
+		reports = append(reports, UsageReport{ProjectID: pid, NodeID: r.nodeID, Window: window, Counters: counters})
+	}
+	sent := 0
+	for _, report := range reports {
+		if report.ReportID == "" {
+			var reportID [16]byte
+			if _, err := rand.Read(reportID[:]); err != nil {
+				r.deferReport(report)
+				r.metrics.ReportErrors.Add(1)
+				r.logger.Error("生成计量批次标识失败", "project_id", report.ProjectID, "error", err)
+				continue
+			}
+			report.ReportID = hex.EncodeToString(reportID[:])
 		}
-		var reportID [16]byte
-		if _, err := rand.Read(reportID[:]); err != nil {
-			r.metrics.ReportErrors.Add(1)
-			r.logger.Error("生成计量批次标识失败", "project_id", pid, "error", err)
-			continue
-		}
-		report.ReportID = hex.EncodeToString(reportID[:])
 		data, err := json.Marshal(report)
 		if err != nil {
+			r.deferReport(report)
 			r.metrics.ReportErrors.Add(1)
-			r.logger.Error("序列化计量上报失败", "project_id", pid, "error", err)
+			r.logger.Error("序列化计量上报失败", "project_id", report.ProjectID, "error", err)
 			continue
 		}
 
 		if err := r.pub.Publish(ctx, r.subject, data); err != nil {
-			// 计数已被取出，不重报（宁可少报也不重复计费）。
+			r.deferReport(report)
 			r.metrics.ReportErrors.Add(1)
-			r.logger.Warn("计量上报失败（该窗口用量不重报）", "project_id", pid, "error", err)
+			r.logger.Warn("计量上报失败，将在下次窗口重试", "project_id", report.ProjectID, "report_id", report.ReportID, "error", err)
 			continue
 		}
 
 		var total int64
-		for _, v := range counters {
+		for _, v := range report.Counters {
 			total += v
 		}
 		r.metrics.CountersReported.Add(total)
@@ -255,4 +263,10 @@ func (r *Reporter) Flush(ctx context.Context) int {
 		r.metrics.ReportsTotal.Add(int64(sent))
 	}
 	return sent
+}
+
+func (r *Reporter) deferReport(report UsageReport) {
+	r.mu.Lock()
+	r.pending = append(r.pending, report)
+	r.mu.Unlock()
 }

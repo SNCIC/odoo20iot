@@ -17,6 +17,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
@@ -36,12 +37,12 @@ func (s *Service) routes() http.Handler {
 		Metrics:  s.deps.AuthMetrics,
 		Logger:   s.deps.Logger,
 	})
-	mux.Handle("/api/v1/devices", requireScope(auth, "device:read", http.HandlerFunc(s.handleDevices)))
-	mux.Handle("/api/v1/series", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleSeries)))
-	mux.Handle("/api/v1/series/multi", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleSeriesMulti)))
-	mux.Handle("/api/v1/export", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleExport)))
+	mux.Handle("/api/v1/devices", requireScope(auth, "device:read", http.HandlerFunc(s.handleDevices), s.deps.Meter))
+	mux.Handle("/api/v1/series", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleSeries), s.deps.Meter))
+	mux.Handle("/api/v1/series/multi", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleSeriesMulti), s.deps.Meter))
+	mux.Handle("/api/v1/export", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleExport), s.deps.Meter))
 	if s.deps.Latest != nil {
-		mux.Handle("/api/v1/latest", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleLatest)))
+		mux.Handle("/api/v1/latest", requireScope(auth, "telemetry:read", http.HandlerFunc(s.handleLatest), s.deps.Meter))
 	}
 	if s.deps.Endpoints != nil {
 		mux.Handle("/api/v1/notification-endpoints", auth(http.HandlerFunc(s.handleNotificationEndpoints)))
@@ -68,6 +69,7 @@ func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 quota:read 权限")
 			return
 		}
+		s.recordAPICall(id.ProjectID)
 		items, err := s.deps.Quota.Policies(r.Context(), id.ProjectID)
 		if err != nil {
 			s.fail(w, "读取配额策略", err)
@@ -80,6 +82,7 @@ func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 quota:write 权限")
 		return
 	}
+	s.recordAPICall(id.ProjectID)
 	metric := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/quota/policies/"), "/")
 	if r.Method == http.MethodDelete {
 		if _, ok := quota.AllowedMetrics[metric]; !ok {
@@ -121,7 +124,7 @@ func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "policy": p})
 }
 
-func requireScope(auth func(http.Handler) http.Handler, scope string, next http.Handler) http.Handler {
+func requireScope(auth func(http.Handler) http.Handler, scope string, next http.Handler, meter Meter) http.Handler {
 	return auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, ok := apiauth.IdentityFrom(r.Context())
 		if !ok {
@@ -131,6 +134,9 @@ func requireScope(auth func(http.Handler) http.Handler, scope string, next http.
 		if !id.Dev && !id.HasScope(scope) {
 			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 "+scope+" 权限")
 			return
+		}
+		if meter != nil {
+			meter.Add(id.ProjectID, metering.MetricAPICalls, 1)
 		}
 		next.ServeHTTP(w, r)
 	}))
@@ -151,6 +157,7 @@ func (s *Service) handleAlarmAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 alarm:write 权限")
 		return
 	}
+	s.recordAPICall(id.ProjectID)
 	path := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/alarms/"), "/ack")
 	path = strings.TrimSuffix(path, "/")
 	if path == "" || strings.Contains(path, "/") {
@@ -278,6 +285,7 @@ func (s *Service) handleNotificationEndpoints(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 "+requiredScope+" 权限")
 		return
 	}
+	s.recordAPICall(id.ProjectID)
 	if r.Method == http.MethodGet {
 		items, err := s.deps.Endpoints.List(r.Context(), id.ProjectID)
 		if err != nil {
@@ -320,6 +328,12 @@ func (s *Service) handleNotificationEndpoints(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "endpoint": e})
+}
+
+func (s *Service) recordAPICall(projectID int64) {
+	if s.deps.Meter != nil {
+		s.deps.Meter.Add(projectID, metering.MetricAPICalls, 1)
+	}
 }
 
 func (s *Service) handleLatest(w http.ResponseWriter, r *http.Request) {

@@ -17,6 +17,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/latest"
+	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
@@ -48,6 +49,17 @@ type fakeAlarmAcknowledger struct {
 type fakeQuotaPolicyStore struct {
 	saved   quota.Policy
 	deleted string
+}
+
+type meterRecorder struct {
+	counts map[string]int64
+}
+
+func (m *meterRecorder) Add(_ int64, metric string, delta int64) {
+	if m.counts == nil {
+		m.counts = make(map[string]int64)
+	}
+	m.counts[metric] += delta
 }
 
 func (f *fakeQuotaPolicyStore) Policies(context.Context, int64) ([]quota.Policy, error) {
@@ -277,6 +289,31 @@ func TestNotificationEndpointScopes(t *testing.T) {
 	svc.Handler().ServeHTTP(postRec, postReq)
 	if postRec.Code != http.StatusCreated {
 		t.Fatalf("notification:write 应允许 POST，得到 %d: %s", postRec.Code, postRec.Body.String())
+	}
+}
+
+func TestControlEndpointsCountOnlyAuthorizedCalls(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	svc.deps.Endpoints = fakeEndpointStore{}
+	meter := &meterRecorder{}
+	svc.deps.Meter = meter
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"notification:read"}}}
+	svc.mux = svc.routes()
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/notification-endpoints", nil)
+	getReq.Header.Set("Authorization", "Bearer scoped")
+	getRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK || meter.counts[metering.MetricAPICalls] != 1 {
+		t.Fatalf("授权 GET 应成功并计数 1，得到 status=%d count=%d", getRec.Code, meter.counts[metering.MetricAPICalls])
+	}
+
+	postReq := httptest.NewRequest(http.MethodPost, "/api/v1/notification-endpoints", strings.NewReader(`{"name":"x","channel":"webhook","target":"https://example.test/hook"}`))
+	postReq.Header.Set("Authorization", "Bearer scoped")
+	postRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusForbidden || meter.counts[metering.MetricAPICalls] != 1 {
+		t.Fatalf("未授权 POST 不应计数，得到 status=%d count=%d", postRec.Code, meter.counts[metering.MetricAPICalls])
 	}
 }
 

@@ -38,7 +38,9 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/gateway"
 	"github.com/SNCIC/odoo20iot/internal/latest"
+	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/querysvc"
@@ -69,6 +71,7 @@ type config struct {
 	jwtLeeway      time.Duration
 	redisURL       string
 	latestRedisURL string
+	natsURL        string
 	jwtRevocation  string
 	devToken       string
 	devProjectID   int64
@@ -112,6 +115,7 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.jwtLeeway, "jwt-leeway", 30*time.Second, "时间声明容差")
 	flag.StringVar(&cfg.redisURL, "redis-url", "", "Redis 地址（jti 吊销表）")
 	flag.StringVar(&cfg.latestRedisURL, "latest-redis-url", "redis://100.64.0.3:28637/0", "最新值 Redis 地址")
+	flag.StringVar(&cfg.natsURL, "nats-url", "nats://100.64.0.3:28222", "计量上报 NATS 地址")
 	flag.StringVar(&cfg.jwtRevocation, "jwt-revocation", "on", "jti 吊销检查：on | off（off 仅开发，启动打 WARN）")
 	flag.StringVar(&cfg.devToken, "dev-token", "", "开发静态令牌（非空即启用；仅开发/PoC）")
 	flag.Int64Var(&cfg.devProjectID, "dev-project-id", 0, "开发令牌绑定的 project_id")
@@ -221,6 +225,17 @@ func run(cfg config) error {
 	if err := latestRedis.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("连接最新值 Redis: %w", err)
 	}
+	quotaPub, err := gateway.NewNATSPublisher(cfg.natsURL, "IOT_QUOTA")
+	if err != nil {
+		return fmt.Errorf("连接计量上报 NATS: %w", err)
+	}
+	defer quotaPub.Close()
+	meterAcc := metering.NewAccumulator()
+	meterReporter, err := metering.NewReporter(metering.ReporterOptions{Accumulator: meterAcc, Publisher: quotaPub, NodeID: "svc-query", Logger: logger})
+	if err != nil {
+		return err
+	}
+	go meterReporter.Run(ctx)
 
 	authMetrics := new(apiauth.Metrics)
 	svc, err := querysvc.New(querysvc.Config{
@@ -242,6 +257,7 @@ func run(cfg config) error {
 		Endpoints: endpointStore,
 		Alarms:    alarmStore,
 		Quota:     quotaStore,
+		Meter:     meterAcc,
 		Catalog:   store,
 		Verifier:  verifier,
 		Health: querysvc.Health{

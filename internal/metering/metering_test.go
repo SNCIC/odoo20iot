@@ -120,9 +120,7 @@ func TestReporter_FlushReportsThenClears(t *testing.T) {
 	}
 }
 
-// TestReporter_FailedReportIsNotResent 是计量口径的关键取舍：
-// 上报失败时计数已取出，**不重报** —— 宁可少报，也不重复计费。
-func TestReporter_FailedReportIsNotResent(t *testing.T) {
+func TestReporter_FailedReportIsRetriedWithStableReportID(t *testing.T) {
 	a := NewAccumulator()
 	pub := &fakePublisher{err: errors.New("NATS 不可用（测试注入）")}
 	r, err := NewReporter(ReporterOptions{
@@ -140,12 +138,12 @@ func TestReporter_FailedReportIsNotResent(t *testing.T) {
 		t.Fatalf("应记录 1 次上报失败，得到 %d", r.Metrics().ReportErrors.Load())
 	}
 
-	// 再 Flush：计数已被取出，不应重报。
-	if n := r.Flush(context.Background()); n != 0 {
-		t.Fatalf("失败的计数不应重报（避免重复计费），得到 %d", n)
+	pub.err = nil
+	if n := r.Flush(context.Background()); n != 1 {
+		t.Fatalf("失败的计数应在下次重试，得到 %d", n)
 	}
-	if pub.count() != 0 {
-		t.Fatal("失败的批次不应写入")
+	if pub.count() != 1 || pub.reports[0].Counters[MetricMsgCount] != 50 {
+		t.Fatalf("重试批次内容不符: %+v", pub.reports)
 	}
 }
 

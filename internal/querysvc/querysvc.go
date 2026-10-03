@@ -43,6 +43,10 @@ type QuotaPolicyStore interface {
 	DeletePolicy(context.Context, int64, string, string) error
 }
 
+type Meter interface {
+	Add(projectID int64, metric string, delta int64)
+}
+
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
 type Health struct {
 	PingPG            func(context.Context) error
@@ -84,6 +88,7 @@ type Deps struct {
 	Endpoints   NotificationEndpointStore
 	Alarms      AlarmAcknowledger
 	Quota       QuotaPolicyStore
+	Meter       Meter
 	Catalog     catalog.Store
 	Verifier    apiauth.Verifier
 	Health      Health
