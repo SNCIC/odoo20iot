@@ -174,6 +174,10 @@ func (s *Service) handleOTATask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "task_id 路径非法")
 		return
 	}
+	if !ota.ValidTaskID(parts[0]) {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "task_id 格式非法")
+		return
+	}
 	if !id.Dev && !id.HasScope("ota:read") {
 		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:read 权限")
 		return

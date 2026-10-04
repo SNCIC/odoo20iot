@@ -71,3 +71,12 @@ func TestNotificationAndProgressValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestValidTaskID(t *testing.T) {
+	if !ValidTaskID("550e8400-e29b-41d4-a716-446655440000") {
+		t.Fatal("合法 UUID 应通过")
+	}
+	if ValidTaskID("not-a-task") || ValidTaskID("550e8400-e29b-31d4-a716-446655440000") {
+		t.Fatal("非法 UUID 不应通过")
+	}
+}

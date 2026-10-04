@@ -80,7 +80,7 @@ func (f *fakeOTAStore) RegisterFirmware(_ context.Context, firmware ota.Firmware
 }
 
 func (f *fakeOTAStore) CreateTask(_ context.Context, projectID, firmwareID int64, deviceKeys []string, rollout ota.Rollout, offlineTTL time.Duration, createdBy string) (ota.Task, error) {
-	f.task = ota.Task{ID: "task-1", ProjectID: projectID, FirmwareID: firmwareID, Status: ota.TaskDraft, Rollout: rollout, OfflineTTL: offlineTTL, CreatedBy: createdBy}
+	f.task = ota.Task{ID: "550e8400-e29b-41d4-a716-446655440000", ProjectID: projectID, FirmwareID: firmwareID, Status: ota.TaskDraft, Rollout: rollout, OfflineTTL: offlineTTL, CreatedBy: createdBy}
 	f.devices = make([]ota.TaskDevice, 0, len(deviceKeys))
 	for _, deviceKey := range deviceKeys {
 		f.devices = append(f.devices, ota.TaskDevice{TaskID: f.task.ID, ProjectID: projectID, DeviceKey: deviceKey, Status: ota.DevicePending})
@@ -374,7 +374,7 @@ func TestOTAEndpointsScopesAndLifecycle(t *testing.T) {
 
 	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"ota:read"}}}
 	svc.mux = svc.routes()
-	rec = get(t, svc.Handler(), "/api/v1/ota/tasks/task-1/devices", "scoped")
+	rec = get(t, svc.Handler(), "/api/v1/ota/tasks/550e8400-e29b-41d4-a716-446655440000/devices", "scoped")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "dev-1") {
 		t.Fatalf("查询 OTA 设备任务期望 200，得到 %d: %s", rec.Code, rec.Body.String())
 	}

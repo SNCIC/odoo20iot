@@ -236,4 +236,22 @@ func newTaskID() (string, error) {
 	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:], nil
 }
 
+func ValidTaskID(taskID string) bool {
+	if len(taskID) != 36 || taskID[8] != '-' || taskID[13] != '-' || taskID[18] != '-' || taskID[23] != '-' {
+		return false
+	}
+	for index, value := range taskID {
+		if value == '-' {
+			continue
+		}
+		if !((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')) {
+			return false
+		}
+		if index == 14 && value != '4' {
+			return false
+		}
+	}
+	return true
+}
+
 var _ = (*PGStore)(nil)
