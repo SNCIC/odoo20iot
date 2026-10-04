@@ -177,6 +177,49 @@ func (s *PGStore) GetTask(ctx context.Context, projectID int64, taskID string) (
 	return task, err
 }
 
+func (s *PGStore) StartTask(ctx context.Context, projectID int64, taskID string) (Task, error) {
+	var task Task
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		var rolloutJSON []byte
+		err := tx.QueryRow(ctx, `SELECT id::text,project_id,firmware_id,status,rollout,extract(epoch from offline_ttl)::bigint,created_by,created_at,started_at,finished_at FROM t_ota_task WHERE project_id=$1 AND id=$2 FOR UPDATE`, projectID, taskID).Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrTaskNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if task.Status == TaskRunning {
+			if err := json.Unmarshal(rolloutJSON, &task.Rollout); err != nil {
+				return err
+			}
+			task.OfflineTTL *= time.Second
+			return nil
+		}
+		if task.Status != TaskDraft {
+			return fmt.Errorf("ota: 任务当前状态 %q，不可启动", task.Status)
+		}
+		if err := json.Unmarshal(rolloutJSON, &task.Rollout); err != nil {
+			return err
+		}
+		err = tx.QueryRow(ctx, `UPDATE t_ota_task SET status='running',started_at=now() WHERE project_id=$1 AND id=$2 RETURNING status,started_at`, projectID, taskID).Scan(&task.Status, &task.StartedAt)
+		return err
+	})
+	return task, err
+}
+
+func (s *PGStore) MarkNotified(ctx context.Context, projectID int64, taskID, deviceKey string) error {
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `UPDATE t_ota_task_device SET status='notified',notified_at=now(),updated_at=now() WHERE project_id=$1 AND task_id=$2 AND device_key=$3 AND status='pending'`, projectID, taskID, deviceKey)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 0 {
+			return fmt.Errorf("ota: 设备任务不存在或已处理")
+		}
+		return nil
+	})
+}
+
 func (s *PGStore) ListTaskDevices(ctx context.Context, projectID int64, taskID string) ([]TaskDevice, error) {
 	var devices []TaskDevice
 	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {

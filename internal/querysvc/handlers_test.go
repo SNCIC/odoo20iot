@@ -127,6 +127,21 @@ func (f *fakeOTAStore) GetTask(context.Context, int64, string) (ota.Task, error)
 	return f.task, nil
 }
 
+func (f *fakeOTAStore) StartTask(_ context.Context, _ int64, _ string) (ota.Task, error) {
+	f.task.Status = ota.TaskRunning
+	return f.task, nil
+}
+
+func (f *fakeOTAStore) MarkNotified(_ context.Context, _ int64, _ string, deviceKey string) error {
+	for index := range f.devices {
+		if f.devices[index].DeviceKey == deviceKey {
+			f.devices[index].Status = ota.DeviceNotified
+			return nil
+		}
+	}
+	return ota.ErrDeviceNotFound
+}
+
 func (f *fakeOTAStore) ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error) {
 	return f.devices, nil
 }

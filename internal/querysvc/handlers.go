@@ -19,6 +19,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/cluster"
 	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/ota"
@@ -80,6 +81,94 @@ func (s *Service) routes() http.Handler {
 	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleOTATaskAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || !strings.HasSuffix(strings.Trim(r.URL.Path, "/"), "/start") {
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if !id.Dev && !id.HasScope("ota:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:write 权限")
+		return
+	}
+	if s.deps.OTARouter == nil || s.deps.OTASigner == nil || s.deps.OTADownloadSecret == "" || s.deps.OTADownloadBaseURL == "" {
+		writeError(w, http.StatusServiceUnavailable, CodeUpstream, "OTA 下发依赖未配置")
+		return
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/ota/tasks/"), "/"), "/")
+	if len(parts) != 2 || parts[1] != "start" || !ota.ValidTaskID(parts[0]) {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "启动任务路径非法")
+		return
+	}
+	task, err := s.deps.OTA.StartTask(r.Context(), id.ProjectID, parts[0])
+	if err != nil {
+		s.fail(w, "启动 OTA 任务", err)
+		return
+	}
+	firmware, err := s.deps.OTA.GetFirmware(r.Context(), id.ProjectID, task.FirmwareID)
+	if err != nil {
+		s.fail(w, "读取 OTA 固件", err)
+		return
+	}
+	devices, err := s.deps.OTA.ListTaskDevices(r.Context(), id.ProjectID, task.ID)
+	if err != nil {
+		s.fail(w, "读取 OTA 设备任务", err)
+		return
+	}
+	devices, err = ota.NextBatchDevices(devices, task.Rollout)
+	if err != nil {
+		s.fail(w, "计算 OTA 灰度批次", err)
+		return
+	}
+	sent := 0
+	for _, device := range devices {
+		if device.Status != ota.DevicePending {
+			continue
+		}
+		expires := s.deps.Now().Add(time.Hour)
+		objectKey := firmware.ObjectKey
+		downloadURL := strings.TrimRight(s.deps.OTADownloadBaseURL, "/") + path.Join("/", strconv.FormatInt(id.ProjectID, 10), url.PathEscape(path.Base(objectKey)))
+		manifest, signErr := s.deps.OTASigner.SignManifest(ota.Manifest{Version: firmware.Version, Filename: firmware.Filename, URL: downloadURL, SizeBytes: firmware.SizeBytes, SHA256: firmware.SHA256}, s.deps.Now(), time.Hour)
+		if signErr != nil {
+			s.fail(w, "签署 OTA 通知", signErr)
+			return
+		}
+		parsed, parseErr := url.Parse(manifest.URL)
+		if parseErr != nil {
+			s.fail(w, "构造 OTA 下载地址", parseErr)
+			return
+		}
+		query := parsed.Query()
+		query.Set("expires", strconv.FormatInt(expires.Unix(), 10))
+		query.Set("sig", ota.DownloadSignature(s.deps.OTADownloadSecret, id.ProjectID, objectKey, expires))
+		parsed.RawQuery = query.Encode()
+		notify, notifyErr := manifest.Notification(task.ID)
+		if notifyErr != nil {
+			s.fail(w, "构造 OTA 通知", notifyErr)
+			return
+		}
+		notify.DownloadURL = parsed.String()
+		payload, marshalErr := json.Marshal(notify)
+		if marshalErr != nil {
+			s.fail(w, "编码 OTA 通知", marshalErr)
+			return
+		}
+		if routeErr := s.deps.OTARouter.RouteExternal(r.Context(), cluster.Envelope{Topic: "v1/devices/" + device.DeviceKey + "/ota/notify", Payload: payload, Qos: 1, DeviceKey: device.DeviceKey}); routeErr != nil {
+			s.fail(w, "下发 OTA 通知", routeErr)
+			return
+		}
+		if markErr := s.deps.OTA.MarkNotified(r.Context(), id.ProjectID, task.ID, device.DeviceKey); markErr != nil {
+			s.fail(w, "更新 OTA 设备状态", markErr)
+			return
+		}
+		sent++
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "task": task, "notified": sent})
 }
 
 func (s *Service) handleOTAFirmwareAction(w http.ResponseWriter, r *http.Request) {
@@ -302,6 +391,10 @@ func (s *Service) handleOTATasks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleOTATask(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(strings.Trim(r.URL.Path, "/"), "/start") {
+		s.handleOTATaskAction(w, r)
+		return
+	}
 	id, ok := apiauth.IdentityFrom(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")

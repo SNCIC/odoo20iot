@@ -85,6 +85,21 @@ func TestValidTaskID(t *testing.T) {
 	}
 }
 
+func TestNextBatchDevices(t *testing.T) {
+	devices := make([]TaskDevice, 0, 100)
+	for index := 0; index < 100; index++ {
+		status := DevicePending
+		if index < 1 {
+			status = DeviceNotified
+		}
+		devices = append(devices, TaskDevice{DeviceKey: fmt.Sprintf("dev-%03d", index), Status: status})
+	}
+	batch, err := NextBatchDevices(devices, DefaultRollout())
+	if err != nil || len(batch) != 9 {
+		t.Fatalf("第二批应选择 9 台，得到 %d/%v", len(batch), err)
+	}
+}
+
 func TestSignerAndDownloadSignature(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(nil)
 	if err != nil {

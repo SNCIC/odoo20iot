@@ -11,6 +11,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/cluster"
 	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
@@ -68,7 +69,13 @@ type OTAStore interface {
 	GetFirmware(context.Context, int64, int64) (ota.Firmware, error)
 	CreateTask(context.Context, int64, int64, []string, ota.Rollout, time.Duration, string) (ota.Task, error)
 	GetTask(context.Context, int64, string) (ota.Task, error)
+	StartTask(context.Context, int64, string) (ota.Task, error)
 	ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error)
+	MarkNotified(context.Context, int64, string, string) error
+}
+
+type OTARouter interface {
+	RouteExternal(context.Context, cluster.Envelope) error
 }
 
 type OTAArtifactStore interface {
@@ -124,6 +131,7 @@ type Deps struct {
 	Commands           CommandIssuer
 	Shadows            ShadowService
 	OTA                OTAStore
+	OTARouter          OTARouter
 	OTAArtifact        OTAArtifactStore
 	OTASigner          OTASigner
 	OTADownloadSecret  string

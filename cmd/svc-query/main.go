@@ -265,6 +265,7 @@ func run(cfg config) error {
 		return fmt.Errorf("连接最新值 Redis: %w", err)
 	}
 	var commandService *command.Service
+	var otaRouter *cluster.Node
 	var shadowService *shadow.Service
 	shadowStore, err := shadow.NewPGStore(pool)
 	if err != nil {
@@ -299,6 +300,7 @@ func run(cfg config) error {
 			return fmt.Errorf("初始化命令下行路由: %w", nodeErr)
 		}
 		defer node.Close()
+		otaRouter = node
 		cmdStore, storeErr := command.NewStore(pool)
 		if storeErr != nil {
 			return storeErr
@@ -345,6 +347,7 @@ func run(cfg config) error {
 		Commands:           commandService,
 		Shadows:            shadowService,
 		OTA:                otaStore,
+		OTARouter:          otaRouter,
 		OTAArtifact:        otaArtifactStore,
 		OTASigner:          otaSigner,
 		OTADownloadSecret:  otaDownloadSecret,

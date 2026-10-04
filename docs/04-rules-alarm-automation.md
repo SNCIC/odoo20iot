@@ -662,9 +662,10 @@ OTA 第一阶段已新增并应用固件清单和任务台账的数据库模型�
 `IOT_OTA_DOWNLOAD_SECRET` 和 HTTPS 的 `IOT_OTA_PUBLIC_BASE_URL` 后，`GET
 /api/v1/ota/firmwares/{firmware_id}/manifest` 生成短时效签名清单；设备下载地址支持 HTTP
 Range。未配置签名器时清单/下载路由不暴露，禁止用明文 HTTP 作为生产下载地址。
-签名私钥只允许由外部密钥管理系统提供，禁止写入仓库或数据库。对象存储上传/预签名 URL、
-`svc-query` 控制面 API、OTA 通知下发和设备进度消费将在下一阶段接入；当前不宣称 OTA 已可
-对真实设备执行升级。
+签名私钥只允许由外部密钥管理系统提供，禁止写入仓库或数据库。`POST
+/api/v1/ota/tasks/{task_id}/start` 会按灰度批次签署清单并经网关路由发送
+`v1/devices/{device_key}/ota/notify`，路由成功后才将设备任务记为 `notified`；设备进度消费、
+后续批次自动推进、超时/失败率暂停和回滚仍在下一阶段，当前不宣称 OTA 已可对真实设备执行升级。
 
 ---
 
