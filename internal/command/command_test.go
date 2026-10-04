@@ -44,3 +44,36 @@ func TestDecodeReply(t *testing.T) {
 		t.Fatalf("unexpected reply: %+v, err=%v", reply, err)
 	}
 }
+
+func TestDecodeLegacyDeviceReply(t *testing.T) {
+	reply, err := DecodeReply([]byte(`{"id":"corr-2","code":0,"msg":"ok","data":{"accepted":true}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.CorrelationID != "corr-2" || reply.Status != "acked" || reply.Error != "ok" {
+		t.Fatalf("unexpected legacy reply: %+v", reply)
+	}
+	if string(reply.Payload) != `{"accepted":true}` {
+		t.Fatalf("unexpected legacy payload: %s", reply.Payload)
+	}
+}
+
+func TestDecodeLegacyFailedDeviceReply(t *testing.T) {
+	reply, err := DecodeReply([]byte(`{"id":"corr-3","code":17,"msg":"busy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.CorrelationID != "corr-3" || reply.Status != "failed" || reply.Error != "busy" {
+		t.Fatalf("unexpected failed reply: %+v", reply)
+	}
+}
+
+func TestProjectFromReplySubject(t *testing.T) {
+	projectID, deviceKey, err := projectFromReplySubject("iot.cmd.reply.42.dev-1")
+	if err != nil || projectID != 42 || deviceKey != "dev-1" {
+		t.Fatalf("unexpected subject parse: project=%d device=%q err=%v", projectID, deviceKey, err)
+	}
+	if _, _, err := projectFromReplySubject("iot.cmd.reply.invalid.dev-1"); err == nil {
+		t.Fatal("invalid project id should fail")
+	}
+}

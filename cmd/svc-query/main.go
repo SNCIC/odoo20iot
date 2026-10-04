@@ -38,6 +38,8 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/cluster"
+	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/gateway"
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/metering"
@@ -89,6 +91,7 @@ type config struct {
 	readyProbe          time.Duration
 	logFormat           string
 	ensureTSDBSchema    bool
+	commandOriginID     string
 }
 
 func main() {
@@ -134,6 +137,7 @@ func parseFlags() config {
 	// ⚠️ 字符串开关而非 -log-json 布尔：布尔被写成 `-log-json false` 时会吞掉后续参数（09 §6）。
 	flag.StringVar(&cfg.logFormat, "log-format", "json", "日志格式：json 或 text")
 	flag.BoolVar(&cfg.ensureTSDBSchema, "ensure-tsdb-schema", true, "启动时幂等创建遥测与预聚合表")
+	flag.StringVar(&cfg.commandOriginID, "command-origin-id", "", "启用命令 API 的路由源 ID")
 	flag.Parse()
 	return cfg
 }
@@ -225,6 +229,19 @@ func run(cfg config) error {
 	if err := latestRedis.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("连接最新值 Redis: %w", err)
 	}
+	var commandService *command.Service
+	if cfg.commandOriginID != "" {
+		node, nodeErr := cluster.New(ctx, cluster.Options{ID: cfg.commandOriginID, NATSURL: cfg.natsURL, Cursor: cluster.NewRedisCursor(latestRedis, "gw:offline:cursor"), Logger: logger}, cluster.NewRedisLocator(latestRedis, "gw:client", cluster.DefaultLocatorTTL))
+		if nodeErr != nil {
+			return fmt.Errorf("初始化命令下行路由: %w", nodeErr)
+		}
+		defer node.Close()
+		cmdStore, storeErr := command.NewStore(pool)
+		if storeErr != nil {
+			return storeErr
+		}
+		commandService = &command.Service{Store: cmdStore, Sender: command.Sender{Router: node}}
+	}
 	quotaPub, err := gateway.NewNATSPublisher(cfg.natsURL, "IOT_QUOTA")
 	if err != nil {
 		return fmt.Errorf("连接计量上报 NATS: %w", err)
@@ -257,6 +274,7 @@ func run(cfg config) error {
 		Endpoints: endpointStore,
 		Alarms:    alarmStore,
 		Quota:     quotaStore,
+		Commands:  commandService,
 		Meter:     meterAcc,
 		Catalog:   store,
 		Verifier:  verifier,

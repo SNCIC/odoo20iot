@@ -9,6 +9,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/quota"
@@ -45,6 +46,11 @@ type QuotaPolicyStore interface {
 
 type Meter interface {
 	Add(projectID int64, metric string, delta int64)
+}
+
+type CommandIssuer interface {
+	Issue(context.Context, command.Record) (command.Record, error)
+	Get(context.Context, int64, string) (command.Record, error)
 }
 
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
@@ -88,6 +94,7 @@ type Deps struct {
 	Endpoints   NotificationEndpointStore
 	Alarms      AlarmAcknowledger
 	Quota       QuotaPolicyStore
+	Commands    CommandIssuer
 	Meter       Meter
 	Catalog     catalog.Store
 	Verifier    apiauth.Verifier

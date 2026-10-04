@@ -143,6 +143,18 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	if err := command.EnsureReplyStream(js); err != nil {
+		return fmt.Errorf("确保命令回执 Stream 失败: %w", err)
+	}
+	commandStore, err := command.NewStore(pool)
+	if err != nil {
+		return err
+	}
+	go func() {
+		if err := command.ConsumeReplies(ctx, js, commandStore, "svc-rule-command-replies", log); err != nil && ctx.Err() == nil {
+			log.Error("命令回执消费者退出", "error", err)
+		}
+	}()
 	sub, err := natsjs.Subscribe(js, natsjs.Options{Subject: cfg.subject, Durable: cfg.durable, Stream: cfg.stream, AckWait: cfg.ackWait, Inactive: cfg.inactive, MaxDeliver: 5})
 	if err != nil {
 		return err

@@ -17,6 +17,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
+	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
@@ -54,8 +55,73 @@ func (s *Service) routes() http.Handler {
 	if s.deps.Alarms != nil {
 		mux.Handle("/api/v1/alarms/", auth(http.HandlerFunc(s.handleAlarmAction)))
 	}
+	if s.deps.Commands != nil {
+		mux.Handle("/api/v1/commands", requireScope(auth, "command:write", http.HandlerFunc(s.handleCommands), s.deps.Meter))
+		mux.Handle("/api/v1/commands/", auth(http.HandlerFunc(s.handleCommandStatus)))
+	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleCommandStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 GET")
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if !id.Dev && !id.HasScope("command:read") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 command:read 权限")
+		return
+	}
+	commandID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/commands/"), "/")
+	if commandID == "" || strings.Contains(commandID, "/") {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "command_id 非法")
+		return
+	}
+	record, err := s.deps.Commands.Get(r.Context(), id.ProjectID, commandID)
+	if err != nil {
+		s.fail(w, "查询命令状态", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "command": record})
+}
+
+func (s *Service) handleCommands(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 POST")
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	var req struct {
+		DeviceKey     string          `json:"device_key"`
+		Command       string          `json:"command"`
+		Payload       json.RawMessage `json:"payload"`
+		CorrelationID string          `json:"correlation_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "请求体非法")
+		return
+	}
+	if strings.TrimSpace(req.DeviceKey) == "" || strings.TrimSpace(req.Command) == "" {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "device_key 和 command 必填")
+		return
+	}
+	record, err := s.deps.Commands.Issue(r.Context(), command.Record{ProjectID: id.ProjectID, CommandID: req.CorrelationID, DeviceKey: strings.TrimSpace(req.DeviceKey), CommandKey: strings.TrimSpace(req.Command), CorrelationID: strings.TrimSpace(req.CorrelationID), Payload: req.Payload})
+	if err != nil {
+		s.fail(w, "下发命令", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "command": record})
 }
 
 func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
