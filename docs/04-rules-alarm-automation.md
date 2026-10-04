@@ -656,7 +656,8 @@ utils.math.clamp(v, min, max), utils.json.parse/stringify
 OTA 第一阶段已新增并应用固件清单和任务台账的数据库模型迁移 `0035_ota`，并在
 `internal/ota` 实现 Ed25519 清单签名/过期校验、SHA-256 摘要、灰度批次规划和设备状态机；
 `svc-query` 已提供 `ota:read` / `ota:write` 保护的固件登记、固件列表、任务创建、任务查询和设备任务列表 API。
-固件登记 API 接收已上传对象的元数据，不负责生成签名或绕过对象存储权限。
+`POST /api/v1/ota/artifacts` 接收 multipart 字段 `firmware`，写入配置的本地制品目录并返回 SHA-256 与租户对象键；
+上传上限 512 MiB。固件登记 API 接收已上传对象元数据，不负责生成签名；发布任务前仍须由受信签名流程签署清单。
 签名私钥只允许由外部密钥管理系统提供，禁止写入仓库或数据库。对象存储上传/预签名 URL、
 `svc-query` 控制面 API、OTA 通知下发和设备进度消费将在下一阶段接入；当前不宣称 OTA 已可
 对真实设备执行升级。

@@ -1,11 +1,14 @@
 package querysvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -66,6 +69,16 @@ type fakeOTAStore struct {
 	firmwares []ota.Firmware
 	task      ota.Task
 	devices   []ota.TaskDevice
+}
+
+type fakeOTAArtifactStore struct {
+	artifact ota.Artifact
+}
+
+func (f *fakeOTAArtifactStore) PutContext(_ context.Context, projectID int64, filename string, _ io.Reader) (ota.Artifact, error) {
+	f.artifact = ota.Artifact{Key: "1/hash", Filename: filename, SizeBytes: 4, SHA256: ota.Digest([]byte("test"))}
+	f.artifact.Key = fmt.Sprintf("%d/hash", projectID)
+	return f.artifact, nil
 }
 
 func (f *fakeOTAStore) ListFirmwares(context.Context, int64) ([]ota.Firmware, error) {
@@ -377,6 +390,36 @@ func TestOTAEndpointsScopesAndLifecycle(t *testing.T) {
 	rec = get(t, svc.Handler(), "/api/v1/ota/tasks/550e8400-e29b-41d4-a716-446655440000/devices", "scoped")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "dev-1") {
 		t.Fatalf("查询 OTA 设备任务期望 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOTAArtifactUpload(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	artifactStore := &fakeOTAArtifactStore{}
+	svc.deps.OTA = &fakeOTAStore{}
+	svc.deps.OTAArtifact = artifactStore
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"ota:write"}}}
+	svc.mux = svc.routes()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("firmware", "edge.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("test")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/ota/artifacts", &body)
+	req.Header.Set("Authorization", "Bearer scoped")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated || artifactStore.artifact.Filename != "edge.bin" {
+		t.Fatalf("上传固件期望 201，得到 %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

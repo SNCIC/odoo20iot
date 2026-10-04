@@ -216,6 +216,16 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	var otaArtifactStore *ota.ArtifactStore
+	if artifactDir := strings.TrimSpace(os.Getenv("IOT_OTA_ARTIFACT_DIR")); artifactDir != "" {
+		otaArtifactStore, err = ota.NewArtifactStore(artifactDir, ota.DefaultMaxArtifactBytes)
+		if err != nil {
+			return fmt.Errorf("初始化 OTA 固件存储: %w", err)
+		}
+		logger.Info("OTA 固件上传已启用", "directory", artifactDir, "max_bytes", ota.DefaultMaxArtifactBytes)
+	} else {
+		logger.Warn("IOT_OTA_ARTIFACT_DIR 未设置，OTA 固件上传 API 未启用")
+	}
 	var endpointStore *notifyconfig.Store
 	if rawKey := os.Getenv("IOT_CONFIG_KEY"); rawKey != "" {
 		key, keyErr := secureconfig.NewKey(rawKey)
@@ -311,17 +321,18 @@ func run(cfg config) error {
 			Burst:          cfg.rateBurst,
 		},
 	}, querysvc.Deps{
-		Reader:    gres,
-		Latest:    latest.NewRedisStore(latestRedis),
-		Endpoints: endpointStore,
-		Alarms:    alarmStore,
-		Quota:     quotaStore,
-		Commands:  commandService,
-		Shadows:   shadowService,
-		OTA:       otaStore,
-		Meter:     meterAcc,
-		Catalog:   store,
-		Verifier:  verifier,
+		Reader:      gres,
+		Latest:      latest.NewRedisStore(latestRedis),
+		Endpoints:   endpointStore,
+		Alarms:      alarmStore,
+		Quota:       quotaStore,
+		Commands:    commandService,
+		Shadows:     shadowService,
+		OTA:         otaStore,
+		OTAArtifact: otaArtifactStore,
+		Meter:       meterAcc,
+		Catalog:     store,
+		Verifier:    verifier,
 		Health: querysvc.Health{
 			PingPG:            pool.Ping,
 			PingTSDB:          gres.Ping,

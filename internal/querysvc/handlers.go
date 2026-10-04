@@ -69,8 +69,45 @@ func (s *Service) routes() http.Handler {
 		mux.Handle("/api/v1/ota/tasks", auth(http.HandlerFunc(s.handleOTATasks)))
 		mux.Handle("/api/v1/ota/tasks/", auth(http.HandlerFunc(s.handleOTATask)))
 	}
+	if s.deps.OTAArtifact != nil {
+		mux.Handle("/api/v1/ota/artifacts", auth(http.HandlerFunc(s.handleOTAArtifactUpload)))
+	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleOTAArtifactUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 POST")
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if !id.Dev && !id.HasScope("ota:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:write 权限")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, ota.DefaultMaxArtifactBytes+1<<20)
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "固件上传表单非法或超过大小限制")
+		return
+	}
+	file, header, err := r.FormFile("firmware")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "缺少 firmware 文件")
+		return
+	}
+	defer file.Close()
+	artifact, err := s.deps.OTAArtifact.PutContext(r.Context(), id.ProjectID, header.Filename, file)
+	if err != nil {
+		s.fail(w, "保存 OTA 固件制品", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "artifact": artifact, "signed_manifest_required": true})
 }
 
 func (s *Service) handleOTAFirmwares(w http.ResponseWriter, r *http.Request) {

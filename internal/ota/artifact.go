@@ -1,6 +1,7 @@
 package ota
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -17,15 +18,19 @@ const DefaultMaxArtifactBytes int64 = 512 << 20
 var ErrArtifactTooLarge = errors.New("ota: 固件超过大小限制")
 
 type Artifact struct {
-	Key       string
-	Filename  string
-	SizeBytes int64
-	SHA256    string
+	Key       string `json:"key"`
+	Filename  string `json:"filename"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
 }
 
 type ArtifactStore struct {
 	root    string
 	maxSize int64
+}
+
+func (s *ArtifactStore) PutContext(_ context.Context, projectID int64, filename string, source io.Reader) (Artifact, error) {
+	return s.Put(projectID, filename, source)
 }
 
 func NewArtifactStore(root string, maxSize int64) (*ArtifactStore, error) {

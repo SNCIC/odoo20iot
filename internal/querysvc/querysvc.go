@@ -3,6 +3,7 @@ package querysvc
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -68,6 +69,10 @@ type OTAStore interface {
 	ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error)
 }
 
+type OTAArtifactStore interface {
+	PutContext(context.Context, int64, string, io.Reader) (ota.Artifact, error)
+}
+
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
 type Health struct {
 	PingPG            func(context.Context) error
@@ -112,6 +117,7 @@ type Deps struct {
 	Commands    CommandIssuer
 	Shadows     ShadowService
 	OTA         OTAStore
+	OTAArtifact OTAArtifactStore
 	Meter       Meter
 	Catalog     catalog.Store
 	Verifier    apiauth.Verifier
