@@ -26,6 +26,7 @@ type Options struct {
 	TLSConfig *tls.Config
 	// Publisher 是内部事件总线的同步投递器，A2 时序依赖它。
 	Publisher                Publisher
+	CommandReplyPublisher    Publisher
 	DeviceLifecyclePublisher DeviceLifecyclePublisher
 	// Router 把设备 topic 映射为总线 subject。
 	Router SubjectRouter
@@ -190,6 +191,8 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		ProjectID:         opts.ProjectID,
 		DeviceTypeID:      opts.DeviceTypeID,
 		Meter:             opts.Meter,
+		ReplyPublisher:    opts.CommandReplyPublisher,
+		ReplyTimeout:      opts.PubackTimeout,
 		IdentityForClient: identityForClient,
 		RequireIdentity:   authHook != nil,
 	})

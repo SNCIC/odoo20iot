@@ -313,12 +313,14 @@ NATS  publish  iot.route.{nodeID}        ← 直接发路由 subject，不发设
 gw-mqtt → Device    topic: v1/devices/{key}/cmd/{cmdKey}
   │ 4. 等待设备回复 v1/devices/{key}/cmd/reply
   ▼
-svc-pipeline 解析回复 → NATS publish iot.cmd.reply.{project}.{deviceID}
+gw-mqtt 分流回复 → NATS publish iot.cmd.reply.{project}.{device_token}
   │ 5. 原调用方按 correlation_id 收结果，更新 t_command(status=acked)
   │ 6. 超时未回复 → 指数退避重试（默认 3 次）→ status=timeout → 记录并告警
 ```
 
 > **为什么用 `iot.route.{nodeID}` 而不是设备级 subject（评审 R-13）**：若发布到 `iot.cmd.{project}.{deviceID}`，则每个 `gw-mqtt` 节点都要维护「本节点上所有设备的 subject 订阅集合」，订阅表随设备数线性膨胀（100 万设备 = 100 万订阅）。既然步骤 2 已经通过 Redis 拿到了 `nodeID`，就直接投递到该节点的路由 subject，**订阅表变成 O(节点数)**。
+
+其中 `device_token` 是设备键的 Raw URL-safe Base64 编码，用于避免设备键中的点号破坏 NATS subject 层级；消费者收到后还原为原始 `device_key`。
 
 **离线设备**：`gw:client:{device_key}` 无节点 → 不投递，只写 `t_command(status=queued)`，并写 NATS **分片离线流** `offline.shard.{hash(device_id)%N}`（TTL = 物模型 `offlineTTL`，默认 24h）；设备重连后由 `svc-device` 触发补发。
 
@@ -354,7 +356,7 @@ scope:   shard.{0..N-1} | device_id | node_id | *
 | `iot.telemetry.normalized.{project}.shard.{i}` | svc-pipeline | svc-rule, svc-quota | **按 device 保序** | JetStream |
 | `iot.attr.{project}` | gw-* / api | svc-device | 弱 | 否 |
 | `iot.event.{project}.shard.{i}` | gw-* / svc-* | svc-pipeline, svc-rule | **按 device 保序** | JetStream |
-| `iot.cmd.reply.{project}.{device}` | gw-mqtt | 调用方 | 否 | 否 |
+| `iot.cmd.reply.{project}.{device_token}` | gw-mqtt | 调用方 | 否 | JetStream（7d） |
 | `iot.alarm.{project}` | svc-alarm | svc-notify, api-sub, odoo-connector | 否 | JetStream |
 | `iot.device.online / offline` | gw-mqtt | svc-device, odoo-connector | 否 | 否 |
 | `iot.route.{node_id}` | gw-mqtt / svc-* / odoo-connector | gw-mqtt（该节点） | 按 device 保序 | 否 |

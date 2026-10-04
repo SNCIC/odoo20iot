@@ -69,11 +69,15 @@ func TestDecodeLegacyFailedDeviceReply(t *testing.T) {
 }
 
 func TestProjectFromReplySubject(t *testing.T) {
-	projectID, deviceKey, err := projectFromReplySubject("iot.cmd.reply.42.dev-1")
-	if err != nil || projectID != 42 || deviceKey != "dev-1" {
+	subject, err := cluster.CommandReplySubject(42, "dev.1/line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectID, deviceKey, err := projectFromReplySubject(subject)
+	if err != nil || projectID != 42 || deviceKey != "dev.1/line" {
 		t.Fatalf("unexpected subject parse: project=%d device=%q err=%v", projectID, deviceKey, err)
 	}
-	if _, _, err := projectFromReplySubject("iot.cmd.reply.invalid.dev-1"); err == nil {
+	if _, _, err := projectFromReplySubject("iot.cmd.reply.invalid.ZGV2LTE"); err == nil {
 		t.Fatal("invalid project id should fail")
 	}
 }

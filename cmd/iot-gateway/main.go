@@ -122,6 +122,18 @@ func main() {
 	}); err != nil {
 		logger.Fatal("确保遥测 Stream 存在失败", zap.Error(err))
 	}
+	replyPub, err := gateway.NewNATSPublisher(*natsURL, "IOT_COMMAND_REPLY")
+	if err != nil {
+		logger.Fatal("连接命令回执通道失败", zap.Error(err))
+	}
+	defer func() { _ = replyPub.Close() }()
+	if err := replyPub.EnsureStream(gateway.StreamSpec{
+		Subjects: []string{"iot.cmd.reply.>"},
+		Replicas: 1,
+		MaxAge:   7 * 24 * time.Hour,
+	}); err != nil {
+		logger.Fatal("确保命令回执 Stream 存在失败", zap.Error(err))
+	}
 	lifecyclePub, err := gateway.NewNATSPublisher(*natsURL, *deviceEventsStream)
 	if err != nil {
 		logger.Fatal("连接设备生命周期事件通道失败", zap.Error(err))
@@ -190,6 +202,7 @@ func main() {
 		MQTTAddr:                 *mqttAddr,
 		TLSConfig:                tlsConfig,
 		Publisher:                pub,
+		CommandReplyPublisher:    replyPub,
 		DeviceLifecyclePublisher: lifecyclePub,
 		Router:                   gateway.ContractRouter{Project: *project, Shards: *shards},
 		PubackTimeout:            *pubackTimeout,

@@ -17,6 +17,7 @@ import (
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
 
+	"github.com/SNCIC/odoo20iot/internal/cluster"
 	"github.com/SNCIC/odoo20iot/internal/envelope"
 )
 
@@ -133,6 +134,58 @@ func newTestBrokerWithRouter(t *testing.T, pub Publisher, timeout time.Duration,
 	b.Serve()
 	t.Cleanup(func() { _ = b.Close() })
 	return b, metrics
+}
+
+func newTestBrokerWithReply(t *testing.T, pub, reply Publisher) (*Broker, *Metrics) {
+	t.Helper()
+	metrics := new(Metrics)
+	b, err := New(context.Background(), Options{
+		MQTTAddr:                 "127.0.0.1:0",
+		Publisher:                pub,
+		CommandReplyPublisher:    reply,
+		DeviceLifecyclePublisher: discardLifecyclePublisher{},
+		Router:                   ContractRouter{Project: "spike"},
+		PubackTimeout:            time.Second,
+		Metrics:                  metrics,
+		Log:                      testLogger(),
+		AllowAnonymous:           true,
+		EnableInlineClient:       true,
+	})
+	if err != nil {
+		t.Fatalf("构造带回执通道的 broker 失败: %v", err)
+	}
+	b.Serve()
+	t.Cleanup(func() { _ = b.Close() })
+	return b, metrics
+}
+
+func TestCommandReplyUsesDedicatedStream(t *testing.T) {
+	telemetry := new(fakePublisher)
+	reply := &fakePublisher{block: make(chan struct{})}
+	broker, _ := newTestBrokerWithReply(t, telemetry, reply)
+	dev := dialTestDevice(t, broker.Addr(), "dev-1")
+	dev.connect("dev-1")
+
+	id := dev.publish("v1/devices/dev-1/cmd/reply", []byte(`{"id":"corr-1","code":0}`), false)
+	dev.assertNoPuback(100 * time.Millisecond)
+	close(reply.block)
+	if err := dev.awaitPuback(id, 3*time.Second); err != nil {
+		t.Fatalf("命令回执未收到 PUBACK: %v", err)
+	}
+	if telemetry.callCount() != 0 {
+		t.Fatalf("命令回执不应进入遥测流，得到 %d 次投递", telemetry.callCount())
+	}
+	call, ok := reply.lastCall()
+	if !ok {
+		t.Fatal("命令回执未发布")
+	}
+	want, err := cluster.CommandReplySubject(1, "dev-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.subject != want {
+		t.Fatalf("回执 subject = %q，期望 %q", call.subject, want)
+	}
 }
 
 // ---------- A2 验证 ----------

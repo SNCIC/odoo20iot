@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
 	"time"
 
+	"github.com/SNCIC/odoo20iot/internal/cluster"
 	"github.com/SNCIC/odoo20iot/internal/natsjs"
 	"github.com/nats-io/nats.go"
 )
@@ -68,13 +67,5 @@ func ConsumeReplies(ctx context.Context, js nats.JetStreamContext, store *Store,
 }
 
 func projectFromReplySubject(subject string) (int64, string, error) {
-	parts := strings.Split(subject, ".")
-	if len(parts) != 5 || parts[0] != "iot" || parts[1] != "cmd" || parts[2] != "reply" || parts[3] == "" || parts[4] == "" {
-		return 0, "", fmt.Errorf("期望 iot.cmd.reply.<project>.<device>，得到 %q", subject)
-	}
-	id, err := strconv.ParseInt(parts[3], 10, 64)
-	if err != nil || id <= 0 {
-		return 0, "", fmt.Errorf("project_id 非法")
-	}
-	return id, parts[4], nil
+	return cluster.ParseCommandReplySubject(subject)
 }

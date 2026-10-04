@@ -17,8 +17,10 @@
 package cluster
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -115,6 +117,35 @@ func cut(s, sep string) (before, after string, found bool) {
 func DeviceKeyFromTopic(topic string) string {
 	key, _ := ParseDeviceTopic(topic)
 	return key
+}
+
+func IsCommandReplyTopic(topic string) bool {
+	_, rest := ParseDeviceTopic(topic)
+	return rest == "cmd/reply"
+}
+
+func CommandReplySubject(projectID int64, deviceKey string) (string, error) {
+	if projectID <= 0 || deviceKey == "" {
+		return "", fmt.Errorf("命令回执缺少有效 project_id 或 device_key")
+	}
+	encodedKey := base64.RawURLEncoding.EncodeToString([]byte(deviceKey))
+	return fmt.Sprintf("iot.cmd.reply.%d.%s", projectID, encodedKey), nil
+}
+
+func ParseCommandReplySubject(subject string) (int64, string, error) {
+	parts := strings.Split(subject, ".")
+	if len(parts) != 5 || parts[0] != "iot" || parts[1] != "cmd" || parts[2] != "reply" {
+		return 0, "", fmt.Errorf("命令回执 subject 非法: %q", subject)
+	}
+	projectID, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil || projectID <= 0 {
+		return 0, "", fmt.Errorf("命令回执 project_id 非法")
+	}
+	deviceKeyBytes, err := base64.RawURLEncoding.DecodeString(parts[4])
+	if err != nil || len(deviceKeyBytes) == 0 {
+		return 0, "", fmt.Errorf("命令回执 device_key 编码非法")
+	}
+	return projectID, string(deviceKeyBytes), nil
 }
 
 // IsDeviceDownlink 判断该 topic 是否是「平台 → 设备」方向。

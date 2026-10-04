@@ -46,6 +46,8 @@ type HookConfig struct {
 	DeviceTypeID int64
 	// Meter 为 nil 时不做计量（不影响 A2 时序）。
 	Meter             Meter
+	ReplyPublisher    Publisher
+	ReplyTimeout      time.Duration
 	IdentityForClient func(string) (projectID, deviceID, deviceTypeID int64, ok bool)
 	RequireIdentity   bool
 }
@@ -53,11 +55,12 @@ type HookConfig struct {
 type Hook struct {
 	mqtt.HookBase
 
-	baseCtx context.Context
-	acker   *Acker
-	router  SubjectRouter
-	metrics *Metrics
-	logger  *slog.Logger
+	baseCtx    context.Context
+	acker      *Acker
+	replyAcker *Acker
+	router     SubjectRouter
+	metrics    *Metrics
+	logger     *slog.Logger
 
 	// 归属占位值（Phase 0）。真实 tenant / 设备主键投影依赖 A1 注册表，
 	// 见 internal/envelope 包注释。
@@ -84,7 +87,7 @@ func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metric
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Hook{
+	hook := &Hook{
 		baseCtx:           baseCtx,
 		acker:             acker,
 		router:            router,
@@ -96,6 +99,14 @@ func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metric
 		identityForClient: cfg.IdentityForClient,
 		requireIdentity:   cfg.RequireIdentity,
 	}
+	if cfg.ReplyPublisher != nil {
+		replyTimeout := cfg.ReplyTimeout
+		if replyTimeout <= 0 {
+			replyTimeout = DefaultPubackTimeout
+		}
+		hook.replyAcker = NewAcker(cfg.ReplyPublisher, replyTimeout, metrics)
+	}
+	return hook
 }
 
 // ID 实现 mqtt.Hook。
@@ -132,6 +143,10 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		h.logger.Error("拒绝 QoS2 上报：超出端侧契约，A2 时序未覆盖",
 			"client", cl.ID, "topic", pk.TopicName, "packet_id", pk.PacketID)
 		return pk, packets.ErrRejectPacket
+	}
+
+	if cluster.IsCommandReplyTopic(pk.TopicName) {
+		return h.onCommandReply(cl, pk)
 	}
 
 	subject, err := h.router.Route(cl, pk)
@@ -185,6 +200,52 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 			"client", cl.ID, "topic", pk.TopicName, "packet_id", pk.PacketID, "error", err)
 	}
 
+	return pk, packets.ErrRejectPacket
+}
+
+func (h *Hook) onCommandReply(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
+	if h.replyAcker == nil {
+		h.logger.Error("命令回执通道未配置", "topic", pk.TopicName)
+		return pk, packets.ErrRejectPacket
+	}
+	if !json.Valid(pk.Payload) || len(pk.Payload) > MaxPayloadBytes {
+		h.metrics.InvalidPayloadTotal.Add(1)
+		h.logger.Warn("拒绝非法命令回执", "client", cl.ID, "topic", pk.TopicName)
+		if pk.FixedHeader.Qos > 0 {
+			if err := writePuback(cl, pk); err != nil {
+				h.metrics.PubackWriteErrorTotal.Add(1)
+			}
+			return pk, packets.ErrRejectPacket
+		}
+		return pk, packets.ErrRejectPacket
+	}
+	deviceKey := cluster.DeviceKeyFromTopic(pk.TopicName)
+	projectID := h.projectID
+	if h.identityForClient != nil {
+		resolvedProject, _, _, ok := h.identityForClient(cl.ID)
+		if ok {
+			projectID = resolvedProject
+		} else if h.requireIdentity {
+			return pk, packets.ErrRejectPacket
+		}
+	}
+	subject, err := cluster.CommandReplySubject(projectID, deviceKey)
+	if err != nil {
+		return pk, packets.ErrRejectPacket
+	}
+	if pk.FixedHeader.Qos == 0 {
+		if err := h.replyAcker.PublishQoS0(h.baseCtx, subject, pk.Payload); err != nil {
+			h.logger.Error("命令回执 QoS0 发布失败", "subject", subject, "error", err)
+		}
+		return pk, nil
+	}
+	if err := h.replyAcker.AwaitPersist(h.baseCtx, subject, pk.Payload); err != nil {
+		h.logger.Error("命令回执未持久化，等待设备重传", "subject", subject, "error", err)
+		return pk, packets.ErrRejectPacket
+	}
+	if err := writePuback(cl, pk); err != nil {
+		h.metrics.PubackWriteErrorTotal.Add(1)
+	}
 	return pk, packets.ErrRejectPacket
 }
 
