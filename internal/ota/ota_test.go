@@ -68,10 +68,17 @@ func TestNotificationAndProgressValidation(t *testing.T) {
 	if err != nil || notify.TaskID != "task-1" || !notify.Resume {
 		t.Fatalf("通知构造失败: %+v/%v", notify, err)
 	}
-	if err := (Progress{TaskID: "task-1", Status: "downloading", Progress: 101}).Validate(); err == nil {
+	taskID := "550e8400-e29b-41d4-a716-446655440000"
+	if err := (Progress{TaskID: taskID, Status: "downloading", Progress: 101}).Validate(); err == nil {
 		t.Fatal("超范围 progress 必须拒绝")
 	}
-	if err := (Progress{TaskID: "task-1", Status: "succeeded", Progress: 100, BytesDownloaded: 1}).Validate(); err != nil {
+	if err := (Progress{TaskID: taskID, Status: "pending"}).Validate(); err == nil {
+		t.Fatal("设备进度不能报告 pending 状态")
+	}
+	if err := (Progress{TaskID: taskID, Status: "bogus"}).Validate(); err == nil {
+		t.Fatal("未知状态必须拒绝")
+	}
+	if err := (Progress{TaskID: taskID, Status: "succeeded", Progress: 100, BytesDownloaded: 1}).Validate(); err != nil {
 		t.Fatal(err)
 	}
 }

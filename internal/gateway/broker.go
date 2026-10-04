@@ -28,6 +28,7 @@ type Options struct {
 	Publisher                Publisher
 	CommandReplyPublisher    Publisher
 	ShadowReportedPublisher  Publisher
+	OTAProgressPublisher     Publisher
 	DeviceLifecyclePublisher DeviceLifecyclePublisher
 	// Router 把设备 topic 映射为总线 subject。
 	Router SubjectRouter
@@ -194,6 +195,7 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		Meter:                   opts.Meter,
 		ReplyPublisher:          opts.CommandReplyPublisher,
 		ShadowReportedPublisher: opts.ShadowReportedPublisher,
+		OTAProgressPublisher:    opts.OTAProgressPublisher,
 		ReplyTimeout:            opts.PubackTimeout,
 		IdentityForClient:       identityForClient,
 		RequireIdentity:         authHook != nil,

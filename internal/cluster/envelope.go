@@ -177,6 +177,34 @@ func IsShadowReportedTopic(topic string) bool {
 	return rest == "shadow/reported"
 }
 
+func IsOTAProgressTopic(topic string) bool {
+	_, rest := ParseDeviceTopic(topic)
+	return rest == "ota/progress"
+}
+
+func OTAProgressSubject(projectID int64, deviceKey string) (string, error) {
+	if projectID <= 0 || deviceKey == "" {
+		return "", fmt.Errorf("OTA 进度缺少有效 project_id 或 device_key")
+	}
+	return fmt.Sprintf("iot.ota.progress.%d.%s", projectID, base64.RawURLEncoding.EncodeToString([]byte(deviceKey))), nil
+}
+
+func ParseOTAProgressSubject(subject string) (int64, string, error) {
+	parts := strings.Split(subject, ".")
+	if len(parts) != 5 || parts[0] != "iot" || parts[1] != "ota" || parts[2] != "progress" {
+		return 0, "", fmt.Errorf("OTA 进度 subject 非法: %q", subject)
+	}
+	projectID, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil || projectID <= 0 {
+		return 0, "", fmt.Errorf("OTA 进度 project_id 非法")
+	}
+	deviceKey, err := base64.RawURLEncoding.DecodeString(parts[4])
+	if err != nil || len(deviceKey) == 0 {
+		return 0, "", fmt.Errorf("OTA 进度 device_key 非法")
+	}
+	return projectID, string(deviceKey), nil
+}
+
 // IsDeviceDownlink 判断该 topic 是否是「平台 → 设备」方向。
 //
 // 方向由**设备键之后的第一段路径**决定，规则直接来自 03 §2.2 的两张白名单：

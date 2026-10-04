@@ -48,6 +48,7 @@ type HookConfig struct {
 	Meter                   Meter
 	ReplyPublisher          Publisher
 	ShadowReportedPublisher Publisher
+	OTAProgressPublisher    Publisher
 	ReplyTimeout            time.Duration
 	IdentityForClient       func(string) (projectID, deviceID, deviceTypeID int64, ok bool)
 	RequireIdentity         bool
@@ -60,6 +61,7 @@ type Hook struct {
 	acker       *Acker
 	replyAcker  *Acker
 	shadowAcker *Acker
+	otaAcker    *Acker
 	router      SubjectRouter
 	metrics     *Metrics
 	logger      *slog.Logger
@@ -115,6 +117,13 @@ func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metric
 		}
 		hook.shadowAcker = NewAcker(cfg.ShadowReportedPublisher, shadowTimeout, metrics)
 	}
+	if cfg.OTAProgressPublisher != nil {
+		timeout := cfg.ReplyTimeout
+		if timeout <= 0 {
+			timeout = DefaultPubackTimeout
+		}
+		hook.otaAcker = NewAcker(cfg.OTAProgressPublisher, timeout, metrics)
+	}
 	return hook
 }
 
@@ -159,6 +168,9 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	}
 	if cluster.IsShadowReportedTopic(pk.TopicName) {
 		return h.onShadowReported(cl, pk)
+	}
+	if cluster.IsOTAProgressTopic(pk.TopicName) {
+		return h.onOTAProgress(cl, pk)
 	}
 
 	subject, err := h.router.Route(cl, pk)
@@ -212,6 +224,45 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 			"client", cl.ID, "topic", pk.TopicName, "packet_id", pk.PacketID, "error", err)
 	}
 
+	return pk, packets.ErrRejectPacket
+}
+
+func (h *Hook) onOTAProgress(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
+	if h.otaAcker == nil || !json.Valid(pk.Payload) || len(pk.Payload) > MaxPayloadBytes {
+		h.metrics.InvalidPayloadTotal.Add(1)
+		if pk.FixedHeader.Qos > 0 {
+			if err := writePuback(cl, pk); err != nil {
+				h.metrics.PubackWriteErrorTotal.Add(1)
+			}
+		}
+		return pk, packets.ErrRejectPacket
+	}
+	deviceKey := cluster.DeviceKeyFromTopic(pk.TopicName)
+	projectID := h.projectID
+	if h.identityForClient != nil {
+		resolvedProject, _, _, ok := h.identityForClient(cl.ID)
+		if ok {
+			projectID = resolvedProject
+		} else if h.requireIdentity {
+			return pk, packets.ErrRejectPacket
+		}
+	}
+	subject, err := cluster.OTAProgressSubject(projectID, deviceKey)
+	if err != nil {
+		return pk, packets.ErrRejectPacket
+	}
+	if pk.FixedHeader.Qos == 0 {
+		if err := h.otaAcker.PublishQoS0(h.baseCtx, subject, pk.Payload); err != nil {
+			h.logger.Error("OTA 进度 QoS0 发布失败", "error", err)
+		}
+		return pk, nil
+	}
+	if err := h.otaAcker.AwaitPersist(h.baseCtx, subject, pk.Payload); err != nil {
+		return pk, packets.ErrRejectPacket
+	}
+	if err := writePuback(cl, pk); err != nil {
+		h.metrics.PubackWriteErrorTotal.Add(1)
+	}
 	return pk, packets.ErrRejectPacket
 }
 

@@ -144,6 +144,16 @@ func main() {
 	}); err != nil {
 		logger.Fatal("确保影子上报 Stream 存在失败", zap.Error(err))
 	}
+	otaProgressPub, err := gateway.NewNATSPublisher(*natsURL, "IOT_OTA_PROGRESS")
+	if err != nil {
+		logger.Fatal("连接 OTA 进度通道失败", zap.Error(err))
+	}
+	defer func() { _ = otaProgressPub.Close() }()
+	if err := otaProgressPub.EnsureStream(gateway.StreamSpec{
+		Subjects: []string{"iot.ota.progress.>"}, Replicas: 1, MaxAge: 7 * 24 * time.Hour,
+	}); err != nil {
+		logger.Fatal("确保 OTA 进度 Stream 存在失败", zap.Error(err))
+	}
 	lifecyclePub, err := gateway.NewNATSPublisher(*natsURL, *deviceEventsStream)
 	if err != nil {
 		logger.Fatal("连接设备生命周期事件通道失败", zap.Error(err))
@@ -214,6 +224,7 @@ func main() {
 		Publisher:                pub,
 		CommandReplyPublisher:    replyPub,
 		ShadowReportedPublisher:  shadowReportedPub,
+		OTAProgressPublisher:     otaProgressPub,
 		DeviceLifecyclePublisher: lifecyclePub,
 		Router:                   gateway.ContractRouter{Project: *project, Shards: *shards},
 		PubackTimeout:            *pubackTimeout,

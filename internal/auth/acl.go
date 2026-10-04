@@ -25,6 +25,7 @@ var (
 		"v1/devices/%s/events",
 		"v1/devices/%s/cmd/reply",
 		"v1/devices/%s/shadow/reported",
+		"v1/devices/%s/ota/progress",
 	}
 	subPatterns = []string{
 		"v1/devices/%s/cmd/+",
@@ -39,6 +40,7 @@ var (
 		"v1/gateways/%s/devices/+/events",
 		"v1/gateways/%s/devices/+/cmd/reply",
 		"v1/gateways/%s/devices/+/shadow/reported",
+		"v1/gateways/%s/devices/+/ota/progress",
 	}
 	gatewaySubPatterns = []string{
 		"v1/gateways/%s/devices/+/cmd/+",

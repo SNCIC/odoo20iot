@@ -289,9 +289,17 @@ func run(cfg config) error {
 	if err := shadow.EnsureReportedStream(shadowJS); err != nil {
 		return err
 	}
+	if err := ota.EnsureProgressStream(shadowJS); err != nil {
+		return fmt.Errorf("确保 OTA 进度 Stream 存在失败: %w", err)
+	}
 	go func() {
 		if err := shadow.ConsumeReported(ctx, shadowJS, shadowStore, "svc-shadow-reported", logger); err != nil && ctx.Err() == nil {
 			logger.Error("影子 reported 消费者退出", "error", err)
+		}
+	}()
+	go func() {
+		if err := ota.ConsumeProgress(ctx, shadowJS, otaStore, "svc-ota-progress", logger); err != nil && ctx.Err() == nil {
+			logger.Error("OTA 进度消费者退出", "error", err)
 		}
 	}()
 	if cfg.commandOriginID != "" {

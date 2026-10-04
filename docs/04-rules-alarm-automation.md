@@ -665,7 +665,8 @@ Range。未配置签名器时清单/下载路由不暴露，禁止用明文 HTTP
 签名私钥只允许由外部密钥管理系统提供，禁止写入仓库或数据库。`POST
 /api/v1/ota/tasks/{task_id}/start` 会按灰度批次签署清单并经网关路由发送
 `v1/devices/{device_key}/ota/notify`，路由成功后才将设备任务记为 `notified`；设备进度消费、
-后续批次自动推进、超时/失败率暂停和回滚仍在下一阶段，当前不宣称 OTA 已可对真实设备执行升级。
+进度已通过独立 `IOT_OTA_PROGRESS` Stream 接入 `svc-query`，按租户和设备写入
+`t_ota_task_device`；后续批次自动推进、超时/失败率暂停和回滚仍在下一阶段，当前不宣称 OTA 已可对真实设备执行升级。
 
 ---
 

@@ -72,14 +72,17 @@ type Progress struct {
 }
 
 func (p Progress) Validate() error {
-	if strings.TrimSpace(p.TaskID) == "" {
-		return fmt.Errorf("ota: progress 缺少 task_id")
+	if !ValidTaskID(p.TaskID) {
+		return fmt.Errorf("ota: progress task_id 非法")
 	}
 	if p.Progress < MinProgress || p.Progress > MaxProgress {
 		return fmt.Errorf("ota: progress 超出 0..100")
 	}
 	if p.BytesDownloaded < 0 {
 		return fmt.Errorf("ota: bytes_downloaded 不能为负数")
+	}
+	if !validDeviceStatus(DeviceStatus(p.Status)) || DeviceStatus(p.Status) == DevicePending {
+		return fmt.Errorf("ota: progress status 非法")
 	}
 	return nil
 }
