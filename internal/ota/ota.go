@@ -223,6 +223,9 @@ func (m Manifest) VerifyURL() error {
 }
 
 func Transition(from, to DeviceStatus) error {
+	if !validDeviceStatus(from) || !validDeviceStatus(to) {
+		return fmt.Errorf("ota: 设备状态非法")
+	}
 	allowed := map[DeviceStatus][]DeviceStatus{
 		DevicePending:     {DeviceNotified, DeviceExpired, DeviceFailed},
 		DeviceNotified:    {DeviceDownloading, DeviceExpired, DeviceFailed},
@@ -239,4 +242,14 @@ func Transition(from, to DeviceStatus) error {
 		}
 	}
 	return fmt.Errorf("ota: 设备状态不能从 %q 转为 %q", from, to)
+}
+
+func validDeviceStatus(status DeviceStatus) bool {
+	switch status {
+	case DevicePending, DeviceNotified, DeviceDownloading, DeviceVerifying,
+		DeviceInstalling, DeviceSucceeded, DeviceFailed, DeviceExpired, DeviceRolledBack:
+		return true
+	default:
+		return false
+	}
 }
