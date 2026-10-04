@@ -17,6 +17,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/cluster"
+	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/dlq"
 	"github.com/SNCIC/odoo20iot/internal/envelope"
 	"github.com/SNCIC/odoo20iot/internal/gateway"
@@ -35,6 +37,7 @@ type config struct {
 	ackWait, inactive, reload                                      time.Duration
 	logFormat                                                      string
 	scriptEnabled                                                  bool
+	commandOriginID                                                string
 }
 
 func main() {
@@ -58,6 +61,7 @@ func parseFlags() config {
 	flag.DurationVar(&c.reload, "reload-interval", time.Minute, "规则热加载周期")
 	flag.StringVar(&c.logFormat, "log-format", "json", "日志格式 json/text")
 	flag.BoolVar(&c.scriptEnabled, "script-enabled", false, "启用受限 script.run（默认关闭）")
+	flag.StringVar(&c.commandOriginID, "command-origin-id", "", "command.send 路由源 ID；为空则禁用下行")
 	flag.Parse()
 	return c
 }
@@ -95,6 +99,19 @@ func run(cfg config) error {
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return err
 	}
+	var commandRouter command.Router
+	var gatewayNode *cluster.Node
+	if cfg.commandOriginID != "" {
+		gatewayNode, err = cluster.New(ctx, cluster.Options{
+			ID: cfg.commandOriginID, NATSURL: cfg.natsURL,
+			Cursor: cluster.NewRedisCursor(rdb, "gw:offline:cursor"), Logger: log,
+		}, cluster.NewRedisLocator(rdb, "gw:client", cluster.DefaultLocatorTTL))
+		if err != nil {
+			return err
+		}
+		defer gatewayNode.Close()
+		commandRouter = gatewayNode
+	}
 	history, err := greptimedb.Open(ctx, cfg.historyDSN, 4)
 	if err != nil {
 		return err
@@ -112,7 +129,7 @@ func run(cfg config) error {
 	if err := pub.EnsureStream(gateway.StreamSpec{Name: "IOT_RULE", Subjects: []string{"iot.rule.>"}, Replicas: 1, MaxAge: 24 * time.Hour, StrictSubjects: true}); err != nil {
 		return err
 	}
-	engine, err := ruleengine.New(store, latestStore, history, pub, ruleengine.Config{ReloadEvery: cfg.reload, ScriptEnabled: cfg.scriptEnabled}, log)
+	engine, err := ruleengine.New(store, latestStore, history, pub, ruleengine.Config{ReloadEvery: cfg.reload, ScriptEnabled: cfg.scriptEnabled, CommandSender: command.Sender{Router: commandRouter}}, log)
 	if err != nil {
 		return err
 	}

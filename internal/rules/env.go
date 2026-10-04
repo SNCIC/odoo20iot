@@ -52,6 +52,7 @@ func (e Env) Bind(msg, meta, prev, window, state map[string]any) Env {
 func NewMeta(deviceID, deviceTypeID, projectID, companyID int64, group string, groups []any, tags map[string]any, ts time.Time, seq int64) map[string]any {
 	return map[string]any{
 		"device_id":      deviceID,
+		"device_key":     "",
 		"device_type_id": deviceTypeID,
 		"project_id":     projectID,
 		"company_id":     companyID,

@@ -427,6 +427,30 @@ func (n *Node) Route(ctx context.Context, env Envelope) error {
 	return n.publishTo(ctx, node, env)
 }
 
+// RouteExternal 是网关外部服务发起下行消息的入口。
+// 外部服务没有本地 broker，因此本节点也必须走路由 subject，由网关消费者注入。
+func (n *Node) RouteExternal(ctx context.Context, env Envelope) error {
+	if env.DeviceKey == "" {
+		env.DeviceKey = DeviceKeyFromTopic(env.Topic)
+	}
+	if env.DeviceKey == "" {
+		return errors.New("外部下行消息缺少 device_key")
+	}
+	env.Origin = n.opts.ID
+	if env.PublishedAt.IsZero() {
+		env.PublishedAt = time.Now().UTC()
+	}
+	env.Seq = n.seq.Add(1)
+	nodeID, online, err := n.locator.NodeOf(ctx, env.DeviceKey)
+	if err != nil {
+		return fmt.Errorf("查询设备位置 %s: %w", env.DeviceKey, err)
+	}
+	if !online {
+		return n.EnqueueOffline(ctx, env)
+	}
+	return n.publishTo(ctx, nodeID, env)
+}
+
 // broadcast 把消息发给所有对端（非设备命名空间的兜底路径）。
 func (n *Node) broadcast(ctx context.Context, env Envelope) error {
 	for _, peer := range n.opts.Peers {

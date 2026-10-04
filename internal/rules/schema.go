@@ -100,6 +100,7 @@ func (o Object) String() string {
 // MetaField 是 meta 命名空间的静态字段表（04 §1.2「可用变量」）。
 var metaFields = map[string]Kind{
 	"device_id":      KindNumber,
+	"device_key":     KindString,
 	"device_type_id": KindNumber,
 	"project_id":     KindNumber,
 	"company_id":     KindNumber,

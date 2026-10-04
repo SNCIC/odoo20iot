@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/SNCIC/odoo20iot/internal/alarm"
+	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/dag"
 	"github.com/SNCIC/odoo20iot/internal/envelope"
 	"github.com/SNCIC/odoo20iot/internal/latest"
@@ -36,18 +37,20 @@ func (l fixedLocator) LocateDevice(context.Context, string) (int64, int64, error
 type Config struct {
 	ReloadEvery   time.Duration
 	ScriptEnabled bool
+	CommandSender command.Sender
 }
 type Engine struct {
-	loader      RuleLoader
-	cache       rules.PrevSnapshotStore
-	latest      latest.Store
-	publish     Publisher
-	compiler    *rules.Compiler
-	script      *script.Engine
-	logger      *slog.Logger
-	mu          sync.Mutex
-	cached      map[string]cachedRules
-	reloadEvery time.Duration
+	loader        RuleLoader
+	cache         rules.PrevSnapshotStore
+	latest        latest.Store
+	publish       Publisher
+	compiler      *rules.Compiler
+	script        *script.Engine
+	commandSender command.Sender
+	logger        *slog.Logger
+	mu            sync.Mutex
+	cached        map[string]cachedRules
+	reloadEvery   time.Duration
 }
 type cachedRules struct {
 	at    time.Time
@@ -72,7 +75,7 @@ func New(loader RuleLoader, cache latest.Store, history rules.PrevSnapshotStore,
 			return nil, err
 		}
 	}
-	return &Engine{loader: loader, latest: cache, cache: history, publish: publish, compiler: rules.NewCompiler(10000), script: scriptEngine, logger: logger, cached: make(map[string]cachedRules), reloadEvery: cfg.ReloadEvery}, nil
+	return &Engine{loader: loader, latest: cache, cache: history, publish: publish, compiler: rules.NewCompiler(10000), script: scriptEngine, commandSender: cfg.CommandSender, logger: logger, cached: make(map[string]cachedRules), reloadEvery: cfg.ReloadEvery}, nil
 }
 
 func (e *Engine) Process(ctx context.Context, env envelope.Envelope) error {
@@ -102,6 +105,7 @@ func (e *Engine) Process(ctx context.Context, env envelope.Envelope) error {
 		seq = *body.Seq
 	}
 	meta := rules.NewMeta(env.DeviceID, env.DeviceTypeID, env.ProjectID, 0, "", nil, nil, at, seq)
+	meta["device_key"] = env.DeviceKey
 	var prevResolver rules.CachedPrevResolver
 	hasPrev := false
 	if e.latest != nil || e.cache != nil {
@@ -163,6 +167,9 @@ func (e *Engine) load(ctx context.Context, projectID string, deviceTypeID int64)
 		return got.rules, nil
 	}
 	actions := []dag.Action{dag.Func{ActionName: "alarm.raise", Idem: true, Run: e.raiseAction}}
+	if e.commandSender.Router != nil {
+		actions = append(actions, command.Action{Sender: e.commandSender})
+	}
 	if e.script != nil {
 		actions = append(actions, script.Action{Engine: e.script, Emit: e.emitScript})
 	}
@@ -205,6 +212,17 @@ func (e *Engine) load(ctx context.Context, projectID string, deviceTypeID int64)
 				setDefault(node.Params, "rule_id", loaded[i].RuleID)
 				setDefault(node.Params, "rule_name", loaded[i].Name)
 				setDefault(node.Params, "level", loaded[i].Level)
+			}
+			if node.Type == dag.NodeAction && node.Action == "command.send" {
+				if e.commandSender.Router == nil {
+					return nil, fmt.Errorf("规则 %s 使用 command.send，但下行路由未配置", loaded[i].RuleID)
+				}
+				if node.Params == nil {
+					node.Params = map[string]any{}
+				}
+				// 命令只能发回触发当前规则的设备；规则配置不可覆盖可信设备身份。
+				node.Params["device_key"] = "$meta.device_key"
+				node.Params["project_id"] = "$meta.project_id"
 			}
 			if node.Type == dag.NodeAction && node.Action == "script.run" {
 				if node.Params == nil {

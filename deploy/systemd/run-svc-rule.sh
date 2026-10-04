@@ -12,4 +12,5 @@ exec /home/xfusion/projects/odoo20iot/bin/svc-rule \
   -redis-url "${IOT_REDIS_URL:-redis://100.64.0.3:28637/0}" \
   -history-dsn "${IOT_GREPTIME_DSN:-postgres://greptime:greptime@100.64.0.3:28403/public}" \
   -script-enabled="${IOT_RULE_SCRIPT_ENABLED:-false}" \
+  -command-origin-id "${IOT_COMMAND_ORIGIN_ID:-}" \
   -log-format "${IOT_LOG_FORMAT:-json}"
