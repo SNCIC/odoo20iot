@@ -92,18 +92,18 @@ func TestValidTaskID(t *testing.T) {
 	}
 }
 
-func TestNextBatchDevices(t *testing.T) {
-	devices := make([]TaskDevice, 0, 100)
-	for index := 0; index < 100; index++ {
-		status := DevicePending
-		if index < 1 {
-			status = DeviceNotified
-		}
-		devices = append(devices, TaskDevice{DeviceKey: fmt.Sprintf("dev-%03d", index), Status: status})
+func TestRolloutCohortBoundaries(t *testing.T) {
+	devices := make([]TaskDevice, 100)
+	for index := range devices {
+		devices[index] = TaskDevice{DeviceKey: fmt.Sprintf("dev-%03d", index)}
 	}
-	batch, err := NextBatchDevices(devices, DefaultRollout())
-	if err != nil || len(batch) != 9 {
-		t.Fatalf("第二批应选择 9 台，得到 %d/%v", len(batch), err)
+	first, err := RolloutCohort(devices, DefaultRollout(), 0)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("首批应为 1 台: %d/%v", len(first), err)
+	}
+	second, err := RolloutCohort(devices, DefaultRollout(), 1)
+	if err != nil || len(second) != 9 || second[0].DeviceKey != "dev-001" {
+		t.Fatalf("第二批边界错误: %d/%v", len(second), err)
 	}
 }
 

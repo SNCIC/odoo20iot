@@ -13,6 +13,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -27,6 +28,7 @@ type Task struct {
 	ProjectID  int64         `json:"project_id"`
 	FirmwareID int64         `json:"firmware_id"`
 	Status     TaskStatus    `json:"status"`
+	BatchIndex int           `json:"batch_index"`
 	Rollout    Rollout       `json:"rollout"`
 	OfflineTTL time.Duration `json:"offline_ttl"`
 	CreatedBy  string        `json:"created_by"`
@@ -164,7 +166,7 @@ func (s *PGStore) GetTask(ctx context.Context, projectID int64, taskID string) (
 	var task Task
 	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
 		var rolloutJSON []byte
-		err := tx.QueryRow(ctx, `SELECT id::text,project_id,firmware_id,status,rollout,extract(epoch from offline_ttl)::bigint,created_by,created_at,started_at,finished_at FROM t_ota_task WHERE project_id=$1 AND id=$2`, projectID, taskID).Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt)
+		err := tx.QueryRow(ctx, `SELECT id::text,project_id,firmware_id,status,rollout,extract(epoch from offline_ttl)::bigint,created_by,created_at,started_at,finished_at,rollout_batch_index FROM t_ota_task WHERE project_id=$1 AND id=$2`, projectID, taskID).Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt, &task.BatchIndex)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrTaskNotFound
 		}
@@ -175,6 +177,65 @@ func (s *PGStore) GetTask(ctx context.Context, projectID int64, taskID string) (
 		return json.Unmarshal(rolloutJSON, &task.Rollout)
 	})
 	return task, err
+}
+
+func (s *PGStore) ClaimRunningTasks(ctx context.Context, projectID int64, limit int, lease time.Duration) ([]Task, error) {
+	if projectID <= 0 || limit <= 0 || lease <= 0 {
+		return nil, fmt.Errorf("ota: claim 参数非法")
+	}
+	var tasks []Task
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `WITH picked AS (
+			SELECT id FROM t_ota_task WHERE project_id=$1 AND status='running' AND (dispatch_lease_until IS NULL OR dispatch_lease_until < now())
+			ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $2
+		) UPDATE t_ota_task t SET dispatch_lease_until=now()+$3::interval FROM picked p
+		WHERE t.project_id=$1 AND t.id=p.id
+		RETURNING t.id::text,t.project_id,t.firmware_id,t.status,t.rollout,extract(epoch from t.offline_ttl)::bigint,t.created_by,t.created_at,t.started_at,t.finished_at,t.rollout_batch_index`, projectID, limit, fmt.Sprintf("%d seconds", int64(lease/time.Second)))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var task Task
+			var rolloutJSON []byte
+			if err := rows.Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt, &task.BatchIndex); err != nil {
+				return err
+			}
+			task.OfflineTTL *= time.Second
+			if err := json.Unmarshal(rolloutJSON, &task.Rollout); err != nil {
+				return err
+			}
+			tasks = append(tasks, task)
+		}
+		return rows.Err()
+	})
+	return tasks, err
+}
+
+func (s *PGStore) SetBatchState(ctx context.Context, projectID int64, taskID string, expectedIndex, nextIndex int, status TaskStatus) error {
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		var result pgconn.CommandTag
+		var err error
+		if status == TaskPaused || status == TaskCompleted {
+			result, err = tx.Exec(ctx, `UPDATE t_ota_task SET status=$1,rollout_batch_index=$2,dispatch_lease_until=NULL,finished_at=now() WHERE project_id=$3 AND id=$4 AND status='running' AND rollout_batch_index=$5`, status, nextIndex, projectID, taskID, expectedIndex)
+		} else {
+			result, err = tx.Exec(ctx, `UPDATE t_ota_task SET rollout_batch_index=$1,dispatch_lease_until=NULL WHERE project_id=$2 AND id=$3 AND status='running' AND rollout_batch_index=$4`, nextIndex, projectID, taskID, expectedIndex)
+		}
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 0 {
+			return fmt.Errorf("ota: 灰度批次状态已被并发修改")
+		}
+		return nil
+	})
+}
+
+func (s *PGStore) ReleaseDispatchLease(ctx context.Context, projectID int64, taskID string) error {
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE t_ota_task SET dispatch_lease_until=NULL WHERE project_id=$1 AND id=$2 AND status='running'`, projectID, taskID)
+		return err
+	})
 }
 
 func (s *PGStore) StartTask(ctx context.Context, projectID int64, taskID string) (Task, error) {
@@ -209,7 +270,7 @@ func (s *PGStore) StartTask(ctx context.Context, projectID int64, taskID string)
 
 func (s *PGStore) MarkNotified(ctx context.Context, projectID int64, taskID, deviceKey string) error {
 	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
-		result, err := tx.Exec(ctx, `UPDATE t_ota_task_device SET status='notified',notified_at=now(),updated_at=now() WHERE project_id=$1 AND task_id=$2 AND device_key=$3 AND status='pending'`, projectID, taskID, deviceKey)
+		result, err := tx.Exec(ctx, `UPDATE t_ota_task_device SET status=CASE WHEN status IN ('pending','dispatching') THEN 'notified' ELSE status END,notified_at=COALESCE(notified_at,now()),updated_at=now() WHERE project_id=$1 AND task_id=$2 AND device_key=$3 AND status IN ('pending','dispatching','notified','downloading','verifying','installing','succeeded','failed','expired','rolled_back')`, projectID, taskID, deviceKey)
 		if err != nil {
 			return err
 		}
@@ -217,6 +278,26 @@ func (s *PGStore) MarkNotified(ctx context.Context, projectID int64, taskID, dev
 			return fmt.Errorf("ota: 设备任务不存在或已处理")
 		}
 		return nil
+	})
+}
+
+func (s *PGStore) BeginDispatch(ctx context.Context, projectID int64, taskID, deviceKey string) error {
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `UPDATE t_ota_task_device SET status='dispatching',notified_at=COALESCE(notified_at,now()),updated_at=now() WHERE project_id=$1 AND task_id=$2 AND device_key=$3 AND status IN ('pending','dispatching')`, projectID, taskID, deviceKey)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 0 {
+			return fmt.Errorf("ota: 设备不在待下发状态")
+		}
+		return nil
+	})
+}
+
+func (s *PGStore) ResetDispatch(ctx context.Context, projectID int64, taskID, deviceKey string) error {
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE t_ota_task_device SET status='pending',updated_at=now() WHERE project_id=$1 AND task_id=$2 AND device_key=$3 AND status='dispatching'`, projectID, taskID, deviceKey)
+		return err
 	})
 }
 
@@ -328,7 +409,7 @@ func reconcileTaskTx(ctx context.Context, tx pgx.Tx, projectID int64, taskID str
 		return nil
 	}
 	if offlineTTL > 0 {
-		_, err := tx.Exec(ctx, `UPDATE t_ota_task_device SET status='expired',error_code='offline_timeout',error_message='设备在离线窗口内未完成 OTA',completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE project_id=$1 AND task_id=$2 AND status IN ('notified','downloading','verifying','installing') AND COALESCE(progress_at,notified_at) < now() - $3::interval`, projectID, taskID, fmt.Sprintf("%d seconds", int64(offlineTTL/time.Second)))
+		_, err := tx.Exec(ctx, `UPDATE t_ota_task_device SET status='expired',error_code='offline_timeout',error_message='设备在离线窗口内未完成 OTA',completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE project_id=$1 AND task_id=$2 AND status IN ('dispatching','notified','downloading','verifying','installing') AND COALESCE(progress_at,notified_at) < now() - $3::interval`, projectID, taskID, fmt.Sprintf("%d seconds", int64(offlineTTL/time.Second)))
 		if err != nil {
 			return err
 		}

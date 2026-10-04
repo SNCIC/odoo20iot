@@ -302,27 +302,7 @@ func run(cfg config) error {
 			logger.Error("OTA 进度消费者退出", "error", err)
 		}
 	}()
-	go func() {
-		ticker := time.NewTicker(time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				projects, err := store.ListProjects(ctx)
-				if err != nil {
-					logger.Warn("读取 OTA 租户列表失败", "error", err)
-					continue
-				}
-				for _, project := range projects {
-					if err := otaStore.ReconcileStale(ctx, project.ID); err != nil {
-						logger.Warn("OTA 任务超时收敛失败", "project_id", project.ID, "error", err)
-					}
-				}
-			}
-		}
-	}()
+
 	if cfg.commandOriginID != "" {
 		node, nodeErr := cluster.New(ctx, cluster.Options{ID: cfg.commandOriginID, NATSURL: cfg.natsURL, Cursor: cluster.NewRedisCursor(latestRedis, "gw:offline:cursor"), Logger: logger}, cluster.NewRedisLocator(latestRedis, "gw:client", cluster.DefaultLocatorTTL))
 		if nodeErr != nil {
@@ -395,6 +375,43 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+
+	var rolloutWorker *ota.RolloutWorker
+	if otaRouter != nil && otaSigner != nil && otaDownloadSecret != "" && otaDownloadBaseURL != "" {
+		rolloutWorker, err = ota.NewRolloutWorker(otaStore, otaRouter, otaSigner, otaDownloadSecret, otaDownloadBaseURL)
+		if err != nil {
+			return fmt.Errorf("初始化 OTA 灰度 worker: %w", err)
+		}
+		logger.Info("OTA 灰度自动推进已启用")
+	} else {
+		logger.Warn("OTA 灰度自动推进未启用：命令路由、签名器或下载配置缺失")
+	}
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				projects, err := store.ListProjects(ctx)
+				if err != nil {
+					logger.Warn("读取 OTA 租户列表失败", "error", err)
+					continue
+				}
+				for _, project := range projects {
+					if err := otaStore.ReconcileStale(ctx, project.ID); err != nil {
+						logger.Warn("OTA 任务超时收敛失败", "project_id", project.ID, "error", err)
+					}
+					if rolloutWorker != nil {
+						if err := rolloutWorker.RunProject(ctx, project.ID); err != nil {
+							logger.Warn("OTA 灰度推进失败", "project_id", project.ID, "error", err)
+						}
+					}
+				}
+			}
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.httpAddr,

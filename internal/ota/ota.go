@@ -113,6 +113,7 @@ type DeviceStatus string
 
 const (
 	DevicePending     DeviceStatus = "pending"
+	DeviceDispatching DeviceStatus = "dispatching"
 	DeviceNotified    DeviceStatus = "notified"
 	DeviceDownloading DeviceStatus = "downloading"
 	DeviceVerifying   DeviceStatus = "verifying"
@@ -126,46 +127,6 @@ const (
 type Rollout struct {
 	Batches          []int   `json:"batches"`
 	SuccessThreshold float64 `json:"success_threshold"`
-}
-
-func NextBatchDevices(devices []TaskDevice, rollout Rollout) ([]TaskDevice, error) {
-	if err := rollout.Validate(); err != nil {
-		return nil, err
-	}
-	if len(devices) == 0 {
-		return nil, nil
-	}
-	active := 0
-	for _, device := range devices {
-		if device.Status != DevicePending {
-			active++
-		}
-	}
-	batchIndex := -1
-	for index, percent := range rollout.Batches {
-		target := (len(devices)*percent + 99) / 100
-		if target > active {
-			batchIndex = index
-			break
-		}
-	}
-	if batchIndex < 0 {
-		return nil, nil
-	}
-	count, err := rollout.BatchSize(len(devices), batchIndex)
-	if err != nil {
-		return nil, err
-	}
-	selected := make([]TaskDevice, 0, count)
-	for _, device := range devices {
-		if device.Status == DevicePending {
-			selected = append(selected, device)
-			if len(selected) == count {
-				break
-			}
-		}
-	}
-	return selected, nil
 }
 
 func DefaultRollout() Rollout {
@@ -270,7 +231,8 @@ func Transition(from, to DeviceStatus) error {
 		return fmt.Errorf("ota: 设备状态非法")
 	}
 	allowed := map[DeviceStatus][]DeviceStatus{
-		DevicePending:     {DeviceNotified, DeviceExpired, DeviceFailed},
+		DevicePending:     {DeviceDispatching, DeviceNotified, DeviceExpired, DeviceFailed},
+		DeviceDispatching: {DeviceNotified, DeviceDownloading, DeviceVerifying, DeviceInstalling, DeviceSucceeded, DeviceFailed, DeviceExpired, DeviceRolledBack},
 		DeviceNotified:    {DeviceDownloading, DeviceExpired, DeviceFailed},
 		DeviceDownloading: {DeviceVerifying, DeviceFailed, DeviceExpired},
 		DeviceVerifying:   {DeviceInstalling, DeviceFailed},
@@ -289,7 +251,7 @@ func Transition(from, to DeviceStatus) error {
 
 func validDeviceStatus(status DeviceStatus) bool {
 	switch status {
-	case DevicePending, DeviceNotified, DeviceDownloading, DeviceVerifying,
+	case DevicePending, DeviceDispatching, DeviceNotified, DeviceDownloading, DeviceVerifying,
 		DeviceInstalling, DeviceSucceeded, DeviceFailed, DeviceExpired, DeviceRolledBack:
 		return true
 	default:

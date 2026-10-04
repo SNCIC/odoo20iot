@@ -144,6 +144,15 @@ func (f *fakeOTAStore) MarkNotified(_ context.Context, _ int64, _ string, device
 
 func (f *fakeOTAStore) ReconcileTask(context.Context, int64, string) error { return nil }
 func (f *fakeOTAStore) ReconcileStale(context.Context, int64) error        { return nil }
+func (f *fakeOTAStore) ClaimRunningTasks(context.Context, int64, int, time.Duration) ([]ota.Task, error) {
+	return nil, nil
+}
+func (f *fakeOTAStore) SetBatchState(context.Context, int64, string, int, int, ota.TaskStatus) error {
+	return nil
+}
+func (f *fakeOTAStore) ReleaseDispatchLease(context.Context, int64, string) error  { return nil }
+func (f *fakeOTAStore) BeginDispatch(context.Context, int64, string, string) error { return nil }
+func (f *fakeOTAStore) ResetDispatch(context.Context, int64, string, string) error { return nil }
 
 func (f *fakeOTAStore) ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error) {
 	return f.devices, nil

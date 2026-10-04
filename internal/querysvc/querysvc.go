@@ -74,6 +74,11 @@ type OTAStore interface {
 	MarkNotified(context.Context, int64, string, string) error
 	ReconcileTask(context.Context, int64, string) error
 	ReconcileStale(context.Context, int64) error
+	ClaimRunningTasks(context.Context, int64, int, time.Duration) ([]ota.Task, error)
+	SetBatchState(context.Context, int64, string, int, int, ota.TaskStatus) error
+	ReleaseDispatchLease(context.Context, int64, string) error
+	BeginDispatch(context.Context, int64, string, string) error
+	ResetDispatch(context.Context, int64, string, string) error
 }
 
 type OTARouter interface {
