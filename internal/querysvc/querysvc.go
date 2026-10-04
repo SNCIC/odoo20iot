@@ -13,6 +13,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/quota"
+	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -51,6 +52,11 @@ type Meter interface {
 type CommandIssuer interface {
 	Issue(context.Context, command.Record) (command.Record, error)
 	Get(context.Context, int64, string) (command.Record, error)
+}
+
+type ShadowService interface {
+	Get(context.Context, int64, string) (shadow.Snapshot, error)
+	UpdateDesired(context.Context, int64, string, map[string]any, *int64) (shadow.Snapshot, error)
 }
 
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
@@ -95,6 +101,7 @@ type Deps struct {
 	Alarms      AlarmAcknowledger
 	Quota       QuotaPolicyStore
 	Commands    CommandIssuer
+	Shadows     ShadowService
 	Meter       Meter
 	Catalog     catalog.Store
 	Verifier    apiauth.Verifier

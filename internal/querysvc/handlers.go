@@ -20,6 +20,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/quota"
+	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -59,8 +60,66 @@ func (s *Service) routes() http.Handler {
 		mux.Handle("/api/v1/commands", requireScope(auth, "command:write", http.HandlerFunc(s.handleCommands), s.deps.Meter))
 		mux.Handle("/api/v1/commands/", auth(http.HandlerFunc(s.handleCommandStatus)))
 	}
+	if s.deps.Shadows != nil {
+		mux.Handle("/api/v1/shadows/", auth(http.HandlerFunc(s.handleShadow)))
+	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleShadow(w http.ResponseWriter, r *http.Request) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/shadows/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" || strings.ContainsAny(parts[0], "/+#") {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "device_key 非法")
+		return
+	}
+	deviceKey := parts[0]
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		if !id.Dev && !id.HasScope("shadow:read") {
+			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 shadow:read 权限")
+			return
+		}
+		snapshot, err := s.deps.Shadows.Get(r.Context(), id.ProjectID, deviceKey)
+		if err != nil {
+			s.fail(w, "读取设备影子", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "shadow": snapshot})
+		return
+	}
+	if len(parts) != 2 || parts[1] != "desired" || r.Method != http.MethodPatch {
+		w.Header().Set("Allow", "GET, PATCH")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "影子仅支持 GET 或 PATCH desired")
+		return
+	}
+	if !id.Dev && !id.HasScope("shadow:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 shadow:write 权限")
+		return
+	}
+	var req struct {
+		Patch           map[string]any `json:"patch"`
+		ExpectedVersion *int64         `json:"expected_version"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, shadow.MaxStateBytes)).Decode(&req); err != nil || len(req.Patch) == 0 {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "patch 非法或为空")
+		return
+	}
+	snapshot, err := s.deps.Shadows.UpdateDesired(r.Context(), id.ProjectID, deviceKey, req.Patch, req.ExpectedVersion)
+	if err != nil {
+		if errors.Is(err, shadow.ErrVersionConflict) {
+			writeError(w, http.StatusConflict, CodeConflict, "影子版本冲突")
+			return
+		}
+		s.fail(w, "更新设备影子", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "shadow": snapshot})
 }
 
 func (s *Service) handleCommandStatus(w http.ResponseWriter, r *http.Request) {

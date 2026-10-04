@@ -148,6 +148,35 @@ func ParseCommandReplySubject(subject string) (int64, string, error) {
 	return projectID, string(deviceKeyBytes), nil
 }
 
+func ShadowReportedSubject(projectID int64, deviceKey string) (string, error) {
+	if projectID <= 0 || deviceKey == "" {
+		return "", fmt.Errorf("影子上报缺少有效 project_id 或 device_key")
+	}
+	encodedKey := base64.RawURLEncoding.EncodeToString([]byte(deviceKey))
+	return fmt.Sprintf("iot.shadow.reported.%d.%s", projectID, encodedKey), nil
+}
+
+func ParseShadowReportedSubject(subject string) (int64, string, error) {
+	parts := strings.Split(subject, ".")
+	if len(parts) != 5 || parts[0] != "iot" || parts[1] != "shadow" || parts[2] != "reported" {
+		return 0, "", fmt.Errorf("影子上报 subject 非法: %q", subject)
+	}
+	projectID, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil || projectID <= 0 {
+		return 0, "", fmt.Errorf("影子上报 project_id 非法")
+	}
+	deviceKeyBytes, err := base64.RawURLEncoding.DecodeString(parts[4])
+	if err != nil || len(deviceKeyBytes) == 0 {
+		return 0, "", fmt.Errorf("影子上报 device_key 编码非法")
+	}
+	return projectID, string(deviceKeyBytes), nil
+}
+
+func IsShadowReportedTopic(topic string) bool {
+	_, rest := ParseDeviceTopic(topic)
+	return rest == "shadow/reported"
+}
+
 // IsDeviceDownlink 判断该 topic 是否是「平台 → 设备」方向。
 //
 // 方向由**设备键之后的第一段路径**决定，规则直接来自 03 §2.2 的两张白名单：

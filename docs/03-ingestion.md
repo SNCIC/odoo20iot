@@ -294,6 +294,12 @@ ACL 规则**自动生成**，不手工配置：
 - 透传/网关型设备（`device_type.is_gateway=true`）：允许 `v1/gateways/{key}/devices/{sub_key}/...` 的子设备命名空间，子设备需在平台登记。
 - 应用端（App/第三方）**不直连设备 topic**，统一走 `openapi` 与 `iot.cmd.*`，由服务端鉴权。
 
+影子上报与下行的服务端链路如下：网关将设备发布的
+`v1/devices/{device_key}/shadow/reported` 持久化到 `IOT_SHADOW_REPORTED`，subject 为
+`iot.shadow.reported.<project_id>.<device_token>`；`svc-query` 以租户上下文消费并合并
+reported。平台通过 `PATCH /api/v1/shadows/{device_key}/desired` 更新 desired，在线时经
+`gw:client:{device_key}` 路由投递，离线时进入既有离线队列，设备重连后补发。
+
 ### 2.3 限流与保护
 
 | 层级 | 机制 | 默认阈值 | 超限动作 |

@@ -20,6 +20,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/quota"
+	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
 
@@ -53,6 +54,31 @@ type fakeQuotaPolicyStore struct {
 
 type meterRecorder struct {
 	counts map[string]int64
+}
+
+type fakeShadowService struct {
+	snapshot shadow.Snapshot
+	err      error
+}
+
+func (f *fakeShadowService) Get(context.Context, int64, string) (shadow.Snapshot, error) {
+	if f.err != nil {
+		return shadow.Snapshot{}, f.err
+	}
+	return f.snapshot, nil
+}
+
+func (f *fakeShadowService) UpdateDesired(_ context.Context, _ int64, _ string, patch map[string]any, expectedVersion *int64) (shadow.Snapshot, error) {
+	if f.err != nil {
+		return shadow.Snapshot{}, f.err
+	}
+	if expectedVersion != nil && *expectedVersion != f.snapshot.Version {
+		return shadow.Snapshot{}, shadow.ErrVersionConflict
+	}
+	f.snapshot.Desired = shadow.Merge(f.snapshot.Desired, patch)
+	f.snapshot.Delta = shadow.Delta(f.snapshot.Desired, f.snapshot.Reported)
+	f.snapshot.Version++
+	return f.snapshot, nil
 }
 
 func (m *meterRecorder) Add(_ int64, metric string, delta int64) {
@@ -238,6 +264,46 @@ func TestReadEndpointsRequireScopes(t *testing.T) {
 	svc.mux = svc.routes()
 	if rec := get(t, svc.Handler(), "/api/v1/series?metric=temp", "scoped"); rec.Code == http.StatusForbidden {
 		t.Fatalf("telemetry:read 不应被拒绝: %s", rec.Body.String())
+	}
+}
+
+func TestShadowEndpointsRequireScopesAndHandleConflict(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	shadowSvc := &fakeShadowService{snapshot: shadow.Snapshot{
+		ProjectID: 1, DeviceKey: "a-1", Desired: map[string]any{}, Reported: map[string]any{}, Delta: map[string]any{}, Version: 1,
+	}}
+	svc.deps.Shadows = shadowSvc
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"shadow:read"}}}
+	svc.mux = svc.routes()
+	rec := get(t, svc.Handler(), "/api/v1/shadows/a-1", "scoped")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("shadow:read 期望 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/shadows/a-1/desired", strings.NewReader(`{"patch":{"mode":"auto"}}`))
+	req.Header.Set("Authorization", "Bearer scoped")
+	patchRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(patchRec, req)
+	if patchRec.Code != http.StatusForbidden {
+		t.Fatalf("缺 shadow:write 期望 403，得到 %d: %s", patchRec.Code, patchRec.Body.String())
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"shadow:write"}}}
+	svc.mux = svc.routes()
+	req = httptest.NewRequest(http.MethodPatch, "/api/v1/shadows/a-1/desired", strings.NewReader(`{"patch":{"mode":"auto"},"expected_version":0}`))
+	req.Header.Set("Authorization", "Bearer scoped")
+	patchRec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(patchRec, req)
+	if patchRec.Code != http.StatusConflict {
+		t.Fatalf("版本冲突期望 409，得到 %d: %s", patchRec.Code, patchRec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "/api/v1/shadows/a-1/desired", strings.NewReader(`{"patch":{"mode":"auto"},"expected_version":1}`))
+	req.Header.Set("Authorization", "Bearer scoped")
+	patchRec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(patchRec, req)
+	if patchRec.Code != http.StatusAccepted {
+		t.Fatalf("正常 patch 期望 202，得到 %d: %s", patchRec.Code, patchRec.Body.String())
 	}
 }
 

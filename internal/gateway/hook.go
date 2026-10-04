@@ -45,22 +45,24 @@ type HookConfig struct {
 	ProjectID    int64
 	DeviceTypeID int64
 	// Meter 为 nil 时不做计量（不影响 A2 时序）。
-	Meter             Meter
-	ReplyPublisher    Publisher
-	ReplyTimeout      time.Duration
-	IdentityForClient func(string) (projectID, deviceID, deviceTypeID int64, ok bool)
-	RequireIdentity   bool
+	Meter                   Meter
+	ReplyPublisher          Publisher
+	ShadowReportedPublisher Publisher
+	ReplyTimeout            time.Duration
+	IdentityForClient       func(string) (projectID, deviceID, deviceTypeID int64, ok bool)
+	RequireIdentity         bool
 }
 
 type Hook struct {
 	mqtt.HookBase
 
-	baseCtx    context.Context
-	acker      *Acker
-	replyAcker *Acker
-	router     SubjectRouter
-	metrics    *Metrics
-	logger     *slog.Logger
+	baseCtx     context.Context
+	acker       *Acker
+	replyAcker  *Acker
+	shadowAcker *Acker
+	router      SubjectRouter
+	metrics     *Metrics
+	logger      *slog.Logger
 
 	// 归属占位值（Phase 0）。真实 tenant / 设备主键投影依赖 A1 注册表，
 	// 见 internal/envelope 包注释。
@@ -106,6 +108,13 @@ func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metric
 		}
 		hook.replyAcker = NewAcker(cfg.ReplyPublisher, replyTimeout, metrics)
 	}
+	if cfg.ShadowReportedPublisher != nil {
+		shadowTimeout := cfg.ReplyTimeout
+		if shadowTimeout <= 0 {
+			shadowTimeout = DefaultPubackTimeout
+		}
+		hook.shadowAcker = NewAcker(cfg.ShadowReportedPublisher, shadowTimeout, metrics)
+	}
 	return hook
 }
 
@@ -147,6 +156,9 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 
 	if cluster.IsCommandReplyTopic(pk.TopicName) {
 		return h.onCommandReply(cl, pk)
+	}
+	if cluster.IsShadowReportedTopic(pk.TopicName) {
+		return h.onShadowReported(cl, pk)
 	}
 
 	subject, err := h.router.Route(cl, pk)
@@ -200,6 +212,47 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 			"client", cl.ID, "topic", pk.TopicName, "packet_id", pk.PacketID, "error", err)
 	}
 
+	return pk, packets.ErrRejectPacket
+}
+
+func (h *Hook) onShadowReported(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
+	if h.shadowAcker == nil {
+		return pk, packets.ErrRejectPacket
+	}
+	if !json.Valid(pk.Payload) || len(pk.Payload) > MaxPayloadBytes {
+		h.metrics.InvalidPayloadTotal.Add(1)
+		if pk.FixedHeader.Qos > 0 {
+			_ = writePuback(cl, pk)
+		}
+		return pk, packets.ErrRejectPacket
+	}
+	deviceKey := cluster.DeviceKeyFromTopic(pk.TopicName)
+	projectID := h.projectID
+	if h.identityForClient != nil {
+		resolvedProject, _, _, ok := h.identityForClient(cl.ID)
+		if ok {
+			projectID = resolvedProject
+		} else if h.requireIdentity {
+			return pk, packets.ErrRejectPacket
+		}
+	}
+	subject, err := cluster.ShadowReportedSubject(projectID, deviceKey)
+	if err != nil {
+		return pk, packets.ErrRejectPacket
+	}
+	if pk.FixedHeader.Qos == 0 {
+		if err := h.shadowAcker.PublishQoS0(h.baseCtx, subject, pk.Payload); err != nil {
+			h.logger.Error("影子 reported QoS0 发布失败", "subject", subject, "error", err)
+		}
+		return pk, nil
+	}
+	if err := h.shadowAcker.AwaitPersist(h.baseCtx, subject, pk.Payload); err != nil {
+		h.logger.Error("影子 reported 未持久化，等待设备重传", "subject", subject, "error", err)
+		return pk, packets.ErrRejectPacket
+	}
+	if err := writePuback(cl, pk); err != nil {
+		h.metrics.PubackWriteErrorTotal.Add(1)
+	}
 	return pk, packets.ErrRejectPacket
 }
 

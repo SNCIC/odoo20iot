@@ -17,4 +17,5 @@ exec /home/xfusion/projects/odoo20iot/bin/svc-query \
   -latest-redis-url "${IOT_LATEST_REDIS_URL:-redis://100.64.0.3:28637/0}" \
   -nats-url "${IOT_NATS_URL:-nats://100.64.0.3:28222}" \
   -command-origin-id "${IOT_COMMAND_ORIGIN_ID:-}" \
+  -shadow-origin-id "${IOT_SHADOW_ORIGIN_ID:-svc-query-shadow}" \
   -log-format "${IOT_LOG_FORMAT:-json}"

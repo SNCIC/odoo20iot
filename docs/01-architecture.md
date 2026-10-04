@@ -444,5 +444,5 @@ scope:   shard.{0..N-1} | device_id | node_id | *
 | 网关 | 内嵌 mochi-mqtt，多副本 + NATS 路由 | 会话迁移优化、边缘下沉 |
 | 规则 | `expr` 条件 + 自研 DAG + 预处理/上报规则 | 受限 JS 逃生舱、独立进程沙箱、WASM |
 | 告警 | FSM + Webhook + 短信/邮件 | 语音、升级策略、告警风暴抑制 |
-| 影子 | 基础 desired/reported/delta | 离线可达、版本冲突策略 |
+| 影子 | desired/reported/delta、离线下发、版本冲突策略 | 设备实测验收、前端影子面板 |
 | 应用层 | 控制台 + 基础看板 | 零代码 App / 大屏 / 组态 |

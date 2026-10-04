@@ -13,6 +13,7 @@ const (
 	CodeInvalidArgument  Code = "INVALID_ARGUMENT"   // 400 参数非法
 	CodeUnauthenticated  Code = "UNAUTHENTICATED"    // 401
 	CodeForbidden        Code = "FORBIDDEN"          // 403 设备不属于本租户
+	CodeConflict         Code = "CONFLICT"           // 409 乐观锁冲突
 	CodeNotFound         Code = "NOT_FOUND"          // 404（预留）
 	CodeUnprocessable    Code = "UNPROCESSABLE"      // 422 违反查询保护规则
 	CodeTenantNotAllowed Code = "TENANT_NOT_ALLOWED" // 400 请求里出现了 project_id

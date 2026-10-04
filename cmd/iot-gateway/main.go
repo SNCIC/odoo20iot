@@ -134,6 +134,16 @@ func main() {
 	}); err != nil {
 		logger.Fatal("确保命令回执 Stream 存在失败", zap.Error(err))
 	}
+	shadowReportedPub, err := gateway.NewNATSPublisher(*natsURL, "IOT_SHADOW_REPORTED")
+	if err != nil {
+		logger.Fatal("连接影子上报通道失败", zap.Error(err))
+	}
+	defer func() { _ = shadowReportedPub.Close() }()
+	if err := shadowReportedPub.EnsureStream(gateway.StreamSpec{
+		Subjects: []string{"iot.shadow.reported.>"}, Replicas: 1, MaxAge: 7 * 24 * time.Hour,
+	}); err != nil {
+		logger.Fatal("确保影子上报 Stream 存在失败", zap.Error(err))
+	}
 	lifecyclePub, err := gateway.NewNATSPublisher(*natsURL, *deviceEventsStream)
 	if err != nil {
 		logger.Fatal("连接设备生命周期事件通道失败", zap.Error(err))
@@ -203,6 +213,7 @@ func main() {
 		TLSConfig:                tlsConfig,
 		Publisher:                pub,
 		CommandReplyPublisher:    replyPub,
+		ShadowReportedPublisher:  shadowReportedPub,
 		DeviceLifecyclePublisher: lifecyclePub,
 		Router:                   gateway.ContractRouter{Project: *project, Shards: *shards},
 		PubackTimeout:            *pubackTimeout,

@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/alarm"
@@ -48,6 +49,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/querysvc"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/secureconfig"
+	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 	"github.com/SNCIC/odoo20iot/internal/tsdb/greptimedb"
 )
@@ -92,6 +94,7 @@ type config struct {
 	logFormat           string
 	ensureTSDBSchema    bool
 	commandOriginID     string
+	shadowOriginID      string
 }
 
 func main() {
@@ -138,6 +141,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.logFormat, "log-format", "json", "日志格式：json 或 text")
 	flag.BoolVar(&cfg.ensureTSDBSchema, "ensure-tsdb-schema", true, "启动时幂等创建遥测与预聚合表")
 	flag.StringVar(&cfg.commandOriginID, "command-origin-id", "", "启用命令 API 的路由源 ID")
+	flag.StringVar(&cfg.shadowOriginID, "shadow-origin-id", "svc-query-shadow", "设备影子下行路由源 ID")
 	flag.Parse()
 	return cfg
 }
@@ -230,6 +234,34 @@ func run(cfg config) error {
 		return fmt.Errorf("连接最新值 Redis: %w", err)
 	}
 	var commandService *command.Service
+	var shadowService *shadow.Service
+	shadowStore, err := shadow.NewPGStore(pool)
+	if err != nil {
+		return err
+	}
+	shadowNode, err := cluster.New(ctx, cluster.Options{ID: cfg.shadowOriginID, NATSURL: cfg.natsURL, Cursor: cluster.NewRedisCursor(latestRedis, "gw:offline:cursor:shadow"), Logger: logger}, cluster.NewRedisLocator(latestRedis, "gw:client", cluster.DefaultLocatorTTL))
+	if err != nil {
+		return fmt.Errorf("初始化影子下行路由: %w", err)
+	}
+	defer shadowNode.Close()
+	shadowService = &shadow.Service{Store: shadowStore, Router: shadowNode}
+	shadowNC, err := nats.Connect(cfg.natsURL, nats.Name("svc-query-shadow-reported"), nats.MaxReconnects(-1))
+	if err != nil {
+		return fmt.Errorf("连接影子上报 NATS: %w", err)
+	}
+	defer shadowNC.Close()
+	shadowJS, err := shadowNC.JetStream()
+	if err != nil {
+		return err
+	}
+	if err := shadow.EnsureReportedStream(shadowJS); err != nil {
+		return err
+	}
+	go func() {
+		if err := shadow.ConsumeReported(ctx, shadowJS, shadowStore, "svc-shadow-reported", logger); err != nil && ctx.Err() == nil {
+			logger.Error("影子 reported 消费者退出", "error", err)
+		}
+	}()
 	if cfg.commandOriginID != "" {
 		node, nodeErr := cluster.New(ctx, cluster.Options{ID: cfg.commandOriginID, NATSURL: cfg.natsURL, Cursor: cluster.NewRedisCursor(latestRedis, "gw:offline:cursor"), Logger: logger}, cluster.NewRedisLocator(latestRedis, "gw:client", cluster.DefaultLocatorTTL))
 		if nodeErr != nil {
@@ -241,6 +273,11 @@ func run(cfg config) error {
 			return storeErr
 		}
 		commandService = &command.Service{Store: cmdStore, Sender: command.Sender{Router: node}}
+		shadowStore, shadowErr := shadow.NewPGStore(pool)
+		if shadowErr != nil {
+			return shadowErr
+		}
+		shadowService = &shadow.Service{Store: shadowStore, Router: node}
 	}
 	quotaPub, err := gateway.NewNATSPublisher(cfg.natsURL, "IOT_QUOTA")
 	if err != nil {
@@ -275,6 +312,7 @@ func run(cfg config) error {
 		Alarms:    alarmStore,
 		Quota:     quotaStore,
 		Commands:  commandService,
+		Shadows:   shadowService,
 		Meter:     meterAcc,
 		Catalog:   store,
 		Verifier:  verifier,
