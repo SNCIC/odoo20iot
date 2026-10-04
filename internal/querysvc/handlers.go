@@ -180,6 +180,10 @@ func (s *Service) handleOTATask(w http.ResponseWriter, r *http.Request) {
 	}
 	task, err := s.deps.OTA.GetTask(r.Context(), id.ProjectID, parts[0])
 	if err != nil {
+		if errors.Is(err, ota.ErrTaskNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "OTA 任务不存在")
+			return
+		}
 		s.fail(w, "读取 OTA 任务", err)
 		return
 	}
