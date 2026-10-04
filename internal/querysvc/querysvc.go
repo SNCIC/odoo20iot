@@ -72,6 +72,8 @@ type OTAStore interface {
 	StartTask(context.Context, int64, string) (ota.Task, error)
 	ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error)
 	MarkNotified(context.Context, int64, string, string) error
+	ReconcileTask(context.Context, int64, string) error
+	ReconcileStale(context.Context, int64) error
 }
 
 type OTARouter interface {

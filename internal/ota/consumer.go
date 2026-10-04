@@ -53,8 +53,12 @@ func ConsumeProgress(ctx context.Context, js nats.JetStreamContext, store Progre
 				continue
 			}
 			var progress Progress
-			if err := json.Unmarshal(message.Data, &progress); err != nil || progress.Validate() != nil {
-				logger.Warn("OTA 进度载荷非法，已 ACK", "project_id", projectID, "device_key", deviceKey, "error", err)
+			validationErr := json.Unmarshal(message.Data, &progress)
+			if validationErr == nil {
+				validationErr = progress.Validate()
+			}
+			if validationErr != nil {
+				logger.Warn("OTA 进度载荷非法，已 ACK", "project_id", projectID, "device_key", deviceKey, "error", validationErr)
 				_ = message.Ack()
 				continue
 			}

@@ -142,6 +142,9 @@ func (f *fakeOTAStore) MarkNotified(_ context.Context, _ int64, _ string, device
 	return ota.ErrDeviceNotFound
 }
 
+func (f *fakeOTAStore) ReconcileTask(context.Context, int64, string) error { return nil }
+func (f *fakeOTAStore) ReconcileStale(context.Context, int64) error        { return nil }
+
 func (f *fakeOTAStore) ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error) {
 	return f.devices, nil
 }

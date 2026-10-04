@@ -262,9 +262,91 @@ func (s *PGStore) ReportProgress(ctx context.Context, projectID int64, deviceKey
 				return err
 			}
 		}
-		_, err = tx.Exec(ctx, `UPDATE t_ota_task_device SET status=$1,progress=GREATEST(progress,$2),bytes_downloaded=GREATEST(bytes_downloaded,$3),error_code=$4,error_message=$5,last_seen_version=$6,progress_at=now(),completed_at=CASE WHEN $1 IN ('succeeded','failed','expired','rolled_back') THEN now() ELSE completed_at END,updated_at=now() WHERE project_id=$7 AND task_id=$8 AND device_key=$9`, to, progress.Progress, progress.BytesDownloaded, progress.ErrorCode, progress.ErrorMessage, progress.FirmwareVersion, projectID, progress.TaskID, deviceKey)
-		return err
+		_, err = tx.Exec(ctx, `UPDATE t_ota_task_device SET status=$1,progress=GREATEST(progress,$2),bytes_downloaded=GREATEST(bytes_downloaded,$3),error_code=$4,error_message=$5,last_seen_version=$6,progress_at=now(),completed_at=CASE WHEN $1 IN ('succeeded','failed','expired','rolled_back') THEN COALESCE(completed_at,now()) ELSE completed_at END,updated_at=now() WHERE project_id=$7 AND task_id=$8 AND device_key=$9`, to, progress.Progress, progress.BytesDownloaded, progress.ErrorCode, progress.ErrorMessage, progress.FirmwareVersion, projectID, progress.TaskID, deviceKey)
+		if err != nil {
+			return err
+		}
+		return reconcileTaskTx(ctx, tx, projectID, progress.TaskID)
 	})
+}
+
+func (s *PGStore) ReconcileTask(ctx context.Context, projectID int64, taskID string) error {
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		return reconcileTaskTx(ctx, tx, projectID, taskID)
+	})
+}
+
+func (s *PGStore) ReconcileStale(ctx context.Context, projectID int64) error {
+	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id::text FROM t_ota_task WHERE project_id=$1 AND status='running' ORDER BY created_at FOR UPDATE`, projectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var taskIDs []string
+		for rows.Next() {
+			var taskID string
+			if err := rows.Scan(&taskID); err != nil {
+				return err
+			}
+			taskIDs = append(taskIDs, taskID)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+		for _, taskID := range taskIDs {
+			if err := reconcileTaskTx(ctx, tx, projectID, taskID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func reconcileTaskTx(ctx context.Context, tx pgx.Tx, projectID int64, taskID string) error {
+	var status TaskStatus
+	var threshold float64
+	var offlineTTL time.Duration
+	var rolloutJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT status,rollout,extract(epoch from offline_ttl)::bigint FROM t_ota_task WHERE project_id=$1 AND id=$2 FOR UPDATE`, projectID, taskID).Scan(&status, &rolloutJSON, &offlineTTL); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrTaskNotFound
+		}
+		return err
+	}
+	var rollout Rollout
+	if err := json.Unmarshal(rolloutJSON, &rollout); err != nil {
+		return err
+	}
+	threshold = rollout.SuccessThreshold
+	var total, succeeded, failed, expired int
+	if err := tx.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE status='succeeded'),count(*) FILTER (WHERE status='failed'),count(*) FILTER (WHERE status='expired') FROM t_ota_task_device WHERE project_id=$1 AND task_id=$2`, projectID, taskID).Scan(&total, &succeeded, &failed, &expired); err != nil {
+		return err
+	}
+	if total == 0 || status != TaskRunning {
+		return nil
+	}
+	if offlineTTL > 0 {
+		_, err := tx.Exec(ctx, `UPDATE t_ota_task_device SET status='expired',error_code='offline_timeout',error_message='设备在离线窗口内未完成 OTA',completed_at=COALESCE(completed_at,now()),updated_at=now() WHERE project_id=$1 AND task_id=$2 AND status IN ('notified','downloading','verifying','installing') AND COALESCE(progress_at,notified_at) < now() - $3::interval`, projectID, taskID, fmt.Sprintf("%d seconds", int64(offlineTTL/time.Second)))
+		if err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status='succeeded'),count(*) FILTER (WHERE status='failed'),count(*) FILTER (WHERE status IN ('expired','rolled_back')) FROM t_ota_task_device WHERE project_id=$1 AND task_id=$2`, projectID, taskID).Scan(&succeeded, &failed, &expired); err != nil {
+			return err
+		}
+	}
+	terminal := succeeded + failed + expired
+	if terminal < total {
+		return nil
+	}
+	rate := float64(succeeded) / float64(total)
+	newStatus := TaskCompleted
+	if rate < threshold {
+		newStatus = TaskPaused
+	}
+	_, err := tx.Exec(ctx, `UPDATE t_ota_task SET status=$1,finished_at=now() WHERE project_id=$2 AND id=$3 AND status='running'`, newStatus, projectID, taskID)
+	return err
 }
 
 func normalizeDeviceKeys(deviceKeys []string) ([]string, error) {

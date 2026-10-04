@@ -666,7 +666,8 @@ Range。未配置签名器时清单/下载路由不暴露，禁止用明文 HTTP
 /api/v1/ota/tasks/{task_id}/start` 会按灰度批次签署清单并经网关路由发送
 `v1/devices/{device_key}/ota/notify`，路由成功后才将设备任务记为 `notified`；设备进度消费、
 进度已通过独立 `IOT_OTA_PROGRESS` Stream 接入 `svc-query`，按租户和设备写入
-`t_ota_task_device`；后续批次自动推进、超时/失败率暂停和回滚仍在下一阶段，当前不宣称 OTA 已可对真实设备执行升级。
+`t_ota_task_device`；`svc-query` 每分钟扫描运行中任务，只对已通知/执行中的设备按 `offline_ttl` 标记超时，尚未进入灰度的 `pending` 设备不会被误过期。
+全部设备进入终态后才按全任务成功率将任务收敛为 `completed` 或 `paused`。后续灰度批次自动推进和回滚仍在下一阶段，当前不宣称 OTA 已可对真实设备执行升级。
 
 ---
 

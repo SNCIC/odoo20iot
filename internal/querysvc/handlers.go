@@ -110,6 +110,10 @@ func (s *Service) handleOTATaskAction(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "启动 OTA 任务", err)
 		return
 	}
+	if task.Status == ota.TaskRunning {
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "task": task, "notified": 0, "idempotent": true})
+		return
+	}
 	firmware, err := s.deps.OTA.GetFirmware(r.Context(), id.ProjectID, task.FirmwareID)
 	if err != nil {
 		s.fail(w, "读取 OTA 固件", err)

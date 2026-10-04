@@ -302,6 +302,27 @@ func run(cfg config) error {
 			logger.Error("OTA 进度消费者退出", "error", err)
 		}
 	}()
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				projects, err := store.ListProjects(ctx)
+				if err != nil {
+					logger.Warn("读取 OTA 租户列表失败", "error", err)
+					continue
+				}
+				for _, project := range projects {
+					if err := otaStore.ReconcileStale(ctx, project.ID); err != nil {
+						logger.Warn("OTA 任务超时收敛失败", "project_id", project.ID, "error", err)
+					}
+				}
+			}
+		}
+	}()
 	if cfg.commandOriginID != "" {
 		node, nodeErr := cluster.New(ctx, cluster.Options{ID: cfg.commandOriginID, NATSURL: cfg.natsURL, Cursor: cluster.NewRedisCursor(latestRedis, "gw:offline:cursor"), Logger: logger}, cluster.NewRedisLocator(latestRedis, "gw:client", cluster.DefaultLocatorTTL))
 		if nodeErr != nil {
