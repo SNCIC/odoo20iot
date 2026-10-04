@@ -123,6 +123,11 @@ func (f *fakeOTAStore) CreateTask(_ context.Context, projectID, firmwareID int64
 	return f.task, nil
 }
 
+func (f *fakeOTAStore) CreateRollbackTask(_ context.Context, projectID int64, sourceTaskID string, firmwareID int64, reason, createdBy string) (ota.Task, error) {
+	f.task = ota.Task{ID: "550e8400-e29b-41d4-a716-446655440001", ProjectID: projectID, FirmwareID: firmwareID, Status: ota.TaskDraft, Rollout: ota.DefaultRollout(), OfflineTTL: ota.DefaultOfflineTTL, RollbackOf: &sourceTaskID, RollbackReason: reason, IsRollback: true, CreatedBy: createdBy}
+	return f.task, nil
+}
+
 func (f *fakeOTAStore) GetTask(context.Context, int64, string) (ota.Task, error) {
 	return f.task, nil
 }

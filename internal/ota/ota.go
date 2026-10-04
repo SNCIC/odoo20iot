@@ -59,6 +59,7 @@ type Notify struct {
 	ExpiresAt    string   `json:"expires_at"`
 	Resume       bool     `json:"resume"`
 	Actions      []string `json:"actions,omitempty"`
+	Rollback     bool     `json:"rollback,omitempty"`
 }
 
 type Progress struct {
@@ -97,6 +98,16 @@ func (m Manifest) Notification(taskID string) (Notify, error) {
 	return Notify{TaskID: taskID, Version: m.Version, DownloadURL: m.URL, SizeBytes: m.SizeBytes,
 		SHA256: m.SHA256, Signature: m.Signature, SigningKeyID: m.SigningKeyID,
 		ExpiresAt: m.ExpiresAt, Resume: true, Actions: []string{"download", "verify", "install"}}, nil
+}
+
+func (m Manifest) RollbackNotification(taskID string) (Notify, error) {
+	notify, err := m.Notification(taskID)
+	if err != nil {
+		return Notify{}, err
+	}
+	notify.Rollback = true
+	notify.Actions = []string{"download", "verify", "install", "rollback"}
+	return notify, nil
 }
 
 type TaskStatus string

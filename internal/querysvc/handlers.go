@@ -112,6 +112,42 @@ func (s *Service) handleOTATaskAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "task": task, "scheduled": true, "batch_index": task.BatchIndex})
 }
 
+func (s *Service) handleOTARollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 POST")
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if !id.Dev && !id.HasScope("ota:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:write 权限")
+		return
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/ota/tasks/"), "/"), "/")
+	if len(parts) != 2 || parts[1] != "rollback" || !ota.ValidTaskID(parts[0]) {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "回滚路径非法")
+		return
+	}
+	var req struct {
+		FirmwareID int64  `json:"firmware_id"`
+		Reason     string `json:"reason"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "回滚请求 JSON 非法")
+		return
+	}
+	task, err := s.deps.OTA.CreateRollbackTask(r.Context(), id.ProjectID, parts[0], req.FirmwareID, req.Reason, id.ActorID)
+	if err != nil {
+		s.fail(w, "创建 OTA 回滚任务", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "task": task, "scheduled": false})
+}
+
 func (s *Service) handleOTAFirmwareAction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
@@ -334,6 +370,10 @@ func (s *Service) handleOTATasks(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleOTATask(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(strings.Trim(r.URL.Path, "/"), "/start") {
 		s.handleOTATaskAction(w, r)
+		return
+	}
+	if strings.HasSuffix(strings.Trim(r.URL.Path, "/"), "/rollback") {
+		s.handleOTARollback(w, r)
 		return
 	}
 	id, ok := apiauth.IdentityFrom(r.Context())

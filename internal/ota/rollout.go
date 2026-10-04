@@ -119,7 +119,11 @@ func (w *RolloutWorker) processTask(ctx context.Context, task Task) (err error) 
 				pending = append(pending, device)
 			case DeviceSucceeded:
 				succeeded++
-			case DeviceFailed, DeviceExpired, DeviceRolledBack:
+			case DeviceRolledBack:
+				if task.IsRollback {
+					succeeded++
+				}
+			case DeviceFailed, DeviceExpired:
 			default:
 				ready = false
 			}
@@ -183,7 +187,12 @@ func (w *RolloutWorker) dispatch(ctx context.Context, task Task, firmware Firmwa
 	query.Set("sig", DownloadSignature(w.secret, task.ProjectID, firmware.ObjectKey, expires))
 	parsed.RawQuery = query.Encode()
 	manifest.URL = parsed.String()
-	notify, err := manifest.Notification(task.ID)
+	var notify Notify
+	if task.IsRollback {
+		notify, err = manifest.RollbackNotification(task.ID)
+	} else {
+		notify, err = manifest.Notification(task.ID)
+	}
 	if err != nil {
 		return err
 	}

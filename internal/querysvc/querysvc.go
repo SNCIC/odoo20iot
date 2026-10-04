@@ -68,6 +68,7 @@ type OTAStore interface {
 	RegisterFirmware(context.Context, ota.Firmware, string) (ota.Firmware, error)
 	GetFirmware(context.Context, int64, int64) (ota.Firmware, error)
 	CreateTask(context.Context, int64, int64, []string, ota.Rollout, time.Duration, string) (ota.Task, error)
+	CreateRollbackTask(context.Context, int64, string, int64, string, string) (ota.Task, error)
 	GetTask(context.Context, int64, string) (ota.Task, error)
 	StartTask(context.Context, int64, string) (ota.Task, error)
 	ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error)

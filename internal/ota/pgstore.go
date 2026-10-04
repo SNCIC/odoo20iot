@@ -24,17 +24,20 @@ var (
 )
 
 type Task struct {
-	ID         string        `json:"id"`
-	ProjectID  int64         `json:"project_id"`
-	FirmwareID int64         `json:"firmware_id"`
-	Status     TaskStatus    `json:"status"`
-	BatchIndex int           `json:"batch_index"`
-	Rollout    Rollout       `json:"rollout"`
-	OfflineTTL time.Duration `json:"offline_ttl"`
-	CreatedBy  string        `json:"created_by"`
-	CreatedAt  time.Time     `json:"created_at"`
-	StartedAt  *time.Time    `json:"started_at,omitempty"`
-	FinishedAt *time.Time    `json:"finished_at,omitempty"`
+	ID             string        `json:"id"`
+	ProjectID      int64         `json:"project_id"`
+	FirmwareID     int64         `json:"firmware_id"`
+	Status         TaskStatus    `json:"status"`
+	BatchIndex     int           `json:"batch_index"`
+	Rollout        Rollout       `json:"rollout"`
+	OfflineTTL     time.Duration `json:"offline_ttl"`
+	CreatedBy      string        `json:"created_by"`
+	CreatedAt      time.Time     `json:"created_at"`
+	StartedAt      *time.Time    `json:"started_at,omitempty"`
+	FinishedAt     *time.Time    `json:"finished_at,omitempty"`
+	RollbackOf     *string       `json:"rollback_of,omitempty"`
+	RollbackReason string        `json:"rollback_reason,omitempty"`
+	IsRollback     bool          `json:"is_rollback"`
 }
 
 type TaskDevice struct {
@@ -162,11 +165,58 @@ func (s *PGStore) CreateTask(ctx context.Context, projectID, firmwareID int64, d
 	return task, err
 }
 
+func (s *PGStore) CreateRollbackTask(ctx context.Context, projectID int64, sourceTaskID string, firmwareID int64, reason, createdBy string) (Task, error) {
+	if projectID <= 0 || !ValidTaskID(sourceTaskID) || firmwareID <= 0 {
+		return Task{}, fmt.Errorf("ota: 回滚参数非法")
+	}
+	rollout := DefaultRollout()
+	rolloutJSON, err := json.Marshal(rollout)
+	if err != nil {
+		return Task{}, err
+	}
+	taskID, err := newTaskID()
+	if err != nil {
+		return Task{}, err
+	}
+	task := Task{ID: taskID, ProjectID: projectID, FirmwareID: firmwareID, Status: TaskDraft, Rollout: rollout, OfflineTTL: DefaultOfflineTTL, CreatedBy: createdBy, RollbackOf: &sourceTaskID, RollbackReason: strings.TrimSpace(reason), IsRollback: true}
+	err = pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		var sourceStatus TaskStatus
+		if err := tx.QueryRow(ctx, `SELECT status FROM t_ota_task WHERE project_id=$1 AND id=$2`, projectID, sourceTaskID).Scan(&sourceStatus); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrTaskNotFound
+			}
+			return err
+		}
+		if sourceStatus != TaskCompleted && sourceStatus != TaskPaused {
+			return fmt.Errorf("ota: 只有已结束或已暂停任务可以回滚")
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM t_ota_firmware WHERE project_id=$1 AND id=$2)`, projectID, firmwareID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return ErrFirmwareNotFound
+		}
+		if err := tx.QueryRow(ctx, `INSERT INTO t_ota_task(id,project_id,firmware_id,status,rollout,offline_ttl,created_by,rollback_of,rollback_reason) VALUES($1,$2,$3,'draft',$4::jsonb,$5,$6,$7,$8) RETURNING created_at`, taskID, projectID, firmwareID, string(rolloutJSON), DefaultOfflineTTL, createdBy, sourceTaskID, task.RollbackReason).Scan(&task.CreatedAt); err != nil {
+			return err
+		}
+		result, err := tx.Exec(ctx, `INSERT INTO t_ota_task_device(task_id,project_id,device_key) SELECT $1,project_id,device_key FROM t_ota_task_device WHERE project_id=$2 AND task_id=$3 AND status='succeeded'`, taskID, projectID, sourceTaskID)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 0 {
+			return fmt.Errorf("ota: 源任务没有可回滚的成功设备")
+		}
+		return nil
+	})
+	return task, err
+}
+
 func (s *PGStore) GetTask(ctx context.Context, projectID int64, taskID string) (Task, error) {
 	var task Task
 	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
 		var rolloutJSON []byte
-		err := tx.QueryRow(ctx, `SELECT id::text,project_id,firmware_id,status,rollout,extract(epoch from offline_ttl)::bigint,created_by,created_at,started_at,finished_at,rollout_batch_index FROM t_ota_task WHERE project_id=$1 AND id=$2`, projectID, taskID).Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt, &task.BatchIndex)
+		err := tx.QueryRow(ctx, `SELECT id::text,project_id,firmware_id,status,rollout,extract(epoch from offline_ttl)::bigint,created_by,created_at,started_at,finished_at,rollout_batch_index,rollback_of::text,rollback_reason,(rollback_of IS NOT NULL) FROM t_ota_task WHERE project_id=$1 AND id=$2`, projectID, taskID).Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt, &task.BatchIndex, &task.RollbackOf, &task.RollbackReason, &task.IsRollback)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrTaskNotFound
 		}
@@ -190,7 +240,7 @@ func (s *PGStore) ClaimRunningTasks(ctx context.Context, projectID int64, limit 
 			ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $2
 		) UPDATE t_ota_task t SET dispatch_lease_until=now()+$3::interval FROM picked p
 		WHERE t.project_id=$1 AND t.id=p.id
-		RETURNING t.id::text,t.project_id,t.firmware_id,t.status,t.rollout,extract(epoch from t.offline_ttl)::bigint,t.created_by,t.created_at,t.started_at,t.finished_at,t.rollout_batch_index`, projectID, limit, fmt.Sprintf("%d seconds", int64(lease/time.Second)))
+			RETURNING t.id::text,t.project_id,t.firmware_id,t.status,t.rollout,extract(epoch from t.offline_ttl)::bigint,t.created_by,t.created_at,t.started_at,t.finished_at,t.rollout_batch_index,t.rollback_of::text,t.rollback_reason,(t.rollback_of IS NOT NULL)`, projectID, limit, fmt.Sprintf("%d seconds", int64(lease/time.Second)))
 		if err != nil {
 			return err
 		}
@@ -198,7 +248,7 @@ func (s *PGStore) ClaimRunningTasks(ctx context.Context, projectID int64, limit 
 		for rows.Next() {
 			var task Task
 			var rolloutJSON []byte
-			if err := rows.Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt, &task.BatchIndex); err != nil {
+			if err := rows.Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt, &task.BatchIndex, &task.RollbackOf, &task.RollbackReason, &task.IsRollback); err != nil {
 				return err
 			}
 			task.OfflineTTL *= time.Second
@@ -242,7 +292,7 @@ func (s *PGStore) StartTask(ctx context.Context, projectID int64, taskID string)
 	var task Task
 	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
 		var rolloutJSON []byte
-		err := tx.QueryRow(ctx, `SELECT id::text,project_id,firmware_id,status,rollout,extract(epoch from offline_ttl)::bigint,created_by,created_at,started_at,finished_at FROM t_ota_task WHERE project_id=$1 AND id=$2 FOR UPDATE`, projectID, taskID).Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt)
+		err := tx.QueryRow(ctx, `SELECT id::text,project_id,firmware_id,status,rollout,extract(epoch from offline_ttl)::bigint,created_by,created_at,started_at,finished_at,rollback_of::text,rollback_reason,(rollback_of IS NOT NULL) FROM t_ota_task WHERE project_id=$1 AND id=$2 FOR UPDATE`, projectID, taskID).Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &task.OfflineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt, &task.RollbackOf, &task.RollbackReason, &task.IsRollback)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrTaskNotFound
 		}
@@ -331,12 +381,16 @@ func (s *PGStore) ReportProgress(ctx context.Context, projectID int64, deviceKey
 	to := DeviceStatus(progress.Status)
 	return pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
 		var from DeviceStatus
-		err := tx.QueryRow(ctx, `SELECT status FROM t_ota_task_device WHERE project_id=$1 AND task_id=$2 AND device_key=$3 FOR UPDATE`, projectID, progress.TaskID, deviceKey).Scan(&from)
+		var rollback bool
+		err := tx.QueryRow(ctx, `SELECT d.status,(t.rollback_of IS NOT NULL) FROM t_ota_task_device d JOIN t_ota_task t ON t.project_id=d.project_id AND t.id=d.task_id WHERE d.project_id=$1 AND d.task_id=$2 AND d.device_key=$3 FOR UPDATE`, projectID, progress.TaskID, deviceKey).Scan(&from, &rollback)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrTaskNotFound
 		}
 		if err != nil {
 			return err
+		}
+		if rollback && to == DeviceSucceeded {
+			to = DeviceRolledBack
 		}
 		if from != to {
 			if err := Transition(from, to); err != nil {
@@ -402,7 +456,7 @@ func reconcileTaskTx(ctx context.Context, tx pgx.Tx, projectID int64, taskID str
 	}
 	threshold = rollout.SuccessThreshold
 	var total, succeeded, failed, expired int
-	if err := tx.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE status='succeeded'),count(*) FILTER (WHERE status='failed'),count(*) FILTER (WHERE status='expired') FROM t_ota_task_device WHERE project_id=$1 AND task_id=$2`, projectID, taskID).Scan(&total, &succeeded, &failed, &expired); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE d.status='succeeded' OR (t.rollback_of IS NOT NULL AND d.status='rolled_back')),count(*) FILTER (WHERE d.status='failed'),count(*) FILTER (WHERE d.status='expired') FROM t_ota_task_device d JOIN t_ota_task t ON t.project_id=d.project_id AND t.id=d.task_id WHERE d.project_id=$1 AND d.task_id=$2`, projectID, taskID).Scan(&total, &succeeded, &failed, &expired); err != nil {
 		return err
 	}
 	if total == 0 || status != TaskRunning {
@@ -413,7 +467,7 @@ func reconcileTaskTx(ctx context.Context, tx pgx.Tx, projectID int64, taskID str
 		if err != nil {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status='succeeded'),count(*) FILTER (WHERE status='failed'),count(*) FILTER (WHERE status IN ('expired','rolled_back')) FROM t_ota_task_device WHERE project_id=$1 AND task_id=$2`, projectID, taskID).Scan(&succeeded, &failed, &expired); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status='succeeded' OR (status='rolled_back' AND EXISTS (SELECT 1 FROM t_ota_task WHERE project_id=$1 AND id=$2 AND rollback_of IS NOT NULL))),count(*) FILTER (WHERE status='failed'),count(*) FILTER (WHERE status='expired') FROM t_ota_task_device WHERE project_id=$1 AND task_id=$2`, projectID, taskID).Scan(&succeeded, &failed, &expired); err != nil {
 			return err
 		}
 	}
