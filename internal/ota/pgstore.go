@@ -74,6 +74,30 @@ RETURNING id, created_at`, firmware.ProjectID, firmware.Version, firmware.Filena
 	return firmware, err
 }
 
+func (s *PGStore) ListFirmwares(ctx context.Context, projectID int64) ([]Firmware, error) {
+	var firmwares []Firmware
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id,project_id,version,filename,object_key,size_bytes,sha256,signature,signing_key_id,metadata,created_at FROM t_ota_firmware WHERE project_id=$1 ORDER BY created_at DESC,id DESC`, projectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var firmware Firmware
+			var metadata []byte
+			if err := rows.Scan(&firmware.ID, &firmware.ProjectID, &firmware.Version, &firmware.Filename, &firmware.ObjectKey, &firmware.SizeBytes, &firmware.SHA256, &firmware.Signature, &firmware.SigningKeyID, &metadata, &firmware.CreatedAt); err != nil {
+				return err
+			}
+			if err := json.Unmarshal(metadata, &firmware.Metadata); err != nil {
+				return err
+			}
+			firmwares = append(firmwares, firmware)
+		}
+		return rows.Err()
+	})
+	return firmwares, err
+}
+
 func (s *PGStore) CreateTask(ctx context.Context, projectID, firmwareID int64, deviceKeys []string, rollout Rollout, offlineTTL time.Duration, createdBy string) (Task, error) {
 	if projectID <= 0 || firmwareID <= 0 || len(deviceKeys) == 0 {
 		return Task{}, fmt.Errorf("ota: project_id、firmware_id 和目标设备必填")

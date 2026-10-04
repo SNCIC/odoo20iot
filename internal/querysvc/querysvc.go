@@ -12,6 +12,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
+	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
@@ -59,6 +60,14 @@ type ShadowService interface {
 	UpdateDesired(context.Context, int64, string, map[string]any, *int64) (shadow.Snapshot, error)
 }
 
+type OTAStore interface {
+	ListFirmwares(context.Context, int64) ([]ota.Firmware, error)
+	RegisterFirmware(context.Context, ota.Firmware, string) (ota.Firmware, error)
+	CreateTask(context.Context, int64, int64, []string, ota.Rollout, time.Duration, string) (ota.Task, error)
+	GetTask(context.Context, int64, string) (ota.Task, error)
+	ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error)
+}
+
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
 type Health struct {
 	PingPG            func(context.Context) error
@@ -102,6 +111,7 @@ type Deps struct {
 	Quota       QuotaPolicyStore
 	Commands    CommandIssuer
 	Shadows     ShadowService
+	OTA         OTAStore
 	Meter       Meter
 	Catalog     catalog.Store
 	Verifier    apiauth.Verifier

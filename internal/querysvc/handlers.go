@@ -19,6 +19,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/metering"
+	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
@@ -63,8 +64,135 @@ func (s *Service) routes() http.Handler {
 	if s.deps.Shadows != nil {
 		mux.Handle("/api/v1/shadows/", auth(http.HandlerFunc(s.handleShadow)))
 	}
+	if s.deps.OTA != nil {
+		mux.Handle("/api/v1/ota/firmwares", auth(http.HandlerFunc(s.handleOTAFirmwares)))
+		mux.Handle("/api/v1/ota/tasks", auth(http.HandlerFunc(s.handleOTATasks)))
+		mux.Handle("/api/v1/ota/tasks/", auth(http.HandlerFunc(s.handleOTATask)))
+	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleOTAFirmwares(w http.ResponseWriter, r *http.Request) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if r.Method == http.MethodGet {
+		if !id.Dev && !id.HasScope("ota:read") {
+			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:read 权限")
+			return
+		}
+		items, err := s.deps.OTA.ListFirmwares(r.Context(), id.ProjectID)
+		if err != nil {
+			s.fail(w, "读取 OTA 固件", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "firmwares": items})
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 GET 或 POST")
+		return
+	}
+	if !id.Dev && !id.HasScope("ota:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:write 权限")
+		return
+	}
+	var req struct {
+		Version      string         `json:"version"`
+		Filename     string         `json:"filename"`
+		ObjectKey    string         `json:"object_key"`
+		SizeBytes    int64          `json:"size_bytes"`
+		SHA256       string         `json:"sha256"`
+		Signature    string         `json:"signature"`
+		SigningKeyID string         `json:"signing_key_id"`
+		Metadata     map[string]any `json:"metadata"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "固件元数据 JSON 非法")
+		return
+	}
+	firmware, err := s.deps.OTA.RegisterFirmware(r.Context(), ota.Firmware{ProjectID: id.ProjectID, Version: req.Version, Filename: req.Filename, ObjectKey: req.ObjectKey, SizeBytes: req.SizeBytes, SHA256: req.SHA256, Signature: req.Signature, SigningKeyID: req.SigningKeyID, Metadata: req.Metadata}, id.ActorID)
+	if err != nil {
+		s.fail(w, "登记 OTA 固件", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "firmware": firmware})
+}
+
+func (s *Service) handleOTATasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 POST")
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if !id.Dev && !id.HasScope("ota:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:write 权限")
+		return
+	}
+	var req struct {
+		FirmwareID int64       `json:"firmware_id"`
+		DeviceKeys []string    `json:"device_keys"`
+		Rollout    ota.Rollout `json:"rollout"`
+		OfflineTTL int64       `json:"offline_ttl_seconds"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "OTA 任务 JSON 非法")
+		return
+	}
+	if req.Rollout.Batches == nil {
+		req.Rollout = ota.DefaultRollout()
+	}
+	if req.OfflineTTL == 0 {
+		req.OfflineTTL = int64(ota.DefaultOfflineTTL / time.Second)
+	}
+	task, err := s.deps.OTA.CreateTask(r.Context(), id.ProjectID, req.FirmwareID, req.DeviceKeys, req.Rollout, time.Duration(req.OfflineTTL)*time.Second, id.ActorID)
+	if err != nil {
+		s.fail(w, "创建 OTA 任务", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "task": task})
+}
+
+func (s *Service) handleOTATask(w http.ResponseWriter, r *http.Request) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	path := strings.TrimPrefix(strings.Trim(r.URL.Path, "/"), "api/v1/ota/tasks/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" || len(parts) > 2 || (len(parts) == 2 && parts[1] != "devices") {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "task_id 路径非法")
+		return
+	}
+	if !id.Dev && !id.HasScope("ota:read") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:read 权限")
+		return
+	}
+	task, err := s.deps.OTA.GetTask(r.Context(), id.ProjectID, parts[0])
+	if err != nil {
+		s.fail(w, "读取 OTA 任务", err)
+		return
+	}
+	if len(parts) == 2 {
+		devices, err := s.deps.OTA.ListTaskDevices(r.Context(), id.ProjectID, parts[0])
+		if err != nil {
+			s.fail(w, "读取 OTA 设备任务", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task": task, "devices": devices})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task": task})
 }
 
 func (s *Service) handleShadow(w http.ResponseWriter, r *http.Request) {

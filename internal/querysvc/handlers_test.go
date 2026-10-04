@@ -19,6 +19,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
+	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
@@ -59,6 +60,40 @@ type meterRecorder struct {
 type fakeShadowService struct {
 	snapshot shadow.Snapshot
 	err      error
+}
+
+type fakeOTAStore struct {
+	firmwares []ota.Firmware
+	task      ota.Task
+	devices   []ota.TaskDevice
+}
+
+func (f *fakeOTAStore) ListFirmwares(context.Context, int64) ([]ota.Firmware, error) {
+	return f.firmwares, nil
+}
+
+func (f *fakeOTAStore) RegisterFirmware(_ context.Context, firmware ota.Firmware, createdBy string) (ota.Firmware, error) {
+	firmware.ID = int64(len(f.firmwares) + 1)
+	_ = createdBy
+	f.firmwares = append(f.firmwares, firmware)
+	return firmware, nil
+}
+
+func (f *fakeOTAStore) CreateTask(_ context.Context, projectID, firmwareID int64, deviceKeys []string, rollout ota.Rollout, offlineTTL time.Duration, createdBy string) (ota.Task, error) {
+	f.task = ota.Task{ID: "task-1", ProjectID: projectID, FirmwareID: firmwareID, Status: ota.TaskDraft, Rollout: rollout, OfflineTTL: offlineTTL, CreatedBy: createdBy}
+	f.devices = make([]ota.TaskDevice, 0, len(deviceKeys))
+	for _, deviceKey := range deviceKeys {
+		f.devices = append(f.devices, ota.TaskDevice{TaskID: f.task.ID, ProjectID: projectID, DeviceKey: deviceKey, Status: ota.DevicePending})
+	}
+	return f.task, nil
+}
+
+func (f *fakeOTAStore) GetTask(context.Context, int64, string) (ota.Task, error) {
+	return f.task, nil
+}
+
+func (f *fakeOTAStore) ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error) {
+	return f.devices, nil
 }
 
 func (f *fakeShadowService) Get(context.Context, int64, string) (shadow.Snapshot, error) {
@@ -304,6 +339,44 @@ func TestShadowEndpointsRequireScopesAndHandleConflict(t *testing.T) {
 	svc.Handler().ServeHTTP(patchRec, req)
 	if patchRec.Code != http.StatusAccepted {
 		t.Fatalf("正常 patch 期望 202，得到 %d: %s", patchRec.Code, patchRec.Body.String())
+	}
+}
+
+func TestOTAEndpointsScopesAndLifecycle(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	otaStore := &fakeOTAStore{}
+	svc.deps.OTA = otaStore
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, ActorID: "operator", Scopes: []string{"telemetry:read"}}}
+	svc.mux = svc.routes()
+	rec := get(t, svc.Handler(), "/api/v1/ota/firmwares", "scoped")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("缺 ota:read 期望 403，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, ActorID: "operator", Scopes: []string{"ota:write"}}}
+	svc.mux = svc.routes()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/ota/firmwares", strings.NewReader(`{"version":"v1.0.0","filename":"edge.bin","object_key":"1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size_bytes":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","signature":"sig","signing_key_id":"key-1"}`))
+	req.Header.Set("Authorization", "Bearer scoped")
+	rec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated || len(otaStore.firmwares) != 1 {
+		t.Fatalf("登记固件期望 201，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/ota/tasks", strings.NewReader(`{"firmware_id":1,"device_keys":["dev-1","dev-2"]}`))
+	req.Header.Set("Authorization", "Bearer scoped")
+	rec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted || len(otaStore.devices) != 2 {
+		t.Fatalf("创建任务期望 202/2 台设备，得到 %d/%d: %s", rec.Code, len(otaStore.devices), rec.Body.String())
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"ota:read"}}}
+	svc.mux = svc.routes()
+	rec = get(t, svc.Handler(), "/api/v1/ota/tasks/task-1/devices", "scoped")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "dev-1") {
+		t.Fatalf("查询 OTA 设备任务期望 200，得到 %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

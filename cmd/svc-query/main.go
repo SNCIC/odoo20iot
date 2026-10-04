@@ -45,6 +45,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
+	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/querysvc"
 	"github.com/SNCIC/odoo20iot/internal/quota"
@@ -211,6 +212,10 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	otaStore, err := ota.NewPGStore(pool)
+	if err != nil {
+		return err
+	}
 	var endpointStore *notifyconfig.Store
 	if rawKey := os.Getenv("IOT_CONFIG_KEY"); rawKey != "" {
 		key, keyErr := secureconfig.NewKey(rawKey)
@@ -313,6 +318,7 @@ func run(cfg config) error {
 		Quota:     quotaStore,
 		Commands:  commandService,
 		Shadows:   shadowService,
+		OTA:       otaStore,
 		Meter:     meterAcc,
 		Catalog:   store,
 		Verifier:  verifier,
