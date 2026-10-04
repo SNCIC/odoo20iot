@@ -409,6 +409,9 @@ func (g *gate) checkMember(n *ast.MemberNode, prevGuarded bool) Kind {
 		}
 		k, ok := g.sch.Metrics[props[0]]
 		if !ok {
+			if g.sch.AllowUnknownMetrics {
+				return KindAny
+			}
 			g.addf(n.Location(), "物模型里没有指标 %q%s", props[0], hintSuffix(suggestion(props[0], metricNames(g.sch))))
 			return KindUnknown
 		}

@@ -9,9 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/SNCIC/odoo20iot/internal/envelope"
 )
 
 // WebhookPath 是 C-2 的入口路径。
@@ -117,30 +120,30 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	w.metrics.WebhookReceived.Add(1)
 
 	if r.Method != http.MethodPost {
-		w.reject(rw, http.StatusMethodNotAllowed, "只接受 POST")
+		w.reject(rw, r, http.StatusMethodNotAllowed, "只接受 POST")
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxWebhookBody+1))
 	if err != nil {
-		w.reject(rw, http.StatusBadRequest, "读取请求体失败")
+		w.reject(rw, r, http.StatusBadRequest, "读取请求体失败")
 		return
 	}
 	if len(body) > MaxWebhookBody {
-		w.reject(rw, http.StatusRequestEntityTooLarge, "请求体过大")
+		w.reject(rw, r, http.StatusRequestEntityTooLarge, "请求体过大")
 		return
 	}
 	if !w.authorized(r, body) {
-		w.reject(rw, http.StatusUnauthorized, "令牌无效")
+		w.reject(rw, r, http.StatusUnauthorized, "令牌无效")
 		return
 	}
 
 	var req webhookRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		w.reject(rw, http.StatusBadRequest, "请求体不是合法 JSON")
+		w.reject(rw, r, http.StatusBadRequest, "请求体不是合法 JSON")
 		return
 	}
 	if strings.TrimSpace(req.Model) == "" || req.ID == 0 {
-		w.reject(rw, http.StatusUnprocessableEntity, "缺少 model 或 id")
+		w.reject(rw, r, http.StatusUnprocessableEntity, "缺少 model 或 id")
 		return
 	}
 
@@ -157,7 +160,7 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 				"key", dedupKey, "error", err)
 		case !first:
 			w.writeJSON(rw, http.StatusOK, map[string]any{
-				"ok": true, "duplicate": true, "dedup_key": dedupKey,
+				"ok": true, "code": 0, "trace_id": requestTraceID(r), "duplicate": true, "dedup_key": dedupKey,
 			})
 			return
 		}
@@ -183,7 +186,7 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 	data, err := ev.Encode()
 	if err != nil {
-		w.reject(rw, http.StatusInternalServerError, "序列化事件失败")
+		w.reject(rw, r, http.StatusInternalServerError, "序列化事件失败")
 		return
 	}
 
@@ -194,7 +197,7 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		w.metrics.PublishErrors.Add(1)
 		w.logger.Error("C-2 事件发布失败（待对账补齐）",
 			"event_id", eventID, "subject", ev.Subject(), "error", err)
-		w.reject(rw, http.StatusServiceUnavailable, "发布失败")
+		w.reject(rw, r, http.StatusServiceUnavailable, "发布失败")
 		return
 	}
 
@@ -202,7 +205,7 @@ func (w *Webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	w.metrics.PublishedTotal.Add(1)
 	w.writeJSON(rw, http.StatusOK, map[string]any{
-		"ok": true, "event_id": eventID, "subject": ev.Subject(),
+		"ok": true, "code": 0, "trace_id": requestTraceID(r), "event_id": eventID, "subject": ev.Subject(),
 	})
 }
 
@@ -268,10 +271,47 @@ func (w *Webhook) authorizedHMAC(r *http.Request, body []byte) bool {
 	return len(got) == len(expected) && subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 
-func (w *Webhook) reject(rw http.ResponseWriter, status int, msg string) {
+func (w *Webhook) reject(rw http.ResponseWriter, r *http.Request, status int, msg string) {
 	w.metrics.WebhookRejected.Add(1)
-	w.logger.Warn("C-2 请求被拒", "status", status, "reason", msg)
-	w.writeJSON(rw, status, map[string]any{"ok": false, "message": msg})
+	traceID := requestTraceID(r)
+	w.logger.Warn("C-2 请求被拒", "status", status, "reason", msg, "trace_id", traceID)
+	w.writeJSON(rw, status, map[string]any{"ok": false, "code": webhookCode(status), "message": msg, "trace_id": traceID})
+}
+
+var webhookTraceIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+func requestTraceID(r *http.Request) string {
+	if r != nil {
+		if traceID := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Trace-Id"))); webhookTraceIDPattern.MatchString(traceID) {
+			return traceID
+		}
+	}
+	traceID, err := envelope.NewTraceID()
+	if err == nil {
+		return traceID
+	}
+	return "00000000000000000000000000000000"
+}
+
+func webhookCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "BAD_REQUEST"
+	case http.StatusUnauthorized:
+		return "AUTH_REQUIRED"
+	case http.StatusForbidden:
+		return "FORBIDDEN"
+	case http.StatusMethodNotAllowed:
+		return "METHOD_NOT_ALLOWED"
+	case http.StatusRequestEntityTooLarge:
+		return "PAYLOAD_TOO_LARGE"
+	case http.StatusUnprocessableEntity:
+		return "BUSINESS_REJECTED"
+	case http.StatusServiceUnavailable:
+		return "UPSTREAM_ERROR"
+	default:
+		return "INTERNAL_ERROR"
+	}
 }
 
 func (w *Webhook) writeJSON(rw http.ResponseWriter, status int, body any) {

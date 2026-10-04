@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/buildinfo"
+	"github.com/SNCIC/odoo20iot/internal/dlq"
 	"github.com/SNCIC/odoo20iot/internal/envelope"
 	"github.com/SNCIC/odoo20iot/internal/gateway"
 	"github.com/SNCIC/odoo20iot/internal/latest"
@@ -115,6 +116,7 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	dlqStore := dlq.New(pool)
 	nc, err := nats.Connect(cfg.natsURL, nats.Name("svc-rule"), nats.MaxReconnects(-1))
 	if err != nil {
 		return err
@@ -124,7 +126,7 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
-	sub, err := natsjs.Subscribe(js, natsjs.Options{Subject: cfg.subject, Durable: cfg.durable, Stream: cfg.stream, AckWait: cfg.ackWait, Inactive: cfg.inactive})
+	sub, err := natsjs.Subscribe(js, natsjs.Options{Subject: cfg.subject, Durable: cfg.durable, Stream: cfg.stream, AckWait: cfg.ackWait, Inactive: cfg.inactive, MaxDeliver: 5})
 	if err != nil {
 		return err
 	}
@@ -138,15 +140,34 @@ func run(cfg config) error {
 			return err
 		}
 		for _, msg := range msgs {
+			attempts := 1
+			if meta, metaErr := msg.Metadata(); metaErr == nil && meta != nil && meta.NumDelivered > 0 {
+				attempts = int(meta.NumDelivered)
+			}
 			var env envelope.Envelope
-			if err := json.Unmarshal(msg.Data, &env); err != nil {
+			if err := json.Unmarshal(msg.Data, &env); err != nil || env.DeviceKey == "" {
+				reason := "规则信封解析失败"
+				if err != nil {
+					reason = err.Error()
+				}
+				if dlqErr := dlqStore.Put(ctx, dlq.Entry{Service: "svc-rule", Subject: cfg.subject, EntityType: "telemetry", Reason: reason, Attempts: attempts, Payload: string(msg.Data)}); dlqErr != nil {
+					log.Error("规则毒消息写入 DLQ 失败", "error", dlqErr)
+				}
 				_ = msg.Ack()
-				log.Warn("规则收到非法信封，已 ACK", "error", err)
+				log.Warn("规则收到非法信封，已写入 DLQ 并 ACK", "error", reason)
 				continue
 			}
 			if err := engine.Process(ctx, env); err != nil {
-				log.Warn("规则求值失败，重投", "error", err)
-				_ = msg.NakWithDelay(time.Second)
+				if attempts >= 5 {
+					if dlqErr := dlqStore.Put(ctx, dlq.Entry{ProjectID: env.ProjectID, Service: "svc-rule", Subject: cfg.subject, EntityType: "telemetry", TraceID: env.TraceID, Reason: err.Error(), Attempts: attempts, Payload: string(msg.Data)}); dlqErr != nil {
+						log.Error("规则求值失败且 DLQ 写入失败", "error", dlqErr)
+					}
+					_ = msg.Ack()
+					log.Error("规则消息达到最大重投次数，已写入 DLQ 并 ACK", "attempts", attempts, "error", err)
+				} else {
+					log.Warn("规则求值失败，重投", "attempts", attempts, "error", err)
+					_ = msg.NakWithDelay(time.Second)
+				}
 				continue
 			}
 			_ = msg.Ack()

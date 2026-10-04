@@ -61,7 +61,8 @@ func (k Kind) String() string {
 // 它是编译期校验的唯一依据，由物模型 + 规则配置构造，**不接受用户直接提交**。
 type DeviceSchema struct {
 	// Metrics 是物模型指标：小写键 → 类型。只允许 Number / Bool / String。
-	Metrics map[string]Kind
+	Metrics             map[string]Kind
+	AllowUnknownMetrics bool
 
 	// TagKeys 是已知的标签键。为空表示不校验标签键
 	//（标签由租户自定义，强制枚举会把合法规则挡在门外）。

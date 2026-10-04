@@ -27,6 +27,8 @@ type Options struct {
 	// MaxAckPending 限制同时在途未确认的消息数；<=0 表示交给服务端默认值。
 	// 攒批类消费者（如 svc-pipeline）需要它来约束内存占用。
 	MaxAckPending int
+	// MaxDeliver 是单条消息最大投递次数；<=0 保持无限重投兼容。
+	MaxDeliver int
 }
 
 // Subscription 是对持久消费者的**收窄视图**：只暴露消费循环真正需要的 Fetch。
@@ -62,12 +64,32 @@ func Subscribe(js nats.JetStreamContext, opts Options) (*Subscription, error) {
 	if opts.Subject == "" || opts.Durable == "" || opts.Stream == "" {
 		return nil, fmt.Errorf("natsjs: subject / durable / stream 都不能为空")
 	}
+	serverMaxDeliver := opts.MaxDeliver
 	subOpts := []nats.SubOpt{
 		nats.BindStream(opts.Stream),
 		nats.ManualAck(),
 		nats.AckExplicit(),
 		nats.DeliverAll(),
-		nats.MaxDeliver(-1),
+	}
+	// Existing durable consumers keep their server-side delivery policy. Update
+	// it before binding so a rollout from unlimited retries is effective without
+	// deleting the consumer and losing its delivery position.
+	if opts.MaxDeliver > 0 {
+		if info, err := js.ConsumerInfo(opts.Stream, opts.Durable); err == nil && info != nil && info.Config.MaxDeliver != opts.MaxDeliver {
+			updated := info.Config
+			updated.MaxDeliver = opts.MaxDeliver
+			if _, err := js.UpdateConsumer(opts.Stream, &updated); err != nil {
+				// Older servers/consumers reject changing MaxDeliver in place.
+				// Keep the durable usable; the caller still enforces its own DLQ
+				// threshold from delivery metadata.
+				serverMaxDeliver = info.Config.MaxDeliver
+			}
+		}
+	}
+	if serverMaxDeliver > 0 {
+		subOpts = append(subOpts, nats.MaxDeliver(serverMaxDeliver))
+	} else {
+		subOpts = append(subOpts, nats.MaxDeliver(-1))
 	}
 	if opts.AckWait > 0 {
 		subOpts = append(subOpts, nats.AckWait(opts.AckWait))

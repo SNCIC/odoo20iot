@@ -38,6 +38,73 @@ type Rule struct {
 
 type Store struct{ pool *pgxpool.Pool }
 
+func (s *Store) DeviceSchema(ctx context.Context, projectID string, deviceTypeID int64) (*rules.DeviceSchema, error) {
+	sch := &rules.DeviceSchema{Metrics: map[string]rules.Kind{}}
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		var raw []byte
+		if err := tx.QueryRow(ctx, `SELECT thing_model FROM t_device_type WHERE project_id=$1 AND id=$2 AND deleted_at IS NULL`, projectID, deviceTypeID).Scan(&raw); err != nil {
+			return err
+		}
+		return decodeThingModel(raw, sch)
+	})
+	if err != nil {
+		sch.AllowUnknownMetrics = true
+	}
+	return sch, nil
+}
+
+func decodeThingModel(raw []byte, sch *rules.DeviceSchema) error {
+	var model struct {
+		Metrics    any `json:"metrics"`
+		Properties map[string]struct {
+			Type string `json:"type"`
+			Kind string `json:"kind"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &model); err != nil {
+		return err
+	}
+	switch metrics := model.Metrics.(type) {
+	case []any:
+		for _, item := range metrics {
+			if key, ok := item.(string); ok && key != "" {
+				sch.Metrics[key] = rules.KindAny
+			}
+		}
+	case map[string]any:
+		for key, value := range metrics {
+			kind := rules.KindAny
+			if spec, ok := value.(map[string]any); ok {
+				kind = thingModelKind(fmt.Sprint(spec["type"]), fmt.Sprint(spec["kind"]))
+			}
+			sch.Metrics[key] = kind
+		}
+	}
+	for key, spec := range model.Properties {
+		sch.Metrics[key] = thingModelKind(spec.Type, spec.Kind)
+	}
+	if len(sch.Metrics) == 0 {
+		sch.AllowUnknownMetrics = true
+	}
+	return nil
+}
+
+func thingModelKind(typ, kind string) rules.Kind {
+	switch typ {
+	case "bool", "boolean":
+		return rules.KindBool
+	case "string", "text":
+		return rules.KindString
+	}
+	switch kind {
+	case "bool", "boolean":
+		return rules.KindBool
+	case "string", "text":
+		return rules.KindString
+	}
+	return rules.KindNumber
+}
+
 func NewStore(pool *pgxpool.Pool) (*Store, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("ruleconfig: 连接池不能为空")

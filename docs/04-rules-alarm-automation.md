@@ -430,7 +430,7 @@ utils.math.clamp(v, min, max), utils.json.parse/stringify
 > **一句提醒**：P99 从 1.3 µs 涨到 2.03 µs，只差一次「VM 池化进出 + 一次分配」。
 > 这类预算里，**微小的常数项就是结论本身**，不能靠「反正很快」糊过去。
 
-**降级**：`svc-rule` 消费滞后 > 30 万时，自动跳过 `priority > 500` 的低优先级规则，并上报降级指标。
+**降级（待实现）**：消费滞后阈值与低优先级规则跳过策略尚未接入当前代码；不得将“滞后 > 30 万自动跳过 `priority > 500`”视为已实现能力。
 
 ---
 
@@ -463,7 +463,7 @@ utils.math.clamp(v, min, max), utils.json.parse/stringify
 
 | 机制 | 规则 |
 |---|---|
-| 去重键 | `dedup_key = sha1(project_id + device_id + rule_id)` —— **同一设备同一规则只允许一个活跃告警** |
+| 去重键 | `dedup_key = sha1(project_id + "\\x00" + device_id + "\\x00" + rule_id)` —— **同一设备同一规则只允许一个活跃告警** |
 | 聚合 | 同一 `device_type` 下 ≥ 5 台设备在 60s 内触发同一规则 → 合并为一条"批量告警"，`notify_count` 累加 |
 | 抑制 | `active` 状态下重复触发只更新 `last_ts`，不重复通知 |
 | 静默窗口 | 支持维护窗口（定时/临时），窗口内只记录不通知 |

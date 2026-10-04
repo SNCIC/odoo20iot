@@ -23,8 +23,8 @@ services:
     container_name: iot-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: iot
-      POSTGRES_PASSWORD: iot_dev_only_change_me
+      POSTGRES_USER: iot_migrator
+      POSTGRES_PASSWORD: iot_migrator_dev_only_change_me
       POSTGRES_DB: odoo20iot
       POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
       TZ: UTC
@@ -44,8 +44,9 @@ services:
       #   PGDATA=/var/lib/postgresql/18/docker，挂载点必须是 /var/lib/postgresql。
       # 若仍挂到 /var/lib/postgresql/data，镜像会判定为「未使用的挂载」并拒绝启动（无限重启）。
       - pg-data:/var/lib/postgresql
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U iot -d odoo20iot"]
+      test: ["CMD-SHELL", "pg_isready -U iot_migrator -d odoo20iot"]
       interval: 10s
       timeout: 5s
       retries: 12

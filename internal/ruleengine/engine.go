@@ -24,6 +24,9 @@ type Publisher interface {
 type RuleLoader interface {
 	LoadEnabled(context.Context, string, *rules.DeviceSchema, *dag.Registry) ([]ruleconfig.Rule, error)
 }
+type schemaProvider interface {
+	DeviceSchema(context.Context, string, int64) (*rules.DeviceSchema, error)
+}
 type fixedLocator struct{ projectID, deviceID int64 }
 
 func (l fixedLocator) LocateDevice(context.Context, string) (int64, int64, error) {
@@ -90,7 +93,7 @@ func (e *Engine) Process(ctx context.Context, env envelope.Envelope) error {
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	ruleset, err := e.load(ctx, fmt.Sprint(env.ProjectID))
+	ruleset, err := e.load(ctx, fmt.Sprint(env.ProjectID), env.DeviceTypeID)
 	if err != nil {
 		return err
 	}
@@ -152,10 +155,11 @@ func (e *Engine) Process(ctx context.Context, env envelope.Envelope) error {
 	return nil
 }
 
-func (e *Engine) load(ctx context.Context, projectID string) ([]ruleconfig.Rule, error) {
+func (e *Engine) load(ctx context.Context, projectID string, deviceTypeID int64) ([]ruleconfig.Rule, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if got, ok := e.cached[projectID]; ok && time.Since(got.at) < e.reloadEvery {
+	cacheKey := fmt.Sprintf("%s:%d", projectID, deviceTypeID)
+	if got, ok := e.cached[cacheKey]; ok && time.Since(got.at) < e.reloadEvery {
 		return got.rules, nil
 	}
 	actions := []dag.Action{dag.Func{ActionName: "alarm.raise", Idem: true, Run: e.raiseAction}}
@@ -166,7 +170,13 @@ func (e *Engine) load(ctx context.Context, projectID string) ([]ruleconfig.Rule,
 	if err != nil {
 		return nil, err
 	}
-	schema := &rules.DeviceSchema{Metrics: metricSchema()}
+	schema := &rules.DeviceSchema{Metrics: metricSchema(), AllowUnknownMetrics: true}
+	if provider, ok := e.loader.(schemaProvider); ok {
+		loadedSchema, schemaErr := provider.DeviceSchema(ctx, projectID, deviceTypeID)
+		if schemaErr == nil && loadedSchema != nil {
+			schema = loadedSchema
+		}
+	}
 	loaded, err := e.loader.LoadEnabled(ctx, projectID, schema, registry)
 	if err != nil {
 		return nil, err
@@ -218,7 +228,7 @@ func (e *Engine) load(ctx context.Context, projectID string) ([]ruleconfig.Rule,
 		}
 		loaded[i].Graph = graph
 	}
-	e.cached[projectID] = cachedRules{at: time.Now(), rules: loaded}
+	e.cached[cacheKey] = cachedRules{at: time.Now(), rules: loaded}
 	e.logger.Info("规则已加载", "project_id", projectID, "rules", len(loaded))
 	return loaded, nil
 }

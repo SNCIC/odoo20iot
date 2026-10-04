@@ -10,6 +10,8 @@ RestartSec=5
 TimeoutStopSec=20
 KillMode=mixed
 NoNewPrivileges=true
+MemoryMax=512M
+Environment=GOMEMLIMIT=384MiB
 
 [Install]
 WantedBy=default.target

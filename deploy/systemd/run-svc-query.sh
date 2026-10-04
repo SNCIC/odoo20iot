@@ -8,7 +8,7 @@ if [[ -f /home/xfusion/etc/odoo20iot.env ]]; then
 fi
 exec /home/xfusion/projects/odoo20iot/bin/svc-query \
   -dsn "${IOT_GREPTIME_DSN:-postgres://greptime:greptime@100.64.0.3:28403/public}" \
-  -pg-dsn "${IOT_PG_DSN:-postgres://iot:iot_dev_only_change_me@100.64.0.3:28543/odoo20iot}" \
+  -pg-dsn "${IOT_PG_DSN:-postgres://iot_app:iot_app_dev_only_change_me@100.64.0.3:28543/odoo20iot}" \
   -http-addr "${IOT_QUERY_HTTP_ADDR:-127.0.0.1:18094}" \
   -auth-mode "${IOT_QUERY_AUTH_MODE:-dev}" \
   -dev-token "${IOT_QUERY_DEV_TOKEN:-}" \
