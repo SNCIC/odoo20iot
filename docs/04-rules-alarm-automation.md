@@ -669,6 +669,7 @@ Range。未配置签名器时清单/下载路由不暴露，禁止用明文 HTTP
 `t_ota_task_device`；`svc-query` 每分钟扫描运行中任务，只对已通知/执行中的设备按 `offline_ttl` 标记超时，尚未进入灰度的 `pending` 设备不会被误过期。
 全部设备进入终态后才按全任务成功率将任务收敛为 `completed` 或 `paused`。迁移 `0036_ota_rollout_state` 增加批次索引和调度租约；配置完整时 `svc-query` 后台 worker 仅在当前批次成功率达标后自动发送下一批，失败则暂停。
 回滚通过 `POST /api/v1/ota/tasks/{task_id}/rollback` 创建独立回滚任务：只复制源任务中已成功设备，目标固件由调用方指定，设备实际回报 `succeeded` 后才将回滚任务设备记为 `rolled_back`；离线或失败设备不会被伪造为已恢复。迁移 `0038_ota_rollback` 保存源任务和回滚原因。回滚通知带 `rollback=true`，真实设备升级、回滚和生产验收仍需现场验证。
+开发环境可用 `go run ./cmd/ota-sim -project-id 1 -device-key <device_key> -task-id <task_id>` 依次模拟进度；该工具仅用于测试 NATS/数据库闭环，不能替代真实设备验收。
 
 ---
 
