@@ -658,6 +658,10 @@ OTA 第一阶段已新增并应用固件清单和任务台账的数据库模型�
 `svc-query` 已提供 `ota:read` / `ota:write` 保护的固件登记、固件列表、任务创建、任务查询和设备任务列表 API。
 `POST /api/v1/ota/artifacts` 接收 multipart 字段 `firmware`，写入配置的本地制品目录并返回 SHA-256 与租户对象键；
 上传上限 512 MiB。固件登记 API 接收已上传对象元数据，不负责生成签名；发布任务前仍须由受信签名流程签署清单。
+配置 `IOT_OTA_SIGNING_KEY_FILE`（PKCS#8 Ed25519 PEM）、`IOT_OTA_SIGNING_KEY_ID`、
+`IOT_OTA_DOWNLOAD_SECRET` 和 HTTPS 的 `IOT_OTA_PUBLIC_BASE_URL` 后，`GET
+/api/v1/ota/firmwares/{firmware_id}/manifest` 生成短时效签名清单；设备下载地址支持 HTTP
+Range。未配置签名器时清单/下载路由不暴露，禁止用明文 HTTP 作为生产下载地址。
 签名私钥只允许由外部密钥管理系统提供，禁止写入仓库或数据库。对象存储上传/预签名 URL、
 `svc-query` 控制面 API、OTA 通知下发和设备进度消费将在下一阶段接入；当前不宣称 OTA 已可
 对真实设备执行升级。

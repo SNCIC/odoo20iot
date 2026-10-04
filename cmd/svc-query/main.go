@@ -217,6 +217,9 @@ func run(cfg config) error {
 		return err
 	}
 	var otaArtifactStore *ota.ArtifactStore
+	var otaSigner *ota.Signer
+	otaDownloadSecret := strings.TrimSpace(os.Getenv("IOT_OTA_DOWNLOAD_SECRET"))
+	otaDownloadBaseURL := strings.TrimSpace(os.Getenv("IOT_OTA_PUBLIC_BASE_URL"))
 	if artifactDir := strings.TrimSpace(os.Getenv("IOT_OTA_ARTIFACT_DIR")); artifactDir != "" {
 		otaArtifactStore, err = ota.NewArtifactStore(artifactDir, ota.DefaultMaxArtifactBytes)
 		if err != nil {
@@ -225,6 +228,19 @@ func run(cfg config) error {
 		logger.Info("OTA 固件上传已启用", "directory", artifactDir, "max_bytes", ota.DefaultMaxArtifactBytes)
 	} else {
 		logger.Warn("IOT_OTA_ARTIFACT_DIR 未设置，OTA 固件上传 API 未启用")
+	}
+	if keyFile := strings.TrimSpace(os.Getenv("IOT_OTA_SIGNING_KEY_FILE")); keyFile != "" {
+		keyID := strings.TrimSpace(os.Getenv("IOT_OTA_SIGNING_KEY_ID"))
+		otaSigner, err = ota.LoadSigner(keyFile, keyID)
+		if err != nil {
+			return fmt.Errorf("初始化 OTA 签名器: %w", err)
+		}
+		if otaDownloadSecret == "" || otaDownloadBaseURL == "" {
+			return fmt.Errorf("OTA 签名器启用时必须配置 IOT_OTA_DOWNLOAD_SECRET 和 IOT_OTA_PUBLIC_BASE_URL")
+		}
+		logger.Info("OTA 清单签名已启用", "key_id", keyID, "public_base_url", otaDownloadBaseURL)
+	} else {
+		logger.Warn("IOT_OTA_SIGNING_KEY_FILE 未设置，OTA 清单签名/下载 API 未启用")
 	}
 	var endpointStore *notifyconfig.Store
 	if rawKey := os.Getenv("IOT_CONFIG_KEY"); rawKey != "" {
@@ -321,18 +337,21 @@ func run(cfg config) error {
 			Burst:          cfg.rateBurst,
 		},
 	}, querysvc.Deps{
-		Reader:      gres,
-		Latest:      latest.NewRedisStore(latestRedis),
-		Endpoints:   endpointStore,
-		Alarms:      alarmStore,
-		Quota:       quotaStore,
-		Commands:    commandService,
-		Shadows:     shadowService,
-		OTA:         otaStore,
-		OTAArtifact: otaArtifactStore,
-		Meter:       meterAcc,
-		Catalog:     store,
-		Verifier:    verifier,
+		Reader:             gres,
+		Latest:             latest.NewRedisStore(latestRedis),
+		Endpoints:          endpointStore,
+		Alarms:             alarmStore,
+		Quota:              quotaStore,
+		Commands:           commandService,
+		Shadows:            shadowService,
+		OTA:                otaStore,
+		OTAArtifact:        otaArtifactStore,
+		OTASigner:          otaSigner,
+		OTADownloadSecret:  otaDownloadSecret,
+		OTADownloadBaseURL: otaDownloadBaseURL,
+		Meter:              meterAcc,
+		Catalog:            store,
+		Verifier:           verifier,
 		Health: querysvc.Health{
 			PingPG:            pool.Ping,
 			PingTSDB:          gres.Ping,

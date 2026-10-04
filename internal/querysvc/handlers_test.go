@@ -11,6 +11,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,14 +77,34 @@ type fakeOTAArtifactStore struct {
 	artifact ota.Artifact
 }
 
+type fakeOTASigner struct{}
+
+func (fakeOTASigner) SignManifest(manifest ota.Manifest, now time.Time, ttl time.Duration) (ota.Manifest, error) {
+	manifest.SigningKeyID = "test-key"
+	manifest.ExpiresAt = now.Add(ttl).UTC().Format(time.RFC3339)
+	manifest.Signature = "test-signature"
+	return manifest, nil
+}
+
 func (f *fakeOTAArtifactStore) PutContext(_ context.Context, projectID int64, filename string, _ io.Reader) (ota.Artifact, error) {
 	f.artifact = ota.Artifact{Key: "1/hash", Filename: filename, SizeBytes: 4, SHA256: ota.Digest([]byte("test"))}
 	f.artifact.Key = fmt.Sprintf("%d/hash", projectID)
 	return f.artifact, nil
 }
 
+func (f *fakeOTAArtifactStore) Open(int64, string) (*os.File, error) {
+	return nil, os.ErrNotExist
+}
+
 func (f *fakeOTAStore) ListFirmwares(context.Context, int64) ([]ota.Firmware, error) {
 	return f.firmwares, nil
+}
+
+func (f *fakeOTAStore) GetFirmware(context.Context, int64, int64) (ota.Firmware, error) {
+	if len(f.firmwares) == 0 {
+		return ota.Firmware{}, ota.ErrFirmwareNotFound
+	}
+	return f.firmwares[0], nil
 }
 
 func (f *fakeOTAStore) RegisterFirmware(_ context.Context, firmware ota.Firmware, createdBy string) (ota.Firmware, error) {
@@ -420,6 +442,47 @@ func TestOTAArtifactUpload(t *testing.T) {
 	svc.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated || artifactStore.artifact.Filename != "edge.bin" {
 		t.Fatalf("上传固件期望 201，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOTAManifestAndRangeDownload(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	artifactStore, err := ota.NewArtifactStore(t.TempDir(), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := artifactStore.Put(1, "edge.bin", strings.NewReader("firmware-image"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otaStore := &fakeOTAStore{firmwares: []ota.Firmware{{ID: 1, ProjectID: 1, Version: "v1", Filename: artifact.Filename, ObjectKey: artifact.Key, SizeBytes: artifact.SizeBytes, SHA256: artifact.SHA256}}}
+	svc.deps.OTA = otaStore
+	svc.deps.OTAArtifact = artifactStore
+	svc.deps.OTASigner = fakeOTASigner{}
+	svc.deps.OTADownloadSecret = "download-secret"
+	svc.deps.OTADownloadBaseURL = "https://iot.invalid/api/v1/ota/download"
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"ota:read"}}}
+	svc.mux = svc.routes()
+	rec := get(t, svc.Handler(), "/api/v1/ota/firmwares/1/manifest", "scoped")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("清单接口期望 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Manifest ota.Manifest `json:"manifest"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	downloadURL, err := url.Parse(envelope.Manifest.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, downloadURL.Path+"?"+downloadURL.RawQuery, nil)
+	req.Header.Set("Range", "bytes=0-7")
+	down := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(down, req)
+	if down.Code != http.StatusPartialContent || down.Body.String() != "firmware" {
+		t.Fatalf("Range 下载期望 206/firmware，得到 %d/%q", down.Code, down.Body.String())
 	}
 }
 

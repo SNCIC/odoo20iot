@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -71,9 +73,109 @@ func (s *Service) routes() http.Handler {
 	}
 	if s.deps.OTAArtifact != nil {
 		mux.Handle("/api/v1/ota/artifacts", auth(http.HandlerFunc(s.handleOTAArtifactUpload)))
+		if s.deps.OTASigner != nil && s.deps.OTADownloadSecret != "" && s.deps.OTADownloadBaseURL != "" {
+			mux.Handle("/api/v1/ota/firmwares/", auth(http.HandlerFunc(s.handleOTAFirmwareAction)))
+			mux.HandleFunc("/api/v1/ota/download/", s.handleOTADownload)
+		}
 	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleOTAFirmwareAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 GET")
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if !id.Dev && !id.HasScope("ota:read") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:read 权限")
+		return
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/ota/firmwares/"), "/"), "/")
+	if len(parts) != 2 || parts[1] != "manifest" {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "固件清单路径非法")
+		return
+	}
+	firmwareID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || firmwareID <= 0 {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "firmware_id 非法")
+		return
+	}
+	firmware, err := s.deps.OTA.GetFirmware(r.Context(), id.ProjectID, firmwareID)
+	if err != nil {
+		if errors.Is(err, ota.ErrFirmwareNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "OTA 固件不存在")
+			return
+		}
+		s.fail(w, "读取 OTA 固件", err)
+		return
+	}
+	ttl := time.Hour
+	if raw := r.URL.Query().Get("ttl_seconds"); raw != "" {
+		seconds, parseErr := strconv.Atoi(raw)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "ttl_seconds 非法")
+			return
+		}
+		ttl = time.Duration(seconds) * time.Second
+	}
+	now := s.deps.Now()
+	expires := now.Add(ttl)
+	objectKey := firmware.ObjectKey
+	signature := ota.DownloadSignature(s.deps.OTADownloadSecret, id.ProjectID, objectKey, expires)
+	downloadURL := strings.TrimRight(s.deps.OTADownloadBaseURL, "/") + path.Join("/", strconv.FormatInt(id.ProjectID, 10), url.PathEscape(path.Base(objectKey)))
+	manifest, err := s.deps.OTASigner.SignManifest(ota.Manifest{Version: firmware.Version, Filename: firmware.Filename, URL: downloadURL, SizeBytes: firmware.SizeBytes, SHA256: firmware.SHA256}, now, ttl)
+	if err != nil {
+		s.fail(w, "签署 OTA 固件清单", err)
+		return
+	}
+	parsed, err := url.Parse(manifest.URL)
+	if err != nil {
+		s.fail(w, "构造 OTA 下载地址", err)
+		return
+	}
+	query := parsed.Query()
+	query.Set("expires", strconv.FormatInt(expires.Unix(), 10))
+	query.Set("sig", signature)
+	parsed.RawQuery = query.Encode()
+	manifest.URL = parsed.String()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "manifest": manifest})
+}
+
+func (s *Service) handleOTADownload(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/ota/download/"), "/"), "/")
+	if len(parts) != 2 {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "下载路径非法")
+		return
+	}
+	projectID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || projectID <= 0 {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "project_id 非法")
+		return
+	}
+	objectKey := parts[0] + "/" + parts[1]
+	if err := ota.VerifyDownloadSignature(s.deps.OTADownloadSecret, projectID, objectKey, r.URL.Query().Get("expires"), r.URL.Query().Get("sig"), s.deps.Now()); err != nil {
+		writeError(w, http.StatusForbidden, CodeForbidden, "下载地址无效或已过期")
+		return
+	}
+	file, err := s.deps.OTAArtifact.Open(projectID, objectKey)
+	if err != nil {
+		writeError(w, http.StatusNotFound, CodeNotFound, "固件制品不存在")
+		return
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, CodeInternal, "读取固件制品失败")
+		return
+	}
+	http.ServeContent(w, r, path.Base(objectKey), stat.ModTime(), file)
 }
 
 func (s *Service) handleOTAArtifactUpload(w http.ResponseWriter, r *http.Request) {

@@ -98,6 +98,22 @@ func (s *PGStore) ListFirmwares(ctx context.Context, projectID int64) ([]Firmwar
 	return firmwares, err
 }
 
+func (s *PGStore) GetFirmware(ctx context.Context, projectID, firmwareID int64) (Firmware, error) {
+	var firmware Firmware
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		var metadata []byte
+		err := tx.QueryRow(ctx, `SELECT id,project_id,version,filename,object_key,size_bytes,sha256,signature,signing_key_id,metadata,created_at FROM t_ota_firmware WHERE project_id=$1 AND id=$2`, projectID, firmwareID).Scan(&firmware.ID, &firmware.ProjectID, &firmware.Version, &firmware.Filename, &firmware.ObjectKey, &firmware.SizeBytes, &firmware.SHA256, &firmware.Signature, &firmware.SigningKeyID, &metadata, &firmware.CreatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrFirmwareNotFound
+		}
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(metadata, &firmware.Metadata)
+	})
+	return firmware, err
+}
+
 func (s *PGStore) CreateTask(ctx context.Context, projectID, firmwareID int64, deviceKeys []string, rollout Rollout, offlineTTL time.Duration, createdBy string) (Task, error) {
 	if projectID <= 0 || firmwareID <= 0 || len(deviceKeys) == 0 {
 		return Task{}, fmt.Errorf("ota: project_id、firmware_id 和目标设备必填")

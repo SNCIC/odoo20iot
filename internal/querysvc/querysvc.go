@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
@@ -64,6 +65,7 @@ type ShadowService interface {
 type OTAStore interface {
 	ListFirmwares(context.Context, int64) ([]ota.Firmware, error)
 	RegisterFirmware(context.Context, ota.Firmware, string) (ota.Firmware, error)
+	GetFirmware(context.Context, int64, int64) (ota.Firmware, error)
 	CreateTask(context.Context, int64, int64, []string, ota.Rollout, time.Duration, string) (ota.Task, error)
 	GetTask(context.Context, int64, string) (ota.Task, error)
 	ListTaskDevices(context.Context, int64, string) ([]ota.TaskDevice, error)
@@ -71,6 +73,11 @@ type OTAStore interface {
 
 type OTAArtifactStore interface {
 	PutContext(context.Context, int64, string, io.Reader) (ota.Artifact, error)
+	Open(int64, string) (*os.File, error)
+}
+
+type OTASigner interface {
+	SignManifest(ota.Manifest, time.Time, time.Duration) (ota.Manifest, error)
 }
 
 // Health 提供就绪探测所需的三类探针。任一为 nil 时该项跳过（测试便利）。
@@ -109,23 +116,26 @@ func DefaultConfig() Config {
 
 // Deps 是服务依赖。
 type Deps struct {
-	Reader      SeriesReader
-	Latest      LatestReader
-	Endpoints   NotificationEndpointStore
-	Alarms      AlarmAcknowledger
-	Quota       QuotaPolicyStore
-	Commands    CommandIssuer
-	Shadows     ShadowService
-	OTA         OTAStore
-	OTAArtifact OTAArtifactStore
-	Meter       Meter
-	Catalog     catalog.Store
-	Verifier    apiauth.Verifier
-	Health      Health
-	Metrics     *Metrics
-	AuthMetrics *apiauth.Metrics
-	Logger      *slog.Logger
-	Now         func() time.Time
+	Reader             SeriesReader
+	Latest             LatestReader
+	Endpoints          NotificationEndpointStore
+	Alarms             AlarmAcknowledger
+	Quota              QuotaPolicyStore
+	Commands           CommandIssuer
+	Shadows            ShadowService
+	OTA                OTAStore
+	OTAArtifact        OTAArtifactStore
+	OTASigner          OTASigner
+	OTADownloadSecret  string
+	OTADownloadBaseURL string
+	Meter              Meter
+	Catalog            catalog.Store
+	Verifier           apiauth.Verifier
+	Health             Health
+	Metrics            *Metrics
+	AuthMetrics        *apiauth.Metrics
+	Logger             *slog.Logger
+	Now                func() time.Time
 }
 
 // Service 是查询服务的 HTTP 处理器集合。

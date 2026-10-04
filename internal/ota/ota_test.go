@@ -2,6 +2,10 @@ package ota
 
 import (
 	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 )
@@ -78,5 +82,37 @@ func TestValidTaskID(t *testing.T) {
 	}
 	if ValidTaskID("not-a-task") || ValidTaskID("550e8400-e29b-31d4-a716-446655440000") {
 		t.Fatal("非法 UUID 不应通过")
+	}
+}
+
+func TestSignerAndDownloadSignature(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := t.TempDir() + "/signer.pem"
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	signer, err := LoadSigner(path, "ota-key-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	manifest, err := signer.SignManifest(Manifest{Version: "v1", Filename: "fw.bin", URL: "https://iot.invalid/fw", SizeBytes: 1, SHA256: Digest([]byte("x"))}, now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.Verify(publicKey, now); err != nil {
+		t.Fatal(err)
+	}
+	expires := now.Add(time.Hour)
+	signature := DownloadSignature("secret", 1, "1/hash", expires)
+	if err := VerifyDownloadSignature("secret", 1, "1/hash", fmt.Sprint(expires.Unix()), signature, now); err != nil {
+		t.Fatal(err)
 	}
 }
