@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/SNCIC/odoo20iot/internal/alarm"
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/cluster"
@@ -50,6 +51,10 @@ type AlarmAcknowledger interface {
 	Acknowledge(context.Context, int64, string, string, time.Time) error
 }
 
+type AlarmLister interface {
+	ActiveForProject(context.Context, string, ...alarm.State) ([]*alarm.Alarm, error)
+}
+
 type QuotaPolicyStore interface {
 	Policies(context.Context, int64) ([]quota.Policy, error)
 	SetPolicy(context.Context, quota.Policy, string) error
@@ -72,6 +77,7 @@ type ShadowService interface {
 
 type OTAStore interface {
 	ListFirmwares(context.Context, int64) ([]ota.Firmware, error)
+	ListTasks(context.Context, int64) ([]ota.Task, error)
 	RegisterFirmware(context.Context, ota.Firmware, string) (ota.Firmware, error)
 	GetFirmware(context.Context, int64, int64) (ota.Firmware, error)
 	CreateTask(context.Context, int64, int64, []string, ota.Rollout, time.Duration, string) (ota.Task, error)
@@ -143,6 +149,7 @@ type Deps struct {
 	Endpoints          NotificationEndpointStore
 	Modbus             ModbusConfigStore
 	Alarms             AlarmAcknowledger
+	AlarmLister        AlarmLister
 	Quota              QuotaPolicyStore
 	Commands           CommandIssuer
 	Shadows            ShadowService

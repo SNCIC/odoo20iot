@@ -13,6 +13,8 @@ id_ed25519*
 # ---- 构建产物 ----
 /bin/
 /dist/
+/web/dist/
+/web/node_modules/
 *.test
 *.out
 coverage.*

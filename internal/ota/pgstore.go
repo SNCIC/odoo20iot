@@ -229,6 +229,32 @@ func (s *PGStore) GetTask(ctx context.Context, projectID int64, taskID string) (
 	return task, err
 }
 
+func (s *PGStore) ListTasks(ctx context.Context, projectID int64) ([]Task, error) {
+	var tasks []Task
+	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id::text,project_id,firmware_id,status,rollout,extract(epoch from offline_ttl)::bigint,created_by,created_at,started_at,finished_at,rollout_batch_index,rollback_of::text,rollback_reason,(rollback_of IS NOT NULL) FROM t_ota_task WHERE project_id=$1 ORDER BY created_at DESC,id DESC`, projectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var task Task
+			var rolloutJSON []byte
+			var offlineTTL int64
+			if err := rows.Scan(&task.ID, &task.ProjectID, &task.FirmwareID, &task.Status, &rolloutJSON, &offlineTTL, &task.CreatedBy, &task.CreatedAt, &task.StartedAt, &task.FinishedAt, &task.BatchIndex, &task.RollbackOf, &task.RollbackReason, &task.IsRollback); err != nil {
+				return err
+			}
+			task.OfflineTTL = time.Duration(offlineTTL) * time.Second
+			if err := json.Unmarshal(rolloutJSON, &task.Rollout); err != nil {
+				return err
+			}
+			tasks = append(tasks, task)
+		}
+		return rows.Err()
+	})
+	return tasks, err
+}
+
 func (s *PGStore) ClaimRunningTasks(ctx context.Context, projectID int64, limit int, lease time.Duration) ([]Task, error) {
 	if projectID <= 0 || limit <= 0 || lease <= 0 {
 		return nil, fmt.Errorf("ota: claim 参数非法")

@@ -12,6 +12,8 @@ GREPTIME_DSN ?= postgres://greptime:greptime@100.64.0.3:28403/public
 IOT_PG_DSN   ?= postgres://iot:iot_dev_only_change_me@100.64.0.3:28543/odoo20iot
 
 COMPOSE_DIR := deploy/compose
+WEB_DIR     := $(PROJECT_DIR)/web
+WEB_EMBED   := $(PROJECT_DIR)/internal/querysvc/web/dist
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME  ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -24,6 +26,17 @@ help: ## 显示可用目标
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 ## ---------- Go ----------
+
+.PHONY: web-build
+web-build: ## 构建 Vue 控制台并同步到 Go embed 目录
+	cd $(WEB_DIR) && npm ci && npm run build
+	find $(WEB_EMBED) -mindepth 1 -delete 2>/dev/null || true
+	mkdir -p $(WEB_EMBED)
+	cp -R $(WEB_DIR)/dist/. $(WEB_EMBED)/
+
+.PHONY: web-typecheck
+web-typecheck: ## 检查 Vue 控制台 TypeScript
+	cd $(WEB_DIR) && npm ci && npm run typecheck
 
 .PHONY: fmt
 fmt: ## 格式化
@@ -46,7 +59,7 @@ tidy: ## 整理依赖
 	$(GO_RUN) 'cd $(PROJECT_DIR) && go mod tidy'
 
 .PHONY: build
-build: ## 编译全部服务到 bin/
+build: web-build ## 编译全部服务到 bin/
 	$(GO_RUN) 'cd $(PROJECT_DIR) && mkdir -p bin && \
 	  go build -ldflags "$(LDFLAGS)" -o bin/iot-gateway ./cmd/iot-gateway && \
 	  go build -ldflags "$(LDFLAGS)" -o bin/odoo-connector ./cmd/odoo-connector && \

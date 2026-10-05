@@ -358,6 +358,7 @@ func run(cfg config) error {
 		Endpoints:          endpointStore,
 		Modbus:             modbusStore,
 		Alarms:             alarmStore,
+		AlarmLister:        alarmStore,
 		Quota:              quotaStore,
 		Commands:           commandService,
 		Shadows:            shadowService,

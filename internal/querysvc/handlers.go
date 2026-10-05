@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/SNCIC/odoo20iot/internal/alarm"
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/command"
@@ -58,6 +59,9 @@ func (s *Service) routes() http.Handler {
 		mux.Handle("/api/v1/quota/policies/", auth(http.HandlerFunc(s.handleQuotaPolicies)))
 	}
 	if s.deps.Alarms != nil {
+		if s.deps.AlarmLister != nil {
+			mux.Handle("/api/v1/alarms", auth(http.HandlerFunc(s.handleAlarms)))
+		}
 		mux.Handle("/api/v1/alarms/", auth(http.HandlerFunc(s.handleAlarmAction)))
 	}
 	if s.deps.Commands != nil {
@@ -468,9 +472,27 @@ func (s *Service) handleOTAFirmwares(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleOTATasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		id, ok := apiauth.IdentityFrom(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+			return
+		}
+		if !id.Dev && !id.HasScope("ota:read") {
+			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 ota:read 权限")
+			return
+		}
+		items, err := s.deps.OTA.ListTasks(r.Context(), id.ProjectID)
+		if err != nil {
+			s.fail(w, "读取 OTA 任务", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": items})
+		return
+	}
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 POST")
+		w.Header().Set("Allow", "GET, POST")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 GET 或 POST")
 		return
 	}
 	id, ok := apiauth.IdentityFrom(r.Context())
@@ -787,6 +809,161 @@ func (s *Service) handleAlarmAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alarm_id": path, "acknowledged": true})
+}
+
+type alarmDTO struct {
+	ID        string     `json:"id"`
+	DeviceKey string     `json:"device_key"`
+	RuleID    string     `json:"rule_id"`
+	Level     string     `json:"level"`
+	Status    string     `json:"status"`
+	CreatedAt time.Time  `json:"created_at"`
+	AckAt     *time.Time `json:"ack_at,omitempty"`
+	Message   string     `json:"message"`
+}
+
+func (s *Service) handleAlarms(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 GET /api/v1/alarms")
+		return
+	}
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if !id.Dev && !id.HasScope("alarm:read") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 alarm:read 权限")
+		return
+	}
+
+	states, acknowledgedOnly, err := parseAlarmStatus(r.URL.Query().Get("status"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, err.Error())
+		return
+	}
+	from, err := parseOptionalTime(r.URL.Query().Get("from"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "from 必须是 RFC3339 时间")
+		return
+	}
+	to, err := parseOptionalTime(r.URL.Query().Get("to"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "to 必须是 RFC3339 时间")
+		return
+	}
+	if from != nil && to != nil && to.Before(*from) {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "to 不能早于 from")
+		return
+	}
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed <= 0 || parsed > 500 {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "limit 必须是 1 到 500 的整数")
+			return
+		}
+		limit = parsed
+	}
+
+	items, err := s.deps.AlarmLister.ActiveForProject(r.Context(), strconv.FormatInt(id.ProjectID, 10), states...)
+	if err != nil {
+		s.fail(w, "读取告警列表", err)
+		return
+	}
+	out := make([]alarmDTO, 0, minInt(limit, len(items)))
+	for _, item := range items {
+		if item == nil || item.State == alarm.StateIdle {
+			continue
+		}
+		status := alarmStatus(item)
+		if acknowledgedOnly && status != "acknowledged" {
+			continue
+		}
+		createdAt := item.FirstTS
+		if createdAt.IsZero() {
+			createdAt = item.StateTS
+		}
+		if from != nil && createdAt.Before(*from) {
+			continue
+		}
+		if to != nil && createdAt.After(*to) {
+			continue
+		}
+		ackAt := optionalTime(item.AcknowledgedAt)
+		out = append(out, alarmDTO{
+			ID: item.ID, DeviceKey: item.DeviceID, RuleID: item.RuleID, Level: item.Level,
+			Status: status, CreatedAt: createdAt, AckAt: ackAt,
+			Message: firstNonEmpty(item.RuleName, item.RuleID, "设备告警"),
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alarms": out, "history_supported": false})
+}
+
+func parseAlarmStatus(raw string) ([]alarm.State, bool, error) {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "":
+		return nil, false, nil
+	case "active":
+		return []alarm.State{alarm.StateActive}, false, nil
+	case "detected":
+		return []alarm.State{alarm.StateDetected}, false, nil
+	case "confirmed":
+		return []alarm.State{alarm.StateConfirmed}, false, nil
+	case "resolved":
+		return []alarm.State{alarm.StateResolved}, false, nil
+	case "acknowledged":
+		return []alarm.State{alarm.StateActive}, true, nil
+	default:
+		return nil, false, fmt.Errorf("status 必须是 active、detected、confirmed、resolved 或 acknowledged")
+	}
+}
+
+func parseOptionalTime(raw string) (*time.Time, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	value, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, err
+	}
+	value = value.UTC()
+	return &value, nil
+}
+
+func optionalTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	value = value.UTC()
+	return &value
+}
+
+func alarmStatus(item *alarm.Alarm) string {
+	if !item.AcknowledgedAt.IsZero() {
+		return "acknowledged"
+	}
+	return string(item.State)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func (s *Service) handleSeriesMulti(w http.ResponseWriter, r *http.Request) {

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SNCIC/odoo20iot/internal/alarm"
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/latest"
@@ -57,6 +58,10 @@ type fakeAlarmAcknowledger struct {
 	projectID int64
 	alarmID   string
 	actorID   string
+}
+
+type fakeAlarmLister struct {
+	alarms []*alarm.Alarm
 }
 
 type fakeQuotaPolicyStore struct {
@@ -104,6 +109,13 @@ func (f *fakeOTAArtifactStore) Open(int64, string) (*os.File, error) {
 
 func (f *fakeOTAStore) ListFirmwares(context.Context, int64) ([]ota.Firmware, error) {
 	return f.firmwares, nil
+}
+
+func (f *fakeOTAStore) ListTasks(context.Context, int64) ([]ota.Task, error) {
+	if f.task.ID == "" {
+		return nil, nil
+	}
+	return []ota.Task{f.task}, nil
 }
 
 func (f *fakeOTAStore) GetFirmware(context.Context, int64, int64) (ota.Firmware, error) {
@@ -211,6 +223,23 @@ func (f *fakeQuotaPolicyStore) DeletePolicy(_ context.Context, _ int64, metric, 
 func (f *fakeAlarmAcknowledger) Acknowledge(_ context.Context, projectID int64, alarmID, actorID string, _ time.Time) error {
 	f.projectID, f.alarmID, f.actorID = projectID, alarmID, actorID
 	return nil
+}
+
+func (f *fakeAlarmLister) ActiveForProject(_ context.Context, _ string, states ...alarm.State) ([]*alarm.Alarm, error) {
+	if len(states) == 0 {
+		return f.alarms, nil
+	}
+	allowed := make(map[alarm.State]struct{}, len(states))
+	for _, state := range states {
+		allowed[state] = struct{}{}
+	}
+	var out []*alarm.Alarm
+	for _, item := range f.alarms {
+		if _, ok := allowed[item.State]; ok {
+			out = append(out, item)
+		}
+	}
+	return out, nil
 }
 
 func (fakeEndpointStore) List(context.Context, int64) ([]notifyconfig.Endpoint, error) {
@@ -460,6 +489,10 @@ func TestOTAEndpointsScopesAndLifecycle(t *testing.T) {
 
 	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"ota:read"}}}
 	svc.mux = svc.routes()
+	rec = get(t, svc.Handler(), "/api/v1/ota/tasks", "scoped")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), otaStore.task.ID) {
+		t.Fatalf("查询 OTA 任务期望 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
 	rec = get(t, svc.Handler(), "/api/v1/ota/tasks/550e8400-e29b-41d4-a716-446655440000/devices", "scoped")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "dev-1") {
 		t.Fatalf("查询 OTA 设备任务期望 200，得到 %d: %s", rec.Code, rec.Body.String())
@@ -714,6 +747,26 @@ func TestAlarmAcknowledgeRequiresScope(t *testing.T) {
 	}
 	if ack.projectID != 7 || ack.alarmID != "alarm-9" || ack.actorID != "user-2" {
 		t.Fatalf("确认参数不正确: %+v", ack)
+	}
+}
+
+func TestAlarmListRequiresScopeAndFiltersStatus(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	svc.deps.Alarms = new(fakeAlarmAcknowledger)
+	svc.deps.AlarmLister = &fakeAlarmLister{alarms: []*alarm.Alarm{
+		{ID: "a-1", DeviceID: "device-1", RuleID: "r-1", RuleName: "温度超限", Level: "P1", State: alarm.StateActive, FirstTS: time.Now().UTC()},
+		{ID: "a-2", DeviceID: "device-2", RuleID: "r-2", RuleName: "已确认告警", Level: "P2", State: alarm.StateActive, AcknowledgedAt: time.Now().UTC(), FirstTS: time.Now().UTC()},
+	}}
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"telemetry:read"}}}
+	svc.mux = svc.routes()
+	if rec := get(t, svc.Handler(), "/api/v1/alarms", "scoped"); rec.Code != http.StatusForbidden {
+		t.Fatalf("缺 alarm:read 应拒绝，得到 %d", rec.Code)
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"alarm:read"}}}
+	svc.mux = svc.routes()
+	if rec := get(t, svc.Handler(), "/api/v1/alarms?status=acknowledged", "scoped"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "a-2") || strings.Contains(rec.Body.String(), "a-1") {
+		t.Fatalf("acknowledged 过滤结果不符，得到 %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
