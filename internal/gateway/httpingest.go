@@ -67,7 +67,12 @@ func (h *HTTPIngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reject(http.StatusRequestEntityTooLarge, `{"error":"payload_too_large"}`)
 		return
 	}
-	if contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])); contentType != "" && contentType != "application/json" {
+	contentType := r.Header.Get("Content-Type")
+	format := r.Header.Get("X-Device-Format")
+	if strings.TrimSpace(format) == "" {
+		format = HTTPFormatJSON
+	}
+	if format == HTTPFormatJSON && strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0])) != "" && strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0])) != "application/json" {
 		reject(http.StatusUnsupportedMediaType, `{"error":"content_type_must_be_application_json"}`)
 		return
 	}
@@ -89,7 +94,8 @@ func (h *HTTPIngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxHTTPPayloadBytes+1))
-	if err != nil || len(body) == 0 || len(body) > MaxHTTPPayloadBytes || !json.Valid(body) {
+	normalized, normalizeErr := normalizeHTTPPayload(format, contentType, body)
+	if err != nil || len(body) == 0 || len(body) > MaxHTTPPayloadBytes || normalizeErr != nil {
 		reject(http.StatusBadRequest, `{"error":"invalid_json"}`)
 		return
 	}
@@ -103,7 +109,7 @@ func (h *HTTPIngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reject(http.StatusInternalServerError, `{"error":"trace_id_failed"}`)
 		return
 	}
-	data, err := (envelope.Envelope{SchemaVersion: envelope.CurrentSchemaVersion, TraceID: traceID, ProjectID: result.ProjectID, DeviceKey: result.DeviceKey, DeviceID: result.DeviceID, DeviceTypeID: result.DeviceTypeID, Stream: stream, ReceivedAt: time.Now().UTC(), Payload: json.RawMessage(body)}).Encode()
+	data, err := (envelope.Envelope{SchemaVersion: envelope.CurrentSchemaVersion, TraceID: traceID, ProjectID: result.ProjectID, DeviceKey: result.DeviceKey, DeviceID: result.DeviceID, DeviceTypeID: result.DeviceTypeID, Stream: stream, ReceivedAt: time.Now().UTC(), Payload: json.RawMessage(normalized)}).Encode()
 	if err != nil {
 		reject(http.StatusInternalServerError, `{"error":"envelope_failed"}`)
 		return

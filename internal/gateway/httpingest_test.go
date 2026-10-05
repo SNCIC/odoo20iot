@@ -86,3 +86,19 @@ func TestHTTPIngestAcceptsBearerAndContentType(t *testing.T) {
 		t.Fatalf("status=%d accepted=%d body=%s", rec.Code, metrics.HTTPIngestAccepted.Load(), rec.Body.String())
 	}
 }
+
+func TestHTTPIngestNormalizesScannerPayload(t *testing.T) {
+	id := &auth.Identity{ProjectID: 1, DeviceKey: "scanner-1", Mode: auth.ModePerDevice, Secret: auth.HashSecret("secret", auth.Params{Time: 1, Memory: 8 * 1024, Threads: 1, KeyLen: 32}, []byte("0123456789abcdef"))}
+	a := auth.NewAuthenticator(auth.DirectoryFunc(func(_ context.Context, _ string) (*auth.Identity, error) { return id, nil }), auth.DefaultPolicy(), nil)
+	publisher := new(httpIngestPublisher)
+	h, _ := NewHTTPIngestHandler(HTTPIngestOptions{Authenticator: a, Publisher: publisher, Router: ContractRouter{Shards: 8}})
+	req := httptest.NewRequest(http.MethodPost, "/ingest/v1/devices/scanner-1/telemetry", strings.NewReader("6901234567890\n"))
+	req.Header.Set("X-Device-Secret", "secret")
+	req.Header.Set("X-Device-Format", HTTPFormatScanner)
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(publisher.payload, `"barcode":"6901234567890"`) {
+		t.Fatalf("status=%d payload=%s", rec.Code, publisher.payload)
+	}
+}

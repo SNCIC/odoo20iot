@@ -523,3 +523,4 @@ curl -fsS http://100.64.0.3:9070/web/login -o /dev/null -w '%{http_code}\n'
 - **2026-10-04 OTA 开发验收工具与控制台**：新增 `cmd/ota-sim`，向 `IOT_OTA_PROGRESS` JetStream 发布可控状态序列，用于模拟下载、校验、安装和成功回报；控制台新增 OTA 页面，可查询固件、查询任务、启动任务和创建回滚任务。模拟器与页面只用于开发验证，不替代真实设备验收。
 - **2026-10-05 HTTP 设备接入第一阶段**：网关新增 `POST /ingest/v1/devices/{device_key}/{stream}`，复用设备 B 档 secret 认证、设备租户归属、统一信封和 NATS JetStream 持久化确认；限制 JSON 请求体 32 KiB，非法路径、凭据、JSON 和超限载荷拒绝。DTU/扫码枪可先在本地把数据转换为统一 JSON 后接入；私有二进制帧解析、TCP-DTU 长连接和生产 HTTPS 终止仍未实现。匿名开发模式不注册该入口，避免无设备身份时错误归属租户。
 - **2026-10-05 HTTP 设备接入第二阶段**：兼容 `Authorization: Bearer <device-secret>` 与 `X-Device-Secret` 两种设备头，校验 `application/json` 内容类型，并增加 HTTP 接入成功/拒绝/发布失败指标；专项测试和全量 Go 测试通过。幂等去重仍由下游遥测管道按设备、时间戳和 seq 契约负责，HTTP 入口不声称已完成业务去重。
+- **2026-10-05 HTTP 设备接入第三阶段**：新增 `X-Device-Format: scanner-text` 扫码文本适配，以及 `X-Device-Format: dtu-kv` 的常见键值/分隔符适配；转换结果统一进入原有信封与物模型管道，未知格式、空值、多行扫码值和非法字段名拒绝。私有二进制协议仍需按具体 DTU 厂商协议单独开发。
