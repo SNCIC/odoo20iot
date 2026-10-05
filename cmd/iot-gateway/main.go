@@ -260,7 +260,7 @@ func main() {
 	mux.HandleFunc("/healthz", healthz)
 	mux.HandleFunc("/metrics", metricsHandler(metrics, meterReporter.Metrics()))
 	if authenticator != nil {
-		httpIngest, err := gateway.NewHTTPIngestHandler(gateway.HTTPIngestOptions{Authenticator: authenticator, Publisher: pub, Router: gateway.ContractRouter{Project: *project, Shards: *shards}, Logger: gwLog, Timeout: *pubackTimeout})
+		httpIngest, err := gateway.NewHTTPIngestHandler(gateway.HTTPIngestOptions{Authenticator: authenticator, Publisher: pub, Router: gateway.ContractRouter{Project: *project, Shards: *shards}, Logger: gwLog, Timeout: *pubackTimeout, Metrics: metrics})
 		if err != nil {
 			logger.Fatal("初始化 HTTP 设备接入失败", zap.Error(err))
 		}

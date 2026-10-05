@@ -22,6 +22,7 @@ type HTTPIngestOptions struct {
 	Router        ContractRouter
 	Logger        *slog.Logger
 	Timeout       time.Duration
+	Metrics       *Metrics
 }
 
 type HTTPIngestHandler struct {
@@ -30,6 +31,7 @@ type HTTPIngestHandler struct {
 	router  ContractRouter
 	logger  *slog.Logger
 	timeout time.Duration
+	metrics *Metrics
 }
 
 func NewHTTPIngestHandler(opts HTTPIngestOptions) (*HTTPIngestHandler, error) {
@@ -42,61 +44,79 @@ func NewHTTPIngestHandler(opts HTTPIngestOptions) (*HTTPIngestHandler, error) {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 5 * time.Second
 	}
-	return &HTTPIngestHandler{auth: opts.Authenticator, acker: NewAcker(opts.Publisher, opts.Timeout, new(Metrics)), router: opts.Router, logger: opts.Logger, timeout: opts.Timeout}, nil
+	if opts.Metrics == nil {
+		opts.Metrics = new(Metrics)
+	}
+	return &HTTPIngestHandler{auth: opts.Authenticator, acker: NewAcker(opts.Publisher, opts.Timeout, opts.Metrics), router: opts.Router, logger: opts.Logger, timeout: opts.Timeout, metrics: opts.Metrics}, nil
 }
 
 func (h *HTTPIngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.metrics.HTTPIngestTotal.Add(1)
+	reject := func(status int, body string) { h.metrics.HTTPIngestRejected.Add(1); http.Error(w, body, status) }
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
-		http.Error(w, `{"error":"method_not_allowed"}`, http.StatusMethodNotAllowed)
+		reject(http.StatusMethodNotAllowed, `{"error":"method_not_allowed"}`)
 		return
 	}
 	deviceKey, stream, ok := parseHTTPIngestPath(r.URL.Path)
 	if !ok {
-		http.Error(w, `{"error":"invalid_path"}`, http.StatusBadRequest)
+		reject(http.StatusBadRequest, `{"error":"invalid_path"}`)
 		return
 	}
 	if r.ContentLength > MaxHTTPPayloadBytes {
-		http.Error(w, `{"error":"payload_too_large"}`, http.StatusRequestEntityTooLarge)
+		reject(http.StatusRequestEntityTooLarge, `{"error":"payload_too_large"}`)
+		return
+	}
+	if contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])); contentType != "" && contentType != "application/json" {
+		reject(http.StatusUnsupportedMediaType, `{"error":"content_type_must_be_application_json"}`)
 		return
 	}
 	secret := strings.TrimSpace(r.Header.Get("X-Device-Secret"))
 	if secret == "" {
-		http.Error(w, `{"error":"missing_device_secret"}`, http.StatusUnauthorized)
+		const prefix = "Bearer "
+		authz := strings.TrimSpace(r.Header.Get("Authorization"))
+		if strings.HasPrefix(authz, prefix) {
+			secret = strings.TrimSpace(strings.TrimPrefix(authz, prefix))
+		}
+	}
+	if secret == "" {
+		reject(http.StatusUnauthorized, `{"error":"missing_device_secret"}`)
 		return
 	}
 	result, err := h.auth.Authenticate(r.Context(), auth.Request{ClientID: deviceKey, Username: deviceKey, Password: secret, RemoteIP: httpRemoteIP(r)})
 	if err != nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		reject(http.StatusUnauthorized, `{"error":"unauthorized"}`)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, MaxHTTPPayloadBytes+1))
 	if err != nil || len(body) == 0 || len(body) > MaxHTTPPayloadBytes || !json.Valid(body) {
-		http.Error(w, `{"error":"invalid_json"}`, http.StatusBadRequest)
+		reject(http.StatusBadRequest, `{"error":"invalid_json"}`)
 		return
 	}
 	subject, err := h.router.RouteHTTPProject(deviceKey, stream, result.ProjectID)
 	if err != nil {
-		http.Error(w, `{"error":"invalid_stream"}`, http.StatusBadRequest)
+		reject(http.StatusBadRequest, `{"error":"invalid_stream"}`)
 		return
 	}
 	traceID, err := envelope.NewTraceID()
 	if err != nil {
-		http.Error(w, `{"error":"trace_id_failed"}`, http.StatusInternalServerError)
+		reject(http.StatusInternalServerError, `{"error":"trace_id_failed"}`)
 		return
 	}
 	data, err := (envelope.Envelope{SchemaVersion: envelope.CurrentSchemaVersion, TraceID: traceID, ProjectID: result.ProjectID, DeviceKey: result.DeviceKey, DeviceID: result.DeviceID, DeviceTypeID: result.DeviceTypeID, Stream: stream, ReceivedAt: time.Now().UTC(), Payload: json.RawMessage(body)}).Encode()
 	if err != nil {
-		http.Error(w, `{"error":"envelope_failed"}`, http.StatusInternalServerError)
+		reject(http.StatusInternalServerError, `{"error":"envelope_failed"}`)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 	if err := h.acker.AwaitPersist(ctx, subject, data); err != nil {
+		h.metrics.HTTPIngestPublishErrors.Add(1)
 		h.logger.Error("HTTP 设备上报未持久化", "device_key", deviceKey, "error", err)
-		http.Error(w, `{"error":"publish_failed"}`, http.StatusServiceUnavailable)
+		reject(http.StatusServiceUnavailable, `{"error":"publish_failed"}`)
 		return
 	}
+	h.metrics.HTTPIngestAccepted.Add(1)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true,"trace_id":"` + traceID + `"}`))
 }

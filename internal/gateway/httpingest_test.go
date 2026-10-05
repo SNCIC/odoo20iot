@@ -71,3 +71,18 @@ func TestHTTPIngestRejectsBadSecretAndInvalidPayload(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPIngestAcceptsBearerAndContentType(t *testing.T) {
+	id := &auth.Identity{ProjectID: 1, DeviceKey: "scanner-1", Mode: auth.ModePerDevice, Secret: auth.HashSecret("secret", auth.Params{Time: 1, Memory: 8 * 1024, Threads: 1, KeyLen: 32}, []byte("0123456789abcdef"))}
+	a := auth.NewAuthenticator(auth.DirectoryFunc(func(_ context.Context, _ string) (*auth.Identity, error) { return id, nil }), auth.DefaultPolicy(), nil)
+	metrics := new(Metrics)
+	h, _ := NewHTTPIngestHandler(HTTPIngestOptions{Authenticator: a, Publisher: new(httpIngestPublisher), Router: ContractRouter{Shards: 8}, Metrics: metrics})
+	req := httptest.NewRequest(http.MethodPost, "/ingest/v1/devices/scanner-1/telemetry", strings.NewReader(`{"barcode":"abc"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || metrics.HTTPIngestAccepted.Load() != 1 {
+		t.Fatalf("status=%d accepted=%d body=%s", rec.Code, metrics.HTTPIngestAccepted.Load(), rec.Body.String())
+	}
+}

@@ -4,7 +4,7 @@
 
 ### 1.0 HTTP 设备接入（DTU / 扫码枪，2026-10-05）
 
-存量 DTU、扫码枪可通过 `POST /ingest/v1/devices/{device_key}/{stream}` 上报 JSON，入口与 MQTT 共用设备级凭据、统一信封和 NATS JetStream 持久化确认。设备凭据放在 `X-Device-Secret` 请求头，服务端按 `device_key` 查找设备并校验 B 档 secret；未认证、非法 JSON、非法路径和超过 32 KiB 的请求直接拒绝。
+存量 DTU、扫码枪可通过 `POST /ingest/v1/devices/{device_key}/{stream}` 上报 JSON，入口与 MQTT 共用设备级凭据、统一信封和 NATS JetStream 持久化确认。设备凭据可放在 `X-Device-Secret` 请求头，也兼容 `Authorization: Bearer <device-secret>`；服务端按 `device_key` 查找设备并校验 B 档 secret。可选 `Content-Type: application/json; charset=utf-8`，未认证、非法 JSON、非法路径和超过 32 KiB 的请求直接拒绝。
 
 示例：
 
@@ -16,7 +16,7 @@ curl -X POST \
   -d '{"temperature":25.3,"barcode":"6901234567890"}'
 ```
 
-响应 `200` 代表消息已经得到 JetStream 持久化确认，并返回 `trace_id`；返回 `503` 时设备应按自身重试策略重发。HTTP 接入只负责 JSON 上报，不在网关解析 DTU 私有帧；DTU 或扫码枪应在本地转换为统一 JSON，二进制/私有 TCP 透传仍属于后续 `gw-tcp` 范围。生产环境应由 HTTPS 反向代理或独立 TLS 入口保护 HTTP 设备流量，禁止明文公网接入。
+响应 `200` 代表消息已经得到 JetStream 持久化确认，并返回 `trace_id`；返回 `503` 时设备应按自身重试策略重发。HTTP 接入只负责 JSON 上报，不在网关解析 DTU 私有帧；DTU 或扫码枪应在本地转换为统一 JSON，二进制/私有 TCP 透传仍属于后续 `gw-tcp` 范围。生产环境应由 HTTPS 反向代理或独立 TLS 入口保护 HTTP 设备流量，禁止明文公网接入。相关 Prometheus 指标为 `gw_http_ingest_total`、`gw_http_ingest_accepted_total`、`gw_http_ingest_rejected_total` 和 `gw_http_ingest_publish_errors_total`。
 
 ### 1.1 目标
 

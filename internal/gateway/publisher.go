@@ -159,6 +159,10 @@ type Metrics struct {
 	QoS0PublishErrorTotal        atomic.Int64
 	DeviceLifecyclePublished     atomic.Int64
 	DeviceLifecyclePublishErrors atomic.Int64
+	HTTPIngestTotal              atomic.Int64
+	HTTPIngestAccepted           atomic.Int64
+	HTTPIngestRejected           atomic.Int64
+	HTTPIngestPublishErrors      atomic.Int64
 
 	// ---- 认证与 ACL（06 §4：gw_connect_fail_total / gw_auth_cache_hit_ratio）----
 
@@ -216,6 +220,10 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	writeMetric(w, "gw_qos0_publish_error_total", "QoS0 总线投递失败数", m.QoS0PublishErrorTotal.Load())
 	writeMetric(w, "gw_device_lifecycle_published_total", "设备生命周期事件发布数", m.DeviceLifecyclePublished.Load())
 	writeMetric(w, "gw_device_lifecycle_publish_errors_total", "设备生命周期事件发布失败数", m.DeviceLifecyclePublishErrors.Load())
+	writeMetric(w, "gw_http_ingest_total", "HTTP 设备上报请求数", m.HTTPIngestTotal.Load())
+	writeMetric(w, "gw_http_ingest_accepted_total", "HTTP 设备上报持久化确认数", m.HTTPIngestAccepted.Load())
+	writeMetric(w, "gw_http_ingest_rejected_total", "HTTP 设备上报拒绝数", m.HTTPIngestRejected.Load())
+	writeMetric(w, "gw_http_ingest_publish_errors_total", "HTTP 设备上报发布失败数", m.HTTPIngestPublishErrors.Load())
 
 	writeMetric(w, "gw_auth_success_total", "设备认证通过的连接数", m.AuthSuccessTotal.Load())
 	writeMetric(w, "gw_connect_fail_total", "设备认证失败的连接数（见 reason 维度）", m.ConnectFailTotal.Load())
