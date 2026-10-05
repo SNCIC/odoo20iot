@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/SNCIC/odoo20iot/internal/alarm"
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
@@ -28,6 +30,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
+	"github.com/SNCIC/odoo20iot/internal/ruleconfig"
 	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
@@ -67,6 +70,32 @@ type fakeAlarmLister struct {
 type fakeQuotaPolicyStore struct {
 	saved   quota.Policy
 	deleted string
+}
+
+type fakeRuleStore struct {
+	rules   []ruleconfig.Rule
+	project string
+	actor   string
+}
+
+func (f *fakeRuleStore) List(_ context.Context, projectID string) ([]ruleconfig.Rule, error) {
+	if f.project != "" && f.project != projectID {
+		return nil, nil
+	}
+	return append([]ruleconfig.Rule(nil), f.rules...), nil
+}
+
+func (f *fakeRuleStore) SetEnabled(_ context.Context, projectID, ruleID string, enabled bool, actor string) (ruleconfig.Rule, error) {
+	for index := range f.rules {
+		if f.rules[index].RuleID == ruleID {
+			f.rules[index].ProjectID = projectID
+			f.rules[index].Enabled = enabled
+			f.rules[index].Version++
+			f.actor = actor
+			return f.rules[index], nil
+		}
+	}
+	return ruleconfig.Rule{}, pgx.ErrNoRows
 }
 
 type meterRecorder struct {
@@ -719,6 +748,38 @@ func TestModbusConfigScopesAndCRUD(t *testing.T) {
 	svc.Handler().ServeHTTP(deleteRec, deleteReq)
 	if deleteRec.Code != http.StatusOK || store.deleted != "plc-2" {
 		t.Fatalf("modbus:write 应删除配置，得到 %d/%q", deleteRec.Code, store.deleted)
+	}
+}
+
+func TestRuleListAndToggleScopes(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	store := &fakeRuleStore{rules: []ruleconfig.Rule{{
+		ProjectID: "1", RuleID: "temperature-high", Name: "温度超限", Level: "P1",
+		Enabled: true, Priority: 10, Version: 2,
+	}}}
+	svc.deps.Rules = store
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"telemetry:read"}}}
+	svc.mux = svc.routes()
+	if rec := get(t, svc.Handler(), "/api/v1/rules", "scoped"); rec.Code != http.StatusForbidden {
+		t.Fatalf("缺少 rule:read 应拒绝，得到 %d", rec.Code)
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"rule:read"}}}
+	svc.mux = svc.routes()
+	rec := get(t, svc.Handler(), "/api/v1/rules", "scoped")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "temperature-high") || !strings.Contains(rec.Body.String(), "rule_name") {
+		t.Fatalf("rule:read 应返回规则列表，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, ActorID: "user-1", Scopes: []string{"rule:write"}}}
+	svc.mux = svc.routes()
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/rules/temperature-high", strings.NewReader(`{"enabled":false}`))
+	req.Header.Set("Authorization", "Bearer scoped")
+	rec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || store.rules[0].Enabled || store.rules[0].Version != 3 || store.actor != "user-1" {
+		t.Fatalf("rule:write 应更新启用状态，得到 %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

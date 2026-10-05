@@ -50,6 +50,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/querysvc"
 	"github.com/SNCIC/odoo20iot/internal/quota"
+	"github.com/SNCIC/odoo20iot/internal/ruleconfig"
 	"github.com/SNCIC/odoo20iot/internal/secureconfig"
 	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
@@ -209,6 +210,10 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	ruleStore, err := ruleconfig.NewStore(pool)
+	if err != nil {
+		return err
+	}
 	alarmStore, err := alarm.NewPGStore(pool)
 	if err != nil {
 		return err
@@ -360,6 +365,7 @@ func run(cfg config) error {
 		Alarms:             alarmStore,
 		AlarmLister:        alarmStore,
 		Quota:              quotaStore,
+		Rules:              ruleStore,
 		Commands:           commandService,
 		Shadows:            shadowService,
 		OTA:                otaStore,

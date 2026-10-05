@@ -24,6 +24,7 @@ type Rule struct {
 	RuleID        string
 	Name          string
 	Level         string
+	Enabled       bool
 	Priority      int
 	Version       int64
 	Match         Match
@@ -153,4 +154,56 @@ ORDER BY priority, rule_id, version DESC`, projectID)
 		return rows.Err()
 	})
 	return out, err
+}
+
+// List returns the control-plane summary for all rules in one tenant.
+// It deliberately does not compile expressions: the rule worker owns runtime
+// validation, while the control plane must remain usable when one rule is bad.
+func (s *Store) List(ctx context.Context, projectID string) ([]Rule, error) {
+	var out []Rule
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+SELECT rule_id, rule_name, level, enabled, priority, version
+FROM t_alarm_rule
+WHERE project_id=$1
+ORDER BY priority, rule_id, version DESC`, projectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var rule Rule
+			if err := rows.Scan(&rule.RuleID, &rule.Name, &rule.Level, &rule.Enabled, &rule.Priority, &rule.Version); err != nil {
+				return err
+			}
+			rule.ProjectID = projectID
+			out = append(out, rule)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// SetEnabled changes only the publication switch and advances the version.
+// The update and audit row share one tenant-scoped transaction.
+func (s *Store) SetEnabled(ctx context.Context, projectID, ruleID string, enabled bool, actor string) (Rule, error) {
+	var rule Rule
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `
+UPDATE t_alarm_rule
+SET enabled=$3, version=version+1, updated_at=now()
+WHERE project_id=$1 AND rule_id=$2
+RETURNING rule_id, rule_name, level, enabled, priority, version`, projectID, ruleID, enabled).
+			Scan(&rule.RuleID, &rule.Name, &rule.Level, &rule.Enabled, &rule.Priority, &rule.Version)
+		if err != nil {
+			return err
+		}
+		rule.ProjectID = projectID
+		_, err = tx.Exec(ctx, `
+INSERT INTO t_audit_log(project_id, action, actor_id, resource_type, resource_id, details)
+VALUES($1::BIGINT, 'rule.enabled.update', $2, 'alarm_rule', $3, jsonb_build_object('enabled', $4, 'version', $5))`,
+			projectID, actor, ruleID, enabled, rule.Version)
+		return err
+	})
+	return rule, err
 }

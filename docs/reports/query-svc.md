@@ -101,7 +101,7 @@ $ curl -s -H 'Authorization: Bearer devtoken' '.../api/v1/series?device_ids=1001
 | 6 | **按设备类型的物模型校验** | 未实现；仍是 tsdb 内的全局 5 指标白名单 |
 | 7 | **慢查询自动降级** | 只有指标 + WARN，没有自动切预聚合表 |
 | 8 | **每租户速率限制 / 读写连接池分离** | 未实现；只有并发上限（进程内，多副本会放大） |
-| 9 | **前端** | 没有。当前唯一的「界面」是 GreptimeDB 自带 dashboard（`http://100.64.0.3:28400/`） |
+| 9 | **前端** | Vue 3 + TypeScript 控制台已完成 M1.1-M1.3，并由 `svc-query` 通过 Go embed 提供；M2 的 Odoo 业务闭环与经营融合看板待后端 Odoo API。 |
 | 10 | **生产 ID / JWKS 轮转 / scope 逐端点校验** | 均未做；JWT 只校验、不签发 |
 
 ## 6. 数字口径

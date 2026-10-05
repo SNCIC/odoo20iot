@@ -19,6 +19,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
+	"github.com/SNCIC/odoo20iot/internal/ruleconfig"
 	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
@@ -53,6 +54,11 @@ type AlarmAcknowledger interface {
 
 type AlarmLister interface {
 	ActiveForProject(context.Context, string, ...alarm.State) ([]*alarm.Alarm, error)
+}
+
+type RuleStore interface {
+	List(context.Context, string) ([]ruleconfig.Rule, error)
+	SetEnabled(context.Context, string, string, bool, string) (ruleconfig.Rule, error)
 }
 
 type QuotaPolicyStore interface {
@@ -151,6 +157,7 @@ type Deps struct {
 	Alarms             AlarmAcknowledger
 	AlarmLister        AlarmLister
 	Quota              QuotaPolicyStore
+	Rules              RuleStore
 	Commands           CommandIssuer
 	Shadows            ShadowService
 	OTA                OTAStore

@@ -25,6 +25,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/modbusgw"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
+	"github.com/SNCIC/odoo20iot/internal/ruleconfig"
 	"github.com/SNCIC/odoo20iot/internal/shadow"
 	"github.com/SNCIC/odoo20iot/internal/tsdb"
 )
@@ -58,6 +59,10 @@ func (s *Service) routes() http.Handler {
 		mux.Handle("/api/v1/quota/policies", auth(http.HandlerFunc(s.handleQuotaPolicies)))
 		mux.Handle("/api/v1/quota/policies/", auth(http.HandlerFunc(s.handleQuotaPolicies)))
 	}
+	if s.deps.Rules != nil {
+		mux.Handle("/api/v1/rules", auth(http.HandlerFunc(s.handleRules)))
+		mux.Handle("/api/v1/rules/", auth(http.HandlerFunc(s.handleRules)))
+	}
 	if s.deps.Alarms != nil {
 		if s.deps.AlarmLister != nil {
 			mux.Handle("/api/v1/alarms", auth(http.HandlerFunc(s.handleAlarms)))
@@ -89,6 +94,83 @@ func (s *Service) routes() http.Handler {
 	}
 
 	return securityHeaders(mux)
+}
+
+type ruleDTO struct {
+	RuleID   string `json:"rule_id"`
+	RuleName string `json:"rule_name"`
+	Level    string `json:"level"`
+	Enabled  bool   `json:"enabled"`
+	Priority int    `json:"priority"`
+	Version  int64  `json:"version"`
+}
+
+func toRuleDTO(rule ruleconfig.Rule) ruleDTO {
+	return ruleDTO{
+		RuleID: rule.RuleID, RuleName: rule.Name, Level: rule.Level,
+		Enabled: rule.Enabled, Priority: rule.Priority, Version: rule.Version,
+	}
+}
+
+func (s *Service) handleRules(w http.ResponseWriter, r *http.Request) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	pathKey := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/rules"), "/")
+	if r.Method == http.MethodGet {
+		if pathKey != "" {
+			writeError(w, http.StatusNotFound, CodeNotFound, "规则路径不存在")
+			return
+		}
+		if !id.Dev && !id.HasScope("rule:read") {
+			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 rule:read 权限")
+			return
+		}
+		items, err := s.deps.Rules.List(r.Context(), strconv.FormatInt(id.ProjectID, 10))
+		if err != nil {
+			s.fail(w, "读取规则列表", err)
+			return
+		}
+		out := make([]ruleDTO, 0, len(items))
+		for _, item := range items {
+			out = append(out, toRuleDTO(item))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rules": out})
+		return
+	}
+	if r.Method != http.MethodPut || pathKey == "" || strings.Contains(pathKey, "/") {
+		w.Header().Set("Allow", "GET, PUT")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "规则接口仅支持 GET 或 PUT")
+		return
+	}
+	if !id.Dev && !id.HasScope("rule:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 rule:write 权限")
+		return
+	}
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil || req.Enabled == nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "enabled 必须是布尔值")
+		return
+	}
+	ruleID, err := url.PathUnescape(pathKey)
+	if err != nil || strings.TrimSpace(ruleID) == "" {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "rule_id 非法")
+		return
+	}
+	item, err := s.deps.Rules.SetEnabled(r.Context(), strconv.FormatInt(id.ProjectID, 10), ruleID, *req.Enabled, id.ActorID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "规则不存在或不属于本租户")
+			return
+		}
+		s.fail(w, "更新规则状态", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rule": toRuleDTO(item)})
 }
 
 type modbusConfigDTO struct {

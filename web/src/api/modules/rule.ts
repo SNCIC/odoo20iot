@@ -23,7 +23,7 @@ function readRules() {
 }
 
 export function rulesUseMock() {
-  return import.meta.env.VITE_USE_MOCK !== 'false'
+  return import.meta.env.VITE_USE_MOCK === 'true'
 }
 
 export async function listRules() {

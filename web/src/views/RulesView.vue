@@ -38,7 +38,7 @@ onMounted(() => void load())
 <template>
   <div class="page">
     <div class="page-head"><div><h1 class="page-title">规则管理</h1><p class="page-description">管理规则启停和优先级。规则编辑器将在后续阶段开放。</p></div><el-button :loading="loading" @click="load">刷新</el-button></div>
-    <el-alert v-if="rulesUseMock()" title="规则 CRUD 接口尚未补齐，当前使用浏览器本地 mock 数据。" type="warning" show-icon :closable="false" />
+    <el-alert v-if="rulesUseMock()" title="当前通过 VITE_USE_MOCK=true 启用了本地规则 mock。" type="warning" show-icon :closable="false" />
     <section class="panel">
       <el-table v-loading="loading" :data="rules" stripe>
         <el-table-column label="规则名称" prop="rule_name" min-width="210" />
