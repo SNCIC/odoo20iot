@@ -9,4 +9,6 @@ fi
 exec /home/xfusion/projects/odoo20iot/bin/svc-quota \
   -nats-url "${IOT_NATS_URL:-nats://100.64.0.3:28222}" \
   -redis-url "${IOT_REDIS_URL:-redis://100.64.0.3:28637/0}" \
+  -pg-dsn "${IOT_PG_DSN:-postgres://iot_app:iot_app_dev_only_change_me@100.64.0.3:28543/odoo20iot}" \
+  -greptime-dsn "${IOT_GREPTIMEDB_DSN:-postgres://greptime:greptime@100.64.0.3:28403/public}" \
   -log-json "${IOT_LOG_JSON:-true}"

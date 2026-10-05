@@ -15,12 +15,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,6 +74,7 @@ type config struct {
 	natsURL           string
 	redisURL          string
 	pgDSN             string
+	greptimeDSN       string
 	stream            string
 	subject           string
 	durable           string
@@ -79,6 +83,8 @@ type config struct {
 	ackWait           time.Duration
 	consumerInactive  time.Duration
 	reconcileInterval time.Duration
+	snapshotProjects  []int64
+	snapshotInterval  time.Duration
 	logJSON           bool
 }
 
@@ -95,6 +101,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.natsURL, "nats-url", "nats://100.64.0.3:28222", "NATS JetStream 地址")
 	flag.StringVar(&cfg.redisURL, "redis-url", "redis://100.64.0.3:28637/0", "Redis 地址（用量计数器）")
 	flag.StringVar(&cfg.pgDSN, "pg-dsn", envOrDefault("IOT_PG_DSN", pg.DefaultDSN), "PG 用量事实账本 DSN（默认开发库，可由 IOT_PG_DSN 覆盖）")
+	flag.StringVar(&cfg.greptimeDSN, "greptime-dsn", envOrDefault("IOT_GREPTIMEDB_DSN", "postgres://greptime:greptime@100.64.0.3:28403/public"), "GreptimeDB 遥测库 DSN；为空则不计入遥测存储量")
 	flag.StringVar(&cfg.stream, "stream", "IOT_QUOTA", "计量 Stream 名称（须与网关上一致）")
 	flag.StringVar(&cfg.subject, "subject", "iot.quota.usage", "消费的 subject")
 	flag.StringVar(&cfg.durable, "durable", "svc-quota", "durable consumer 名")
@@ -104,8 +111,10 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.consumerInactive, "consumer-inactive", 24*time.Hour,
 		"消费者空闲回收阈值（须 ≥ 流保留时长，见 internal/natsjs）")
 	flag.DurationVar(&cfg.reconcileInterval, "reconcile-interval", time.Hour, "PG/Redis 用量对账周期；0 表示关闭")
+	flag.DurationVar(&cfg.snapshotInterval, "snapshot-interval", 5*time.Minute, "设备数与固件存储量快照周期；0 表示关闭")
 	flag.BoolVar(&cfg.logJSON, "log-json", true, "日志输出为 JSON")
 	flag.Parse()
+	cfg.snapshotProjects = parseProjectIDs(os.Getenv("IOT_QUOTA_PROJECTS"))
 	return cfg
 }
 
@@ -183,6 +192,24 @@ func run(cfg config) error {
 		if cfg.reconcileInterval > 0 {
 			go reconcileLoop(ctx, pgStore, quota.NewRedisCounter(rdb, cfg.counterTTL), cfg.reconcileInterval, logger)
 		}
+		if cfg.snapshotInterval > 0 && len(cfg.snapshotProjects) > 0 {
+			source, err := quota.NewPGSnapshotSource(pgPool)
+			if err != nil {
+				return err
+			}
+			var greptimeSource *quota.GreptimeSnapshotSource
+			if cfg.greptimeDSN != "" {
+				greptimeSource, err = quota.NewGreptimeSnapshotSource(ctx, cfg.greptimeDSN)
+				if err != nil {
+					return err
+				}
+				defer greptimeSource.Close()
+			}
+			go snapshotLoop(ctx, js, quota.NewCombinedSnapshotSource(source, greptimeSource), cfg.snapshotProjects, cfg.snapshotInterval, logger)
+			logger.Info("设备与存储快照采集已启用", "projects", cfg.snapshotProjects, "interval", cfg.snapshotInterval)
+		} else {
+			logger.Warn("设备与存储快照采集未启用：请配置 IOT_QUOTA_PROJECTS")
+		}
 	}
 
 	// 4) 消费。
@@ -214,6 +241,64 @@ func run(cfg config) error {
 		"poison", metrics.PermanentTotal.Load(),
 		"errors", metrics.Errors.Load())
 	return nil
+}
+
+func parseProjectIDs(raw string) []int64 {
+	var out []int64
+	seen := make(map[int64]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil || id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func snapshotLoop(ctx context.Context, js nats.JetStreamContext, source quota.SnapshotSource, projects []int64, interval time.Duration, logger *slog.Logger) {
+	collect := func() {
+		window := time.Now().UTC().Truncate(interval)
+		for _, projectID := range projects {
+			values, err := source.Snapshot(ctx, projectID)
+			if err != nil {
+				logger.Error("采集租户计量快照失败", "project_id", projectID, "error", err)
+				continue
+			}
+			report := metering.UsageReport{ProjectID: projectID, NodeID: "svc-quota-snapshot", Window: window, ReportID: fmt.Sprintf("snapshot:%d:%d", projectID, window.Unix()), Counters: values}
+			data, err := json.Marshal(report)
+			if err != nil {
+				logger.Error("编码计量快照失败", "project_id", projectID, "error", err)
+				continue
+			}
+			msg := nats.NewMsg(metering.UsageSubject)
+			msg.Data = data
+			msg.Header.Set(nats.MsgIdHdr, report.ReportID)
+			if _, err := js.PublishMsg(msg, nats.Context(ctx)); err != nil {
+				logger.Error("发布计量快照失败", "project_id", projectID, "error", err)
+			} else {
+				logger.Info("计量快照已发布", "project_id", projectID, "storage_bytes", values[metering.MetricStorageBytes], "device_count", values[metering.MetricDeviceCount], "window", window)
+			}
+		}
+	}
+	collect()
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			collect()
+		}
+	}
 }
 
 func reconcileLoop(ctx context.Context, store *quota.PGStore, redisStore *quota.RedisCounter, interval time.Duration, logger *slog.Logger) {

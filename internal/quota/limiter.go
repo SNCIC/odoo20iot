@@ -17,7 +17,7 @@ type Decision struct {
 // Reserve 使用 Redis 原子脚本预留配额。limit<=0 表示未配置硬限额，直接放行。
 // 调用方应在真正执行有配额成本的操作前调用；脚本拒绝时不会增加计数。
 func (c *RedisCounter) Reserve(ctx context.Context, projectID int64, metric string, limit, delta int64, windowStart time.Time, ttl time.Duration) (Decision, error) {
-	if projectID <= 0 || metric == "" || delta <= 0 {
+	if projectID <= 0 || metric == "" || delta < 0 || (delta == 0 && !isLatestSnapshotMetric(metric)) {
 		return Decision{}, fmt.Errorf("quota: project_id、metric 和正增量必填")
 	}
 	if limit <= 0 {
@@ -26,7 +26,11 @@ func (c *RedisCounter) Reserve(ctx context.Context, projectID int64, metric stri
 	if ttl <= 0 {
 		ttl = c.ttl
 	}
-	key := fmt.Sprintf("quota:reserve:%d:%s:%s", projectID, metric, windowStart.UTC().Format("20060102"))
+	format := "20060102"
+	if windowStart.UTC().Day() == 1 && windowStart.UTC().Hour() == 0 {
+		format = "200601"
+	}
+	key := fmt.Sprintf("quota:reserve:%d:%s:%s", projectID, metric, windowStart.UTC().Format(format))
 	script := redis.NewScript(`
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local delta = tonumber(ARGV[1])

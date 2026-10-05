@@ -15,6 +15,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/auth"
 	"github.com/SNCIC/odoo20iot/internal/cluster"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
 // Options 是接入网关的启动参数。
@@ -37,7 +38,8 @@ type Options struct {
 	ProjectID    int64
 	DeviceTypeID int64
 	// Meter 是计量累加器（04 §6）。为 nil 时不做计量。
-	Meter Meter
+	Meter         Meter
+	QuotaEnforcer *quota.Enforcer
 	// PubackTimeout 是等待 PublishAck 的上限（§4.4 默认 5s）。
 	PubackTimeout time.Duration
 	// Metrics 可为空；空时内部新建。
@@ -193,6 +195,7 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		ProjectID:               opts.ProjectID,
 		DeviceTypeID:            opts.DeviceTypeID,
 		Meter:                   opts.Meter,
+		QuotaEnforcer:           opts.QuotaEnforcer,
 		ReplyPublisher:          opts.CommandReplyPublisher,
 		ShadowReportedPublisher: opts.ShadowReportedPublisher,
 		OTAProgressPublisher:    opts.OTAProgressPublisher,

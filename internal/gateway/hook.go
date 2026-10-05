@@ -14,6 +14,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/cluster"
 	"github.com/SNCIC/odoo20iot/internal/envelope"
 	"github.com/SNCIC/odoo20iot/internal/metering"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
 // Hook 把 A2 时序接入 mochi-mqtt 的 PUBLISH 处理路径。
@@ -46,6 +47,7 @@ type HookConfig struct {
 	DeviceTypeID int64
 	// Meter 为 nil 时不做计量（不影响 A2 时序）。
 	Meter                   Meter
+	QuotaEnforcer           *quota.Enforcer
 	ReplyPublisher          Publisher
 	ShadowReportedPublisher Publisher
 	OTAProgressPublisher    Publisher
@@ -72,6 +74,7 @@ type Hook struct {
 	deviceTypeID int64
 
 	meter             Meter
+	quotaEnforcer     *quota.Enforcer
 	identityForClient func(string) (projectID, deviceID, deviceTypeID int64, ok bool)
 	requireIdentity   bool
 }
@@ -100,6 +103,7 @@ func NewHook(baseCtx context.Context, acker *Acker, router SubjectRouter, metric
 		projectID:         cfg.ProjectID,
 		deviceTypeID:      cfg.DeviceTypeID,
 		meter:             cfg.Meter,
+		quotaEnforcer:     cfg.QuotaEnforcer,
 		identityForClient: cfg.IdentityForClient,
 		requireIdentity:   cfg.RequireIdentity,
 	}
@@ -192,13 +196,25 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		h.logger.Warn("拒绝无法封装的上报", "client", cl.ID, "topic", pk.TopicName, "error", err)
 		return pk, packets.ErrRejectPacket
 	}
+	projectID := h.projectID
+	if resolvedProjectID, _, _, ok := h.identityForClient(cl.ID); ok {
+		projectID = resolvedProjectID
+	}
+	if h.quotaEnforcer != nil {
+		decision, reserveErr := h.quotaEnforcer.ReserveTelemetry(h.baseCtx, projectID, pk.FixedHeader.Dup)
+		if reserveErr != nil || !decision.Allowed {
+			h.metrics.QuotaRejectedTotal.Add(1)
+			h.logger.Warn("遥测超出配额，拒绝接收", "client", cl.ID, "project_id", projectID, "current", decision.Current, "limit", decision.Limit, "error", reserveErr)
+			return pk, packets.ErrRejectPacket
+		}
+	}
 
 	if pk.FixedHeader.Qos == 0 {
 		if err := h.acker.PublishQoS0(h.baseCtx, subject, data); err != nil {
 			h.logger.Error("QoS0 已进入统一路径但总线投递失败：设备不会重传",
 				"client", cl.ID, "topic", pk.TopicName, "subject", subject, "error", err)
-		} else if h.meter != nil {
-			h.meter.Add(h.projectID, metering.MetricMsgCount, 1)
+		} else if h.meter != nil && !pk.FixedHeader.Dup {
+			h.meter.Add(projectID, metering.MetricMsgCount, 1)
 		}
 		return pk, nil
 	}
@@ -213,7 +229,7 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	// 计量：只有**已持久化**的消息才计入（04 §6「每条消息可归属到 project_id」）。
 	// 热路径只做一次加锁自增，无 IO。
 	if h.meter != nil && !pk.FixedHeader.Dup {
-		h.meter.Add(h.projectID, metering.MetricMsgCount, 1)
+		h.meter.Add(projectID, metering.MetricMsgCount, 1)
 	}
 
 	if err := writePuback(cl, pk); err != nil {

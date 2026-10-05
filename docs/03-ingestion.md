@@ -401,6 +401,15 @@ Body:
 - 心跳：`gw-tcp` 维护 idle 检测（默认 5 分钟无数据则断开）。
 - 该通道的消息与 MQTT 通道**共用同一条管道**，仅接入适配层不同。
 
+### 3.4 遥测配额执行（Phase 2）
+
+- MQTT 与 HTTP 设备上报在进入 NATS 持久化前，按租户对 `msg_count` 调用 `quota.Reserve`。
+- `enforcement_mode=reject` 达到硬限额后拒绝消息：MQTT 不发送 PUBACK，HTTP 返回 `429 Too Many Requests`。
+- `enforcement_mode=throttle` 进行有限短暂重试，仍超限后按拒绝语义处理；网关不会无限阻塞收包协程。
+- Redis 或策略读取故障按降级口径放行并记录错误；明确的硬限额超限仍拒绝。
+- QoS1 DUP 重传不重复预留；控制面、查询、命令与 OTA 不走该遥测配额执行器。
+- `device_count` 与 `storage_bytes` 当前仍由计量链路负责告警，不接入网关热路径预留。
+
 ---
 
 ## 4. 消息管道（svc-pipeline）

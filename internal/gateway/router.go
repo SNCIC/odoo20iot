@@ -18,7 +18,8 @@ type SubjectRouter interface {
 	Route(cl *mqtt.Client, pk packets.Packet) (string, error)
 }
 
-// 端侧 topic 契约（docs/03-ingestion.md §5）：v1/devices/{deviceKey}/{stream}
+// 端侧 topic 契约（docs/03-ingestion.md §5）：v1/devices/{deviceKey}/{stream}，
+// 网关子设备使用 v1/gateways/{gatewayKey}/devices/{subKey}/{stream}。
 const (
 	topicRoot    = "v1"
 	topicDevices = "devices"
@@ -53,6 +54,9 @@ func (r ContractRouter) Route(_ *mqtt.Client, pk packets.Packet) (string, error)
 	}
 
 	parts := strings.Split(pk.TopicName, "/")
+	if len(parts) == 6 && parts[0] == topicRoot && parts[1] == "gateways" && parts[3] == topicDevices && parts[4] != "" && parts[5] != "" {
+		return fmt.Sprintf("iot.%s.%s.shard.%d", parts[5], r.Project, hashShard(parts[2]+"/"+parts[4], shards)), nil
+	}
 	if len(parts) != topicParts ||
 		parts[0] != topicRoot || parts[1] != topicDevices ||
 		parts[2] == "" || parts[3] == "" {
@@ -75,6 +79,15 @@ func (r ContractRouter) RouteHTTPProject(deviceKey, stream string, projectID int
 		return "", fmt.Errorf("%w: project_id 非法", ErrUnroutableTopic)
 	}
 	return r.routeHTTP(deviceKey, stream, fmt.Sprintf("%d", projectID))
+}
+
+// RouteHTTPSubdevice 将网关子设备映射到与普通设备相同的分片管道。
+// deviceKey 使用 gateway/sub 的稳定复合键，消费者可据此区分子设备并保持幂等。
+func (r ContractRouter) RouteHTTPSubdevice(gatewayKey, subKey, stream string, projectID int64) (string, error) {
+	if strings.TrimSpace(gatewayKey) == "" || strings.TrimSpace(subKey) == "" || strings.ContainsAny(gatewayKey+subKey, "/+#.") {
+		return "", fmt.Errorf("%w: gateway/subdevice 非法", ErrUnroutableTopic)
+	}
+	return r.RouteHTTPProject(subKey, stream, projectID)
 }
 
 func (r ContractRouter) routeHTTP(deviceKey, stream, project string) (string, error) {

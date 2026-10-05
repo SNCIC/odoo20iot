@@ -21,6 +21,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/metering"
+	"github.com/SNCIC/odoo20iot/internal/modbusgw"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/shadow"
@@ -78,8 +79,146 @@ func (s *Service) routes() http.Handler {
 			mux.HandleFunc("/api/v1/ota/download/", s.handleOTADownload)
 		}
 	}
+	if s.deps.Modbus != nil {
+		mux.Handle("/api/v1/modbus/configs", auth(http.HandlerFunc(s.handleModbusConfigs)))
+		mux.Handle("/api/v1/modbus/configs/", auth(http.HandlerFunc(s.handleModbusConfigs)))
+	}
 
 	return securityHeaders(mux)
+}
+
+type modbusConfigDTO struct {
+	ID           int64            `json:"id,omitempty"`
+	Enabled      bool             `json:"enabled"`
+	Transport    string           `json:"transport"`
+	DeviceKey    string           `json:"device_key"`
+	DeviceID     int64            `json:"device_id"`
+	DeviceTypeID int64            `json:"device_type_id"`
+	Endpoint     string           `json:"endpoint,omitempty"`
+	SerialPath   string           `json:"serial_path,omitempty"`
+	BaudRate     int              `json:"baud_rate"`
+	DataBits     int              `json:"data_bits"`
+	StopBits     int              `json:"stop_bits"`
+	Parity       string           `json:"parity"`
+	UnitID       byte             `json:"unit_id"`
+	IntervalMS   int              `json:"interval_ms"`
+	TimeoutMS    int              `json:"timeout_ms"`
+	Points       []modbusgw.Point `json:"points"`
+}
+
+func toModbusConfigDTO(cfg modbusgw.Config) modbusConfigDTO {
+	return modbusConfigDTO{
+		ID: cfg.ID, Enabled: cfg.Enabled, Transport: cfg.Transport, DeviceKey: cfg.DeviceKey,
+		DeviceID: cfg.DeviceID, DeviceTypeID: cfg.DeviceTypeID, Endpoint: cfg.Endpoint,
+		SerialPath: cfg.SerialPath, BaudRate: cfg.BaudRate, DataBits: cfg.DataBits,
+		StopBits: cfg.StopBits, Parity: cfg.Parity, UnitID: cfg.UnitID,
+		IntervalMS: int(cfg.Interval / time.Millisecond), TimeoutMS: int(cfg.Timeout / time.Millisecond),
+		Points: cfg.Points,
+	}
+}
+
+func (s *Service) handleModbusConfigs(w http.ResponseWriter, r *http.Request) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, CodeUnauthenticated, "缺少身份")
+		return
+	}
+	if r.Method == http.MethodGet {
+		if !id.Dev && !id.HasScope("modbus:read") {
+			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 modbus:read 权限")
+			return
+		}
+		if strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/modbus/configs"), "/") != "" {
+			writeError(w, http.StatusNotFound, CodeNotFound, "Modbus 配置路径不存在")
+			return
+		}
+		s.recordAPICall(id.ProjectID)
+		items, err := s.deps.Modbus.ListAll(r.Context(), id.ProjectID)
+		if err != nil {
+			s.fail(w, "读取 Modbus 配置", err)
+			return
+		}
+		out := make([]modbusConfigDTO, 0, len(items))
+		for _, item := range items {
+			out = append(out, toModbusConfigDTO(item))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "configs": out})
+		return
+	}
+
+	if !id.Dev && !id.HasScope("modbus:write") {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 modbus:write 权限")
+		return
+	}
+	s.recordAPICall(id.ProjectID)
+	pathKey := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/modbus/configs"), "/")
+	if r.Method == http.MethodDelete {
+		if pathKey == "" || strings.Contains(pathKey, "/") {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "device_key 必须位于路径中")
+			return
+		}
+		deviceKey, err := url.PathUnescape(pathKey)
+		if err != nil || strings.TrimSpace(deviceKey) == "" {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "device_key 非法")
+			return
+		}
+		if err := s.deps.Modbus.Delete(r.Context(), id.ProjectID, deviceKey); err != nil {
+			s.fail(w, "删除 Modbus 配置", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "device_key": deviceKey, "enabled": false})
+		return
+	}
+	if r.Method != http.MethodPost || pathKey != "" {
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "Modbus 配置仅支持 GET、POST 或 DELETE")
+		return
+	}
+	var req struct {
+		Enabled      *bool            `json:"enabled"`
+		Transport    string           `json:"transport"`
+		DeviceKey    string           `json:"device_key"`
+		DeviceID     int64            `json:"device_id"`
+		DeviceTypeID int64            `json:"device_type_id"`
+		Endpoint     string           `json:"endpoint"`
+		SerialPath   string           `json:"serial_path"`
+		BaudRate     int              `json:"baud_rate"`
+		DataBits     int              `json:"data_bits"`
+		StopBits     int              `json:"stop_bits"`
+		Parity       string           `json:"parity"`
+		UnitID       byte             `json:"unit_id"`
+		IntervalMS   int              `json:"interval_ms"`
+		TimeoutMS    int              `json:"timeout_ms"`
+		Points       []modbusgw.Point `json:"points"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "请求体非法")
+		return
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	cfg := modbusgw.Config{
+		Enabled: enabled, Transport: req.Transport, ProjectID: id.ProjectID,
+		DeviceKey: strings.TrimSpace(req.DeviceKey), DeviceID: req.DeviceID, DeviceTypeID: req.DeviceTypeID,
+		Endpoint: strings.TrimSpace(req.Endpoint), SerialPath: strings.TrimSpace(req.SerialPath),
+		BaudRate: req.BaudRate, DataBits: req.DataBits, StopBits: req.StopBits,
+		Parity: strings.TrimSpace(req.Parity), UnitID: req.UnitID,
+		Interval: time.Duration(req.IntervalMS) * time.Millisecond,
+		Timeout:  time.Duration(req.TimeoutMS) * time.Millisecond, Points: req.Points,
+	}
+	normalized, err := modbusgw.NormalizeConfig(cfg)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, err.Error())
+		return
+	}
+	saved, err := s.deps.Modbus.Upsert(r.Context(), normalized)
+	if err != nil {
+		s.fail(w, "保存 Modbus 配置", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": toModbusConfigDTO(saved)})
 }
 
 func (s *Service) handleOTATaskAction(w http.ResponseWriter, r *http.Request) {
@@ -581,6 +720,7 @@ func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
 		WarningLimit int64  `json:"warning_limit"`
 		HardLimit    int64  `json:"hard_limit"`
 		Window       string `json:"window"`
+		Enforcement  string `json:"enforcement"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "请求体非法")
@@ -590,7 +730,7 @@ func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "路径 metric 与请求体不一致")
 		return
 	}
-	p := quota.NormalizePolicy(quota.Policy{ProjectID: id.ProjectID, Metric: req.Metric, SoftLimit: req.SoftLimit, WarningLimit: req.WarningLimit, HardLimit: req.HardLimit, Window: req.Window})
+	p := quota.NormalizePolicy(quota.Policy{ProjectID: id.ProjectID, Metric: req.Metric, SoftLimit: req.SoftLimit, WarningLimit: req.WarningLimit, HardLimit: req.HardLimit, Window: req.Window, Enforcement: req.Enforcement})
 	if err := s.deps.Quota.SetPolicy(r.Context(), p, id.ActorID); err != nil {
 		writeError(w, http.StatusBadRequest, CodeInvalidArgument, err.Error())
 		return
@@ -792,8 +932,8 @@ func (s *Service) handleNotificationEndpoints(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "请求体非法")
 		return
 	}
-	if req.Channel != "webhook" && req.Channel != "email" && req.Channel != "sms" {
-		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "channel 必须是 webhook、email 或 sms")
+	if req.Channel != "webhook" && req.Channel != "email" && req.Channel != "sms" && req.Channel != "voice" {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "channel 必须是 webhook、email、sms 或 voice")
 		return
 	}
 	e, err := s.deps.Endpoints.Create(r.Context(), id.ProjectID, strings.TrimSpace(req.Name), req.Channel, strings.TrimSpace(req.Target))

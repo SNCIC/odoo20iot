@@ -23,6 +23,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/metering"
+	"github.com/SNCIC/odoo20iot/internal/modbusgw"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
@@ -46,6 +47,11 @@ func (v identityVerifier) Verify(context.Context, string) (apiauth.Identity, err
 }
 
 type fakeEndpointStore struct{}
+
+type fakeModbusStore struct {
+	configs []modbusgw.Config
+	deleted string
+}
 
 type fakeAlarmAcknowledger struct {
 	projectID int64
@@ -214,6 +220,19 @@ func (fakeEndpointStore) Create(_ context.Context, projectID int64, name, channe
 	return notifyconfig.Endpoint{ProjectID: projectID, Name: name, Channel: channel, Enabled: true}, nil
 }
 func (fakeEndpointStore) Delete(context.Context, int64, int64) error { return nil }
+
+func (f *fakeModbusStore) ListAll(context.Context, int64) ([]modbusgw.Config, error) {
+	return f.configs, nil
+}
+func (f *fakeModbusStore) Upsert(_ context.Context, cfg modbusgw.Config) (modbusgw.Config, error) {
+	cfg.ID = 1
+	f.configs = []modbusgw.Config{cfg}
+	return cfg, nil
+}
+func (f *fakeModbusStore) Delete(_ context.Context, _ int64, deviceKey string) error {
+	f.deleted = deviceKey
+	return nil
+}
 
 func (f *fakeReader) QuerySeries(ctx context.Context, _ tsdb.Plan, _ tsdb.SeriesQuery) (tsdb.SeriesResult, error) {
 	f.mu.Lock()
@@ -625,6 +644,48 @@ func TestQuotaPolicyScopesAndValidation(t *testing.T) {
 	svc.Handler().ServeHTTP(postRec, postReq)
 	if postRec.Code != http.StatusOK || store.saved.Metric != "api_calls" || store.saved.SoftLimit != 10 || store.saved.WarningLimit != 18 {
 		t.Fatalf("quota:write 应保存策略，得到 %d: %s", postRec.Code, postRec.Body.String())
+	}
+}
+
+func TestModbusConfigScopesAndCRUD(t *testing.T) {
+	svc, _ := newTestService(t, &fakeReader{}, nil)
+	store := &fakeModbusStore{configs: []modbusgw.Config{{
+		ID: 1, Enabled: true, ProjectID: 1, DeviceKey: "plc-1", Transport: "tcp",
+		Endpoint: "127.0.0.1:502", UnitID: 1, Interval: 10 * time.Second, Timeout: 5 * time.Second,
+		BaudRate: 9600, DataBits: 8, StopBits: 1, Parity: "none",
+		Points: []modbusgw.Point{{Name: "temperature", Address: 0, Type: "int16"}},
+	}}}
+	svc.deps.Modbus = store
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"telemetry:read"}}}
+	svc.mux = svc.routes()
+	if rec := get(t, svc.Handler(), "/api/v1/modbus/configs", "scoped"); rec.Code != http.StatusForbidden {
+		t.Fatalf("缺少 modbus:read 应拒绝，得到 %d", rec.Code)
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"modbus:read"}}}
+	svc.mux = svc.routes()
+	rec := get(t, svc.Handler(), "/api/v1/modbus/configs", "scoped")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "plc-1") || !strings.Contains(rec.Body.String(), "interval_ms") {
+		t.Fatalf("modbus:read 应返回配置，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	svc.deps.Verifier = identityVerifier{identity: apiauth.Identity{ProjectID: 1, Scopes: []string{"modbus:write"}}}
+	svc.mux = svc.routes()
+	postReq := httptest.NewRequest(http.MethodPost, "/api/v1/modbus/configs", strings.NewReader(`{"device_key":"plc-2","transport":"tcp","endpoint":"127.0.0.1:502","unit_id":1,"interval_ms":1000,"timeout_ms":500,"points":[{"name":"temperature","address":0,"type":"int16"}]}`))
+	postReq.Header.Set("Authorization", "Bearer scoped")
+	postRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusOK || len(store.configs) != 1 || store.configs[0].DeviceKey != "plc-2" {
+		t.Fatalf("modbus:write 应保存配置，得到 %d: %s", postRec.Code, postRec.Body.String())
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/modbus/configs/plc-2", nil)
+	deleteReq.Header.Set("Authorization", "Bearer scoped")
+	deleteRec := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK || store.deleted != "plc-2" {
+		t.Fatalf("modbus:write 应删除配置，得到 %d/%q", deleteRec.Code, store.deleted)
 	}
 }
 

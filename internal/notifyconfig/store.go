@@ -50,7 +50,7 @@ func (s *Store) Create(ctx context.Context, projectID int64, name, channel, targ
 	if name == "" || target == "" {
 		return Endpoint{}, fmt.Errorf("通知端点名称和目标不能为空")
 	}
-	if channel != "webhook" && channel != "email" && channel != "sms" {
+	if channel != "webhook" && channel != "email" && channel != "sms" && channel != "voice" {
 		return Endpoint{}, fmt.Errorf("通知通道非法")
 	}
 	ct, nonce, err := secureconfig.Encrypt(s.key, target)

@@ -35,6 +35,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/gateway"
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/pg"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
 func main() {
@@ -107,6 +108,31 @@ func main() {
 	if authPoolCloser != nil {
 		defer authPoolCloser()
 	}
+	quotaPool := authPool
+	quotaPoolCloser := func() {}
+	if quotaPool == nil {
+		quotaPool, err = pg.Open(context.Background(), pg.Config{DSN: *pgDSN})
+		if err != nil {
+			logger.Fatal("打开配额数据库失败", zap.Error(err))
+		}
+		quotaPoolCloser = quotaPool.Close
+	}
+	defer quotaPoolCloser()
+	quotaStore, err := quota.NewPGStore(quotaPool)
+	if err != nil {
+		logger.Fatal("初始化配额策略存储失败", zap.Error(err))
+	}
+	redisOpts, err := redis.ParseURL(*redisURL)
+	if err != nil {
+		logger.Fatal("解析 Redis 地址失败", zap.Error(err))
+	}
+	rdb := redis.NewClient(redisOpts)
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		_ = rdb.Close()
+		logger.Fatal("连接 Redis 失败", zap.Error(err))
+	}
+	defer func() { _ = rdb.Close() }()
+	quotaEnforcer := quota.NewEnforcer(quota.NewRedisCounter(rdb, quota.DefaultCounterTTL), quotaStore, 30*time.Second, gwLog)
 
 	// 总线不可达即拒绝启动：一个无法确认持久化的网关只会静默丢数据，
 	// 而「不回 PUBACK」在设备侧表现为重传风暴 —— 两者都不该被掩盖。
@@ -165,17 +191,6 @@ func main() {
 
 	var node *cluster.Node
 	if *clusterNodeID != "" {
-		redisOpts, err := redis.ParseURL(*redisURL)
-		if err != nil {
-			logger.Fatal("解析集群 Redis 地址失败", zap.Error(err))
-		}
-		rdb := redis.NewClient(redisOpts)
-		if err := rdb.Ping(context.Background()).Err(); err != nil {
-			_ = rdb.Close()
-			logger.Fatal("连接集群 Redis 失败", zap.Error(err))
-		}
-		defer func() { _ = rdb.Close() }()
-
 		node, err = cluster.New(context.Background(), cluster.Options{
 			ID:      *clusterNodeID,
 			Peers:   splitNonEmpty(*clusterPeers),
@@ -244,6 +259,7 @@ func main() {
 		AllowAnonymous: *allowAnonymous,
 		Cluster:        node,
 		Meter:          meterAcc,
+		QuotaEnforcer:  quotaEnforcer,
 	})
 	if err != nil {
 		logger.Fatal("启动 MQTT 接入失败", zap.Error(err))
@@ -260,7 +276,7 @@ func main() {
 	mux.HandleFunc("/healthz", healthz)
 	mux.HandleFunc("/metrics", metricsHandler(metrics, meterReporter.Metrics()))
 	if authenticator != nil {
-		httpIngest, err := gateway.NewHTTPIngestHandler(gateway.HTTPIngestOptions{Authenticator: authenticator, Publisher: pub, Router: gateway.ContractRouter{Project: *project, Shards: *shards}, Logger: gwLog, Timeout: *pubackTimeout, Metrics: metrics})
+		httpIngest, err := gateway.NewHTTPIngestHandler(gateway.HTTPIngestOptions{Authenticator: authenticator, Publisher: pub, Router: gateway.ContractRouter{Project: *project, Shards: *shards}, Logger: gwLog, Timeout: *pubackTimeout, Metrics: metrics, QuotaEnforcer: quotaEnforcer})
 		if err != nil {
 			logger.Fatal("初始化 HTTP 设备接入失败", zap.Error(err))
 		}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Odoo20IoT CoAP UDP gateway
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/xfusion/projects/odoo20iot/deploy/systemd/run-gw-coap.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

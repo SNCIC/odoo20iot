@@ -163,6 +163,7 @@ type Metrics struct {
 	HTTPIngestAccepted           atomic.Int64
 	HTTPIngestRejected           atomic.Int64
 	HTTPIngestPublishErrors      atomic.Int64
+	QuotaRejectedTotal           atomic.Int64
 
 	// ---- 认证与 ACL（06 §4：gw_connect_fail_total / gw_auth_cache_hit_ratio）----
 
@@ -224,6 +225,7 @@ func (m *Metrics) WriteProm(w io.Writer) {
 	writeMetric(w, "gw_http_ingest_accepted_total", "HTTP 设备上报持久化确认数", m.HTTPIngestAccepted.Load())
 	writeMetric(w, "gw_http_ingest_rejected_total", "HTTP 设备上报拒绝数", m.HTTPIngestRejected.Load())
 	writeMetric(w, "gw_http_ingest_publish_errors_total", "HTTP 设备上报发布失败数", m.HTTPIngestPublishErrors.Load())
+	writeMetric(w, "gw_quota_rejected_total", "因遥测硬配额拒绝的消息数", m.QuotaRejectedTotal.Load())
 
 	writeMetric(w, "gw_auth_success_total", "设备认证通过的连接数", m.AuthSuccessTotal.Load())
 	writeMetric(w, "gw_connect_fail_total", "设备认证失败的连接数（见 reason 维度）", m.ConnectFailTotal.Load())

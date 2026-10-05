@@ -44,6 +44,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/gateway"
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/metering"
+	"github.com/SNCIC/odoo20iot/internal/modbusgw"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/pg"
@@ -204,6 +205,10 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
+	modbusStore, err := modbusgw.NewStore(pool)
+	if err != nil {
+		return err
+	}
 	alarmStore, err := alarm.NewPGStore(pool)
 	if err != nil {
 		return err
@@ -351,6 +356,7 @@ func run(cfg config) error {
 		Reader:             gres,
 		Latest:             latest.NewRedisStore(latestRedis),
 		Endpoints:          endpointStore,
+		Modbus:             modbusStore,
 		Alarms:             alarmStore,
 		Quota:              quotaStore,
 		Commands:           commandService,

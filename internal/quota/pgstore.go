@@ -15,12 +15,13 @@ import (
 type PGStore struct{ pool *pgxpool.Pool }
 
 type Policy struct {
-	ProjectID    int64
-	Metric       string
-	SoftLimit    int64
-	WarningLimit int64
-	HardLimit    int64
-	Window       string
+	ProjectID    int64  `json:"project_id"`
+	Metric       string `json:"metric"`
+	SoftLimit    int64  `json:"soft_limit"`
+	WarningLimit int64  `json:"warning_limit"`
+	HardLimit    int64  `json:"hard_limit"`
+	Window       string `json:"window"`
+	Enforcement  string `json:"enforcement"`
 }
 
 var AllowedMetrics = map[string]struct{}{
@@ -30,14 +31,14 @@ var AllowedMetrics = map[string]struct{}{
 func (s *PGStore) Policies(ctx context.Context, projectID int64) ([]Policy, error) {
 	var out []Policy
 	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT project_id,metric,soft_limit,warning_limit,hard_limit,window_kind FROM t_quota_policy WHERE project_id=$1 AND enabled ORDER BY metric`, projectID)
+		rows, err := tx.Query(ctx, `SELECT project_id,metric,soft_limit,warning_limit,hard_limit,window_kind,enforcement_mode FROM t_quota_policy WHERE project_id=$1 AND enabled ORDER BY metric`, projectID)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var p Policy
-			if err := rows.Scan(&p.ProjectID, &p.Metric, &p.SoftLimit, &p.WarningLimit, &p.HardLimit, &p.Window); err != nil {
+			if err := rows.Scan(&p.ProjectID, &p.Metric, &p.SoftLimit, &p.WarningLimit, &p.HardLimit, &p.Window, &p.Enforcement); err != nil {
 				return err
 			}
 			out = append(out, p)
@@ -49,7 +50,10 @@ func (s *PGStore) Policies(ctx context.Context, projectID int64) ([]Policy, erro
 
 func (s *PGStore) SetPolicy(ctx context.Context, p Policy, actor string) error {
 	p = NormalizePolicy(p)
-	if p.ProjectID <= 0 || p.Metric == "" || p.SoftLimit < 0 || p.HardLimit < p.SoftLimit || (p.Window != "day" && p.Window != "month") {
+	if p.Enforcement == "" {
+		p.Enforcement = EnforcementReject
+	}
+	if p.ProjectID <= 0 || p.Metric == "" || p.SoftLimit < 0 || p.HardLimit < p.SoftLimit || (p.Window != "day" && p.Window != "month") || !ValidEnforcement(p.Enforcement) {
 		return fmt.Errorf("quota: 策略字段非法")
 	}
 	if p.WarningLimit < p.SoftLimit || p.WarningLimit > p.HardLimit {
@@ -62,6 +66,9 @@ func (s *PGStore) SetPolicy(ctx context.Context, p Policy, actor string) error {
 }
 
 func NormalizePolicy(p Policy) Policy {
+	if p.Enforcement == "" {
+		p.Enforcement = EnforcementReject
+	}
 	if p.HardLimit > 0 {
 		if p.SoftLimit == 0 {
 			p.SoftLimit = percentThreshold(p.HardLimit, 80)
@@ -75,10 +82,10 @@ func NormalizePolicy(p Policy) Policy {
 
 func (s *PGStore) writePolicy(ctx context.Context, p Policy, actor string) error {
 	return pg.WithProjectTx(ctx, s.pool, p.ProjectID, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO t_quota_policy(project_id,metric,soft_limit,warning_limit,hard_limit,window_kind,enabled,updated_at) VALUES($1,$2,$3,$4,$5,$6,true,now()) ON CONFLICT(project_id,metric) DO UPDATE SET soft_limit=EXCLUDED.soft_limit,warning_limit=EXCLUDED.warning_limit,hard_limit=EXCLUDED.hard_limit,window_kind=EXCLUDED.window_kind,enabled=true,updated_at=now()`, p.ProjectID, p.Metric, p.SoftLimit, p.WarningLimit, p.HardLimit, p.Window); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO t_quota_policy(project_id,metric,soft_limit,warning_limit,hard_limit,window_kind,enforcement_mode,enabled,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,true,now()) ON CONFLICT(project_id,metric) DO UPDATE SET soft_limit=EXCLUDED.soft_limit,warning_limit=EXCLUDED.warning_limit,hard_limit=EXCLUDED.hard_limit,window_kind=EXCLUDED.window_kind,enforcement_mode=EXCLUDED.enforcement_mode,enabled=true,updated_at=now()`, p.ProjectID, p.Metric, p.SoftLimit, p.WarningLimit, p.HardLimit, p.Window, p.Enforcement); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO t_audit_log(project_id,action,actor_id,resource_type,resource_id,details) VALUES($1,'quota.policy.upsert',$2,'quota_policy',$3,jsonb_build_object('soft_limit',$4,'warning_limit',$5,'hard_limit',$6,'window',$7))`, p.ProjectID, actor, p.Metric, p.SoftLimit, p.WarningLimit, p.HardLimit, p.Window)
+		_, err := tx.Exec(ctx, `INSERT INTO t_audit_log(project_id,action,actor_id,resource_type,resource_id,details) VALUES($1,'quota.policy.upsert',$2,'quota_policy',$3,jsonb_build_object('soft_limit',$4,'warning_limit',$5,'hard_limit',$6,'window',$7,'enforcement',$8))`, p.ProjectID, actor, p.Metric, p.SoftLimit, p.WarningLimit, p.HardLimit, p.Window, p.Enforcement)
 		return err
 	})
 }
@@ -158,7 +165,7 @@ func NewPGStore(pool *pgxpool.Pool) (*PGStore, error) {
 }
 
 func (s *PGStore) Record(ctx context.Context, report metering.UsageReport, metric string, delta int64) error {
-	if report.ProjectID <= 0 || metric == "" || delta <= 0 {
+	if report.ProjectID <= 0 || metric == "" || delta < 0 || (delta == 0 && !isLatestSnapshotMetric(metric)) {
 		return fmt.Errorf("quota: project_id、metric 和正增量必填")
 	}
 	reportID := strings.TrimSpace(report.ReportID)
@@ -189,7 +196,7 @@ func (s *PGStore) Total(ctx context.Context, projectID int64, metric string) (in
 func (s *PGStore) Policy(ctx context.Context, projectID int64, metric string) (Policy, error) {
 	var p Policy
 	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT project_id, metric, soft_limit, warning_limit, hard_limit, window_kind FROM t_quota_policy WHERE project_id=$1 AND metric=$2 AND enabled`, projectID, metric).Scan(&p.ProjectID, &p.Metric, &p.SoftLimit, &p.WarningLimit, &p.HardLimit, &p.Window)
+		return tx.QueryRow(ctx, `SELECT project_id, metric, soft_limit, warning_limit, hard_limit, window_kind, enforcement_mode FROM t_quota_policy WHERE project_id=$1 AND metric=$2 AND enabled`, projectID, metric).Scan(&p.ProjectID, &p.Metric, &p.SoftLimit, &p.WarningLimit, &p.HardLimit, &p.Window, &p.Enforcement)
 	})
 	return p, err
 }
@@ -297,8 +304,14 @@ func (s *PGStore) DailyTotal(ctx context.Context, projectID int64, metric string
 
 func (s *PGStore) dailyTotal(ctx context.Context, projectID int64, metric string, since, until time.Time) (int64, error) {
 	var total int64
+	if isLatestSnapshotMetric(metric) {
+		err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT COALESCE((SELECT delta FROM t_quota_usage WHERE project_id=$1 AND metric=$2 AND window_start >= $3 AND ($4::timestamptz IS NULL OR window_start < $4) ORDER BY window_start DESC, created_at DESC LIMIT 1),0)`, projectID, metric, since, nullableTime(until)).Scan(&total)
+		})
+		return total, err
+	}
 	aggregate := "sum(delta)"
-	if metric == metering.MetricConnPeak {
+	if isSnapshotMetric(metric) {
 		aggregate = "max(delta)"
 	}
 	err := pg.WithProjectTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {

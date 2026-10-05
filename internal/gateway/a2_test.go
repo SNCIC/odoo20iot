@@ -467,6 +467,7 @@ func TestAcker_AwaitPersist(t *testing.T) {
 			t.Fatal("PublishErrorTotal 未累加")
 		}
 	})
+
 }
 
 func TestAcker_PublishQoS0(t *testing.T) {
@@ -513,6 +514,17 @@ func TestContractRouter(t *testing.T) {
 			if _, err := r.Route(nil, packetWithTopic(topic)); !errors.Is(err, ErrUnroutableTopic) {
 				t.Fatalf("topic %q 应被拒绝，得到 %v", topic, err)
 			}
+		}
+	})
+
+	t.Run("网关子设备稳定分片", func(t *testing.T) {
+		got, err := r.Route(nil, packetWithTopic("v1/gateways/gw-1/devices/sub-7/telemetry"))
+		if err != nil {
+			t.Fatalf("子设备 topic 不应报错: %v", err)
+		}
+		want := fmt.Sprintf("iot.telemetry.p1.shard.%d", hashShard("gw-1/sub-7", 8))
+		if got != want {
+			t.Fatalf("期望 %s，得到 %s", want, got)
 		}
 	})
 }

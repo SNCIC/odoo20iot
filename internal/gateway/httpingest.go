@@ -12,6 +12,7 @@ import (
 
 	"github.com/SNCIC/odoo20iot/internal/auth"
 	"github.com/SNCIC/odoo20iot/internal/envelope"
+	"github.com/SNCIC/odoo20iot/internal/quota"
 )
 
 const MaxHTTPPayloadBytes = 32 << 10
@@ -23,15 +24,17 @@ type HTTPIngestOptions struct {
 	Logger        *slog.Logger
 	Timeout       time.Duration
 	Metrics       *Metrics
+	QuotaEnforcer *quota.Enforcer
 }
 
 type HTTPIngestHandler struct {
-	auth    *auth.Authenticator
-	acker   *Acker
-	router  ContractRouter
-	logger  *slog.Logger
-	timeout time.Duration
-	metrics *Metrics
+	auth          *auth.Authenticator
+	acker         *Acker
+	router        ContractRouter
+	logger        *slog.Logger
+	timeout       time.Duration
+	metrics       *Metrics
+	quotaEnforcer *quota.Enforcer
 }
 
 func NewHTTPIngestHandler(opts HTTPIngestOptions) (*HTTPIngestHandler, error) {
@@ -47,7 +50,7 @@ func NewHTTPIngestHandler(opts HTTPIngestOptions) (*HTTPIngestHandler, error) {
 	if opts.Metrics == nil {
 		opts.Metrics = new(Metrics)
 	}
-	return &HTTPIngestHandler{auth: opts.Authenticator, acker: NewAcker(opts.Publisher, opts.Timeout, opts.Metrics), router: opts.Router, logger: opts.Logger, timeout: opts.Timeout, metrics: opts.Metrics}, nil
+	return &HTTPIngestHandler{auth: opts.Authenticator, acker: NewAcker(opts.Publisher, opts.Timeout, opts.Metrics), router: opts.Router, logger: opts.Logger, timeout: opts.Timeout, metrics: opts.Metrics, quotaEnforcer: opts.QuotaEnforcer}, nil
 }
 
 func (h *HTTPIngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +116,14 @@ func (h *HTTPIngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		reject(http.StatusInternalServerError, `{"error":"envelope_failed"}`)
 		return
+	}
+	if h.quotaEnforcer != nil {
+		decision, reserveErr := h.quotaEnforcer.ReserveTelemetry(r.Context(), result.ProjectID, false)
+		if reserveErr != nil || !decision.Allowed {
+			h.metrics.QuotaRejectedTotal.Add(1)
+			reject(http.StatusTooManyRequests, `{"error":"quota_exceeded"}`)
+			return
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()

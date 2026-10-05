@@ -1,13 +1,9 @@
-// Package notify 实现 04 §2.3 的通知分发：三条通道（Webhook / 邮件 / 短信）、
+// Package notify 实现 04 §2.3 的通知分发：四条可选通道（Webhook / 邮件 / 短信 / 语音）、
 // 按优先级的降级、重试阶梯与死信。
 //
 // 边界：本包**不做状态机**（那是 svc-alarm 的事），也不决定「谁该被通知」
 // （那是通知策略的事，见 PolicyResolver）。它只回答一个问题：
 // 给定一条已渲染的通知与一条策略，**怎样把它可靠地送到人手上**。
-//
-// 三通道而非四通道：04 §2.3 列的是「Webhook → 邮件 → 短信 → 语音」四档，
-// 而 06 的 Phase 2 验收项写的是「Webhook / 邮件 / 短信，3 通道」。
-// 语音需要运营商语音网关，本期不做（如实留白，不做假实现）。
 package notify
 
 import (
@@ -22,6 +18,7 @@ const (
 	ChannelWebhook = "webhook"
 	ChannelEmail   = "email"
 	ChannelSMS     = "sms"
+	ChannelVoice   = "voice"
 )
 
 // ErrPermanent 表示重试无意义的失败。
@@ -73,7 +70,7 @@ type Policy struct {
 	Channels []string
 	// Template 是模板名（04 §2.4 的 notify.template）。
 	Template string
-	// Recipients 按通道名给收件人：webhook 是 URL、email 是地址、sms 是号码。
+	// Recipients 按通道名给收件人：webhook 是 URL、email 是地址、sms/voice 是号码。
 	Recipients map[string][]string
 	// EscalatedRecipients 是升级事件的专用收件人；为空时沿用 Recipients。
 	EscalatedRecipients map[string][]string

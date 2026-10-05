@@ -14,6 +14,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/cluster"
 	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/latest"
+	"github.com/SNCIC/odoo20iot/internal/modbusgw"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
@@ -37,6 +38,12 @@ type NotificationEndpointStore interface {
 	List(context.Context, int64) ([]notifyconfig.Endpoint, error)
 	Create(context.Context, int64, string, string, string) (notifyconfig.Endpoint, error)
 	Delete(context.Context, int64, int64) error
+}
+
+type ModbusConfigStore interface {
+	ListAll(context.Context, int64) ([]modbusgw.Config, error)
+	Upsert(context.Context, modbusgw.Config) (modbusgw.Config, error)
+	Delete(context.Context, int64, string) error
 }
 
 type AlarmAcknowledger interface {
@@ -134,6 +141,7 @@ type Deps struct {
 	Reader             SeriesReader
 	Latest             LatestReader
 	Endpoints          NotificationEndpointStore
+	Modbus             ModbusConfigStore
 	Alarms             AlarmAcknowledger
 	Quota              QuotaPolicyStore
 	Commands           CommandIssuer

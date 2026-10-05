@@ -84,6 +84,20 @@ func (c *RedisCounter) IncrBy(ctx context.Context, projectID int64, metric strin
 
 func (c *RedisCounter) IncrReport(ctx context.Context, projectID int64, reportID, metric string, delta int64) (int64, error) {
 	key := CounterKey(projectID, metric, c.now())
+	if isLatestSnapshotMetric(metric) {
+		dedupeKey := fmt.Sprintf("quota:report:%d:%s:%s", projectID, metric, reportID)
+		script := redis.NewScript(`
+if redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[2]) then
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+end
+return redis.call('GET', KEYS[1]) or '0'
+`)
+		value, err := script.Run(ctx, c.rdb, []string{key, dedupeKey}, delta, int64(c.ttl.Seconds())).Int64()
+		if err != nil {
+			return 0, fmt.Errorf("幂等更新快照 %s: %w", key, err)
+		}
+		return value, nil
+	}
 	if metric == metering.MetricConnPeak {
 		script := redis.NewScript(`
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -111,6 +125,10 @@ return redis.call('GET', KEYS[1]) or '0'
 		return 0, fmt.Errorf("幂等累加计数器 %s: %w", key, err)
 	}
 	return value, nil
+}
+
+func isSnapshotMetric(metric string) bool {
+	return metric == metering.MetricConnPeak || metric == metering.MetricDeviceCount || metric == metering.MetricStorageBytes
 }
 
 func (c *RedisCounter) Daily(ctx context.Context, projectID int64, metric string, day time.Time) (int64, error) {
@@ -187,7 +205,7 @@ func (a *Aggregator) Apply(ctx context.Context, data []byte) error {
 	}
 
 	for metric, delta := range report.Counters {
-		if delta == 0 {
+		if delta == 0 && !isLatestSnapshotMetric(metric) {
 			continue
 		}
 		if delta < 0 || !validMetric(metric) {
@@ -241,4 +259,8 @@ func validMetric(metric string) bool {
 	default:
 		return false
 	}
+}
+
+func isLatestSnapshotMetric(metric string) bool {
+	return metric == metering.MetricDeviceCount || metric == metering.MetricStorageBytes
 }

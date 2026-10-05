@@ -1,11 +1,9 @@
-// Command svc-notify 是 04 §2.3 的通知服务：消费告警事件，按策略分发到三条通道。
+// Command svc-notify 是 04 §2.3 的通知服务：消费告警事件，按策略分发到四条可选通道。
 //
 // 职责边界：
 //   - 本服务**不判断告警状态**（那是 svc-alarm 的 FSM），也不决定「有没有告警」。
 //     它只做一件事：把已经进入 active 的告警，按策略送到人手上。
-//   - 通道只有三条（Webhook / 邮件 / 短信）—— 04 §2.3 列了四档（含语音），
-//     而 06 的 Phase 2 验收项写的是「Webhook / 邮件 / 短信，3 通道」。
-//     语音需要运营商语音网关，本期不做（如实留白，不做假实现）。
+//   - 通道支持 Webhook / 邮件 / 短信 / 语音；语音需配置兼容的 HTTP 语音网关。
 //   - 死信落 `t_dlq`（04 §3.3），条目含原文、失败原因、重试历史与 trace_id。
 //
 // 订阅：`iot.alarm.>`（svc-alarm 对外事件）与 `iot.quota.alert.>`（svc-quota 阈值事件），
@@ -97,6 +95,11 @@ type config struct {
 	smsToken    string
 	smsSender   string
 	smsTemplate string
+	// 语音
+	voiceEndpoint string
+	voiceToken    string
+	voiceFrom     string
+	voiceTimeout  time.Duration
 	// 策略
 	policyFile        string
 	policySource      string
@@ -104,6 +107,7 @@ type config struct {
 	defaultWebhooks   string
 	defaultEmails     string
 	defaultSMSTo      string
+	defaultVoiceTo    string
 	defaultTemplate   string
 	healthThreshold   float64
 	healthMinSamples  int
@@ -156,6 +160,9 @@ func parseFlags() config {
 	flag.StringVar(&cfg.smsEndpoint, "sms-endpoint", "", "短信网关地址；留空则不启用短信通道")
 	flag.StringVar(&cfg.smsSender, "sms-sender", "", "短信签名")
 	flag.StringVar(&cfg.smsTemplate, "sms-template", "", "短信模板 ID")
+	flag.StringVar(&cfg.voiceEndpoint, "voice-endpoint", os.Getenv("IOT_VOICE_ENDPOINT"), "语音网关地址；留空则不启用语音通道")
+	flag.StringVar(&cfg.voiceFrom, "voice-from", os.Getenv("IOT_VOICE_FROM"), "语音主叫号码或服务标识")
+	flag.DurationVar(&cfg.voiceTimeout, "voice-timeout", 10*time.Second, "语音网关超时")
 
 	flag.StringVar(&cfg.policyFile, "policy-file", "", "通知策略文件（JSON）；留空用下面的默认策略")
 	flag.StringVar(&cfg.policySource, "policy-source", "db", "通知策略来源：db 或 file")
@@ -163,6 +170,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.defaultWebhooks, "default-webhook-to", "", "默认 Webhook 收件人（逗号分隔 URL）")
 	flag.StringVar(&cfg.defaultEmails, "default-email-to", "", "默认邮件收件人（逗号分隔）")
 	flag.StringVar(&cfg.defaultSMSTo, "default-sms-to", "", "默认短信收件人（逗号分隔号码）")
+	flag.StringVar(&cfg.defaultVoiceTo, "default-voice-to", "", "默认语音收件人（逗号分隔号码）")
 	flag.StringVar(&cfg.defaultTemplate, "default-template", "alarm", "默认模板名")
 	flag.Float64Var(&cfg.healthThreshold, "channel-failure-threshold", 0.3, "通道失败率阈值（04 §2.3：0.3）")
 	flag.IntVar(&cfg.healthMinSamples, "channel-min-samples", 5, "通道健康判定的最小样本数")
@@ -184,6 +192,7 @@ func parseFlags() config {
 	// 凭据优先取环境变量，避免出现在命令行历史与 ps 输出里。
 	cfg.smtpPass = os.Getenv("SMTP_PASS")
 	cfg.smsToken = os.Getenv("SMS_TOKEN")
+	cfg.voiceToken = os.Getenv("IOT_VOICE_TOKEN")
 	return cfg
 }
 
@@ -395,6 +404,7 @@ func defaultPolicy(cfg config) notify.Policy {
 			notify.ChannelWebhook: appendIfSet(splitList(cfg.defaultWebhooks), cfg.webhookURL),
 			notify.ChannelEmail:   splitList(cfg.defaultEmails),
 			notify.ChannelSMS:     splitList(cfg.defaultSMSTo),
+			notify.ChannelVoice:   splitList(cfg.defaultVoiceTo),
 		},
 	}
 }
@@ -438,6 +448,12 @@ func buildChannels(cfg config, guard *notify.Guard, logger *slog.Logger) (map[st
 			cfg.smsToken, cfg.smsSender, cfg.smsTemplate, 5*time.Second)
 	} else {
 		logger.Warn("未配置短信网关，短信通道不可用")
+	}
+	if cfg.voiceEndpoint != "" {
+		out[notify.ChannelVoice] = notify.NewVoiceChannel(guard, cfg.voiceEndpoint,
+			cfg.voiceToken, cfg.voiceFrom, cfg.voiceTimeout)
+	} else {
+		logger.Warn("未配置语音网关，语音通道不可用")
 	}
 	return out, nil
 }

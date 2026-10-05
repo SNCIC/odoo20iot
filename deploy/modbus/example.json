@@ -1,0 +1,14 @@
+{
+  "transport": "tcp",
+  "project_id": 1,
+  "device_key": "modbus-plc-1",
+  "device_id": 0,
+  "device_type_id": 0,
+  "endpoint": "127.0.0.1:502",
+  "unit_id": 1,
+  "interval": 10000000000,
+  "points": [
+    {"name": "temperature", "address": 0, "type": "int16", "scale": 0.1, "unit": "C"},
+    {"name": "pressure", "address": 1, "type": "uint16", "scale": 0.01, "unit": "bar"}
+  ]
+}

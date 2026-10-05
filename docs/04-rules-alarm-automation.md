@@ -491,7 +491,7 @@ utils.math.clamp(v, min, max), utils.json.parse/stringify
   ├─ 1. 解析通知策略（rule.notify）：通知组 / 通道 / 模板 / 静默规则
   ├─ 2. 模板渲染（Go text/template，支持过滤器）
   ├─ 3. 通道分发（svc-notify，按优先级 + 降级）：
-  │       Webhook（钉钉/飞书/企微）→ 邮件 → 短信 → 语音
+  │       Webhook（钉钉/飞书/企微）→ 邮件 → 短信 → 语音（可选 HTTP 语音网关）
   │       失败降级：短信拥塞（失败率 > 30%）自动切换邮件
   ├─ 4. 记录 t_alarm.notify_count、通知结果
   └─ 5. 未确认升级：30 min 未确认 → 通知上级；2 h → P1 升级
@@ -756,7 +756,7 @@ Client-side  → shadow.reported（单向，只由设备写）
 
 **实现**：网关/查询服务/管道本地累加 → 每 10s 通过 NATS 批量上报 `iot.quota.usage`（每批带稳定 `report_id`）→ `svc-quota` 用 `report_id` 幂等写 Redis 计数器并按批次落 PG（幂等键为 `(project_id, metric, report_id)`）→ 每小时执行对账；只修正已关闭的昨天窗口，当前窗口只观测，差异 > 1% 告警。
 
-**超配额处理**：分级预警（80% / 90% / 100%）。Phase 1 只做阈值告警；Phase 2 接入 `quota.Reserve` 业务路径并按租户策略执行 `throttle` / `reject`；`cmd` 与状态查询永不被配额拒绝（保证可运维性）。
+**超配额处理**：分级预警（80% / 90% / 100%）。Phase 2 已接入 `quota.Reserve`：MQTT 与 HTTP 遥测写入在进入 NATS 前按租户策略执行 `reject` 或有限重试的 `throttle`；配额策略读取或 Redis 故障时降级放行并记录。`cmd`、状态查询、命令和 OTA 永不被遥测配额拒绝（保证可运维性）。`device_count` 与 `storage_bytes` 已由 `svc-quota` 定时快照采集，当前存储量口径为租户已登记 OTA 固件字节数；遥测表和对象存储容量待对应存储服务提供精确统计后合并。
 
 ---
 
