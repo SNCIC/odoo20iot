@@ -65,6 +65,32 @@ func (r ContractRouter) Route(_ *mqtt.Client, pk packets.Packet) (string, error)
 	return fmt.Sprintf("iot.%s.%s.shard.%d", stream, r.Project, shard), nil
 }
 
+// RouteHTTP 将 HTTP 设备上报映射到与 MQTT 相同的分片 subject。
+func (r ContractRouter) RouteHTTP(deviceKey, stream string) (string, error) {
+	return r.routeHTTP(deviceKey, stream, r.Project)
+}
+
+func (r ContractRouter) RouteHTTPProject(deviceKey, stream string, projectID int64) (string, error) {
+	if projectID <= 0 {
+		return "", fmt.Errorf("%w: project_id 非法", ErrUnroutableTopic)
+	}
+	return r.routeHTTP(deviceKey, stream, fmt.Sprintf("%d", projectID))
+}
+
+func (r ContractRouter) routeHTTP(deviceKey, stream, project string) (string, error) {
+	if strings.TrimSpace(deviceKey) == "" || strings.TrimSpace(stream) == "" || strings.ContainsAny(deviceKey+stream, "/+#.") {
+		return "", fmt.Errorf("%w: HTTP device_key/stream 非法", ErrUnroutableTopic)
+	}
+	shards := r.Shards
+	if shards <= 0 {
+		shards = DefaultShards
+	}
+	if strings.TrimSpace(project) == "" || strings.ContainsAny(project, ". /+#") {
+		return "", fmt.Errorf("%w: project 非法", ErrUnroutableTopic)
+	}
+	return fmt.Sprintf("iot.%s.%s.shard.%d", stream, project, hashShard(deviceKey, shards)), nil
+}
+
 // hashShard 用 FNV-1a 做分片，保证同一设备恒定落同一分片（规则 prev 上下文与影子合并的前提）。
 func hashShard(deviceKey string, shards int) int {
 	h := fnv.New32a()

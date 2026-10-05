@@ -36,6 +36,9 @@ systemctl --user enable --now odoo20iot-iot-gateway.service
 systemctl --user enable --now odoo20iot-svc-quota.service
 ```
 
+网关 HTTP 设备接入：`POST /ingest/v1/devices/{device_key}/{stream}`。设备使用
+`X-Device-Secret` 认证并提交 JSON；该入口只在设备认证器启用时注册，匿名开发模式不会开放，避免无法确认租户归属。
+
 真实密钥禁止写入 unit、命令行、Git 或日志。
 
 构建并启动连接器：

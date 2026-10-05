@@ -259,6 +259,15 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	mux.HandleFunc("/metrics", metricsHandler(metrics, meterReporter.Metrics()))
+	if authenticator != nil {
+		httpIngest, err := gateway.NewHTTPIngestHandler(gateway.HTTPIngestOptions{Authenticator: authenticator, Publisher: pub, Router: gateway.ContractRouter{Project: *project, Shards: *shards}, Logger: gwLog, Timeout: *pubackTimeout})
+		if err != nil {
+			logger.Fatal("初始化 HTTP 设备接入失败", zap.Error(err))
+		}
+		mux.Handle("/ingest/v1/devices/", httpIngest)
+	} else {
+		logger.Warn("HTTP 设备接入已禁用：匿名开发模式没有可用于信封归属的设备身份")
+	}
 
 	srv := &http.Server{
 		Addr:              *httpAddr,

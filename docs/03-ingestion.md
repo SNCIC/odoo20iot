@@ -2,6 +2,22 @@
 
 ## 1. 接入网关总体设计
 
+### 1.0 HTTP 设备接入（DTU / 扫码枪，2026-10-05）
+
+存量 DTU、扫码枪可通过 `POST /ingest/v1/devices/{device_key}/{stream}` 上报 JSON，入口与 MQTT 共用设备级凭据、统一信封和 NATS JetStream 持久化确认。设备凭据放在 `X-Device-Secret` 请求头，服务端按 `device_key` 查找设备并校验 B 档 secret；未认证、非法 JSON、非法路径和超过 32 KiB 的请求直接拒绝。
+
+示例：
+
+```bash
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'X-Device-Secret: <device-secret>' \
+  'https://<gateway>/ingest/v1/devices/dtu-001/telemetry' \
+  -d '{"temperature":25.3,"barcode":"6901234567890"}'
+```
+
+响应 `200` 代表消息已经得到 JetStream 持久化确认，并返回 `trace_id`；返回 `503` 时设备应按自身重试策略重发。HTTP 接入只负责 JSON 上报，不在网关解析 DTU 私有帧；DTU 或扫码枪应在本地转换为统一 JSON，二进制/私有 TCP 透传仍属于后续 `gw-tcp` 范围。生产环境应由 HTTPS 反向代理或独立 TLS 入口保护 HTTP 设备流量，禁止明文公网接入。
+
 ### 1.1 目标
 
 - 单集群支撑 **100 万并发 MQTT 连接**，可线性扩展至 1000 万。
