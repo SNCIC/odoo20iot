@@ -2,7 +2,8 @@ import { request } from '@/api/client'
 import type { Firmware, OTAArtifact, OTARollout, OTATask, OTATaskDevice } from '@/types/api'
 
 export function listFirmwares() {
-  return request<{ ok: true; firmwares: Firmware[] }>({ method: 'GET', url: '/ota/firmwares' })
+  return request<{ ok: true; firmwares: Firmware[] | null }>({ method: 'GET', url: '/ota/firmwares' })
+    .then((response) => ({ ...response, firmwares: response.firmwares ?? [] }))
 }
 
 export function uploadArtifact(file: File) {
@@ -31,7 +32,8 @@ export function registerFirmware(data: RegisterFirmwareRequest) {
 }
 
 export function listTasks() {
-  return request<{ ok: true; tasks: OTATask[] }>({ method: 'GET', url: '/ota/tasks' })
+  return request<{ ok: true; tasks: OTATask[] | null }>({ method: 'GET', url: '/ota/tasks' })
+    .then((response) => ({ ...response, tasks: response.tasks ?? [] }))
 }
 
 export interface CreateTaskRequest {
@@ -53,10 +55,10 @@ export function getTask(taskId: string) {
 }
 
 export function getTaskDevices(taskId: string) {
-  return request<{ ok: true; task: OTATask; devices: OTATaskDevice[] }>({
+  return request<{ ok: true; task: OTATask; devices: OTATaskDevice[] | null }>({
     method: 'GET',
     url: `/ota/tasks/${encodeURIComponent(taskId)}/devices`,
-  })
+  }).then((response) => ({ ...response, devices: response.devices ?? [] }))
 }
 
 export function startTask(taskId: string) {

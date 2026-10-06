@@ -21,7 +21,12 @@ function defaultPolicy(metric: string): QuotaPolicy {
 }
 
 function policyFor(metric: string) {
-  return policies.value.find((item) => item.metric === metric) as QuotaPolicy
+  let policy = policies.value.find((item) => item.metric === metric)
+  if (!policy) {
+    policy = defaultPolicy(metric)
+    policies.value.push(policy)
+  }
+  return policy
 }
 
 async function load() {

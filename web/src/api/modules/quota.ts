@@ -2,7 +2,8 @@ import { request } from '@/api/client'
 import type { QuotaPolicy } from '@/types/api'
 
 export function listPolicies() {
-  return request<{ ok: true; policies: QuotaPolicy[] }>({ method: 'GET', url: '/quota/policies' })
+  return request<{ ok: true; policies: QuotaPolicy[] | null }>({ method: 'GET', url: '/quota/policies' })
+    .then((response) => ({ ...response, policies: response.policies ?? [] }))
 }
 
 export function savePolicy(policy: QuotaPolicy) {

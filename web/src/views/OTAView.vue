@@ -26,7 +26,7 @@ async function load() {
   loading.value = true
   try {
     const [firmwareResponse, taskResponse] = await Promise.all([listFirmwares(), listTasks()])
-    firmwares.value = firmwareResponse.firmwares
+    firmwares.value = firmwareResponse.firmwares ?? []
     tasks.value = taskResponse.tasks || []
     if (!taskForm.value.firmware_id) taskForm.value.firmware_id = firmwares.value[0]?.id
     await deviceStore.load({ limit: 100 })
@@ -120,7 +120,7 @@ async function inspect(task: OTATask) {
   taskLoading.value = true
   selectedTask.value = task
   try {
-    taskDevices.value = (await getTaskDevices(task.id)).devices
+    taskDevices.value = (await getTaskDevices(task.id)).devices ?? []
   } catch (cause) {
     ElMessage.error(cause instanceof Error ? cause.message : '读取任务进度失败')
   } finally {

@@ -580,6 +580,9 @@ func (s *Service) handleOTAFirmwares(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, "读取 OTA 固件", err)
 			return
 		}
+		if items == nil {
+			items = []ota.Firmware{}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "firmwares": items})
 		return
 	}
@@ -629,6 +632,9 @@ func (s *Service) handleOTATasks(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.fail(w, "读取 OTA 任务", err)
 			return
+		}
+		if items == nil {
+			items = []ota.Task{}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": items})
 		return
@@ -713,6 +719,9 @@ func (s *Service) handleOTATask(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.fail(w, "读取 OTA 设备任务", err)
 			return
+		}
+		if devices == nil {
+			devices = []ota.TaskDevice{}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task": task, "devices": devices})
 		return
@@ -852,6 +861,9 @@ func (s *Service) handleQuotaPolicies(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.fail(w, "读取配额策略", err)
 			return
+		}
+		if items == nil {
+			items = []quota.Policy{}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "policies": items})
 		return
