@@ -130,7 +130,7 @@ func (s *Store) LoadEnabled(ctx context.Context, projectID string, schema *rules
 	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT rule_id, rule_name, level, priority, "match", "window", dag, capabilities, error_policy, version, effective_from
 FROM t_alarm_rule
-WHERE project_id=$1 AND enabled AND (effective_from IS NULL OR effective_from <= now())
+WHERE project_id=$1 AND deleted_at IS NULL AND enabled AND (effective_from IS NULL OR effective_from <= now())
   AND COALESCE("match"->>'expr', '') <> ''
 ORDER BY priority, rule_id, version DESC`, projectID)
 		if err != nil {
@@ -177,7 +177,7 @@ func (s *Store) List(ctx context.Context, projectID string) ([]Rule, error) {
 		rows, err := tx.Query(ctx, `
 SELECT rule_id, rule_name, level, enabled, priority, version, "match", dag
 FROM t_alarm_rule
-WHERE project_id=$1
+WHERE project_id=$1 AND deleted_at IS NULL
 ORDER BY priority, rule_id, version DESC`, projectID)
 		if err != nil {
 			return err
@@ -211,7 +211,7 @@ func (s *Store) SetEnabled(ctx context.Context, projectID, ruleID string, enable
 		err := tx.QueryRow(ctx, `
 UPDATE t_alarm_rule
 SET enabled=$3, version=version+1, updated_at=now()
-WHERE project_id=$1 AND rule_id=$2
+WHERE project_id=$1 AND rule_id=$2 AND deleted_at IS NULL
 RETURNING rule_id, rule_name, level, enabled, priority, version`, projectID, ruleID, enabled).
 			Scan(&rule.RuleID, &rule.Name, &rule.Level, &rule.Enabled, &rule.Priority, &rule.Version)
 		if err != nil {
@@ -239,7 +239,7 @@ func (s *Store) Upsert(ctx context.Context, projectID string, draft Draft, actor
 INSERT INTO t_alarm_rule(project_id, rule_id, rule_name, level, enabled, priority, "match", "window", dag, capabilities, error_policy, version, updated_at)
 VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,'{}'::jsonb,$8::jsonb,'[]'::jsonb,'drop',1,now())
 ON CONFLICT(project_id, rule_id) DO UPDATE SET
- rule_name=EXCLUDED.rule_name, level=EXCLUDED.level, enabled=EXCLUDED.enabled,
+ deleted_at=NULL, rule_name=EXCLUDED.rule_name, level=EXCLUDED.level, enabled=EXCLUDED.enabled,
  priority=EXCLUDED.priority, "match"=EXCLUDED."match", dag=EXCLUDED.dag,
  version=t_alarm_rule.version+1, updated_at=now()
 RETURNING rule_id, rule_name, level, enabled, priority, version`,
@@ -251,4 +251,24 @@ RETURNING rule_id, rule_name, level, enabled, priority, version`,
 	}
 	rule.ProjectID = projectID
 	return rule, nil
+}
+
+// Delete soft-deletes a rule and records the operation in the tenant audit log.
+func (s *Store) Delete(ctx context.Context, projectID, ruleID, actor string) error {
+	return pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `
+UPDATE t_alarm_rule
+SET deleted_at=now(), enabled=false, version=version+1, updated_at=now()
+WHERE project_id=$1 AND rule_id=$2 AND deleted_at IS NULL`, projectID, ruleID)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 0 {
+			return pgx.ErrNoRows
+		}
+		_, err = tx.Exec(ctx, `
+INSERT INTO t_audit_log(project_id, action, actor_id, resource_type, resource_id, details)
+VALUES($1::BIGINT, 'rule.delete', $2, 'alarm_rule', $3, '{}'::jsonb)`, projectID, actor, ruleID)
+		return err
+	})
 }

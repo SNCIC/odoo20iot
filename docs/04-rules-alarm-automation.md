@@ -259,16 +259,17 @@ SELECT * FROM telemetry
 
 **动作注册表（Action Registry）** —— 执行体全部是编译进二进制的 Go 函数，不接受动态代码：
 
-| action | 说明 | 幂等 |
-|---|---|---|
-| `alarm.raise` / `alarm.clear` | 触发 / 清除告警 | 是（按 `dedup_key`） |
-| `command.send` | 下发设备命令 | 是（按 `idem_key`） |
-| `notify.send` | 通知（通道由通知策略决定） | 否（有去重窗口） |
-| `webhook.call` | 出站 HTTP（强制白名单 + 禁内网） | 否 |
-| `timeseries.write` | 写派生指标 | 是（按 `device_id+ts+key`） |
-| `shadow.update` | 更新设备影子 desired | 是（按 `version`） |
-| `state.set` / `state.get` | 规则级持久状态（Redis，带 TTL） | 是 |
-| `script.run` | **L3 逃生舱**，需 `capability` 声明 | 否 |
+| action | 说明 | 幂等 | 实现状态 |
+|---|---|---|---|
+| `alarm.raise` | 触发告警 | 是（按 `dedup_key`） | 当前实现 |
+| `command.send` | 下发设备命令 | 是（按 `idem_key`） | 当前实现 |
+| `alarm.clear` | 清除告警 | 是（按 `dedup_key`） | 计划中 |
+| `notify.send` | 通知（通道由通知策略决定） | 否（有去重窗口） | 计划中 |
+| `webhook.call` | 出站 HTTP（强制白名单 + 禁内网） | 否 | 计划中 |
+| `timeseries.write` | 写派生指标 | 是（按 `device_id+ts+key`） | 计划中 |
+| `shadow.update` | 更新设备影子 desired | 是（按 `version`） | 计划中 |
+| `state.set` / `state.get` | 规则级持久状态（Redis，带 TTL） | 是 | 计划中 |
+| `script.run` | **L3 逃生舱**，需 `capability` 声明 | 否 | 计划中 |
 
 > **新增动作 = 写 Go 代码 + 注册 + 上线**，而不是让用户在平台上写脚本。这是安全边界的根本所在。
 

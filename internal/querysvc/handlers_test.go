@@ -117,6 +117,17 @@ func (f *fakeRuleStore) Upsert(_ context.Context, projectID string, draft ruleco
 	return item, nil
 }
 
+func (f *fakeRuleStore) Delete(_ context.Context, projectID, ruleID, actor string) error {
+	for index := range f.rules {
+		if f.rules[index].ProjectID == projectID && f.rules[index].RuleID == ruleID {
+			f.rules = append(f.rules[:index], f.rules[index+1:]...)
+			f.actor = actor
+			return nil
+		}
+	}
+	return pgx.ErrNoRows
+}
+
 type meterRecorder struct {
 	counts map[string]int64
 }
@@ -799,6 +810,14 @@ func TestRuleListAndToggleScopes(t *testing.T) {
 	svc.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || store.rules[0].Enabled || store.rules[0].Version != 3 || store.actor != "user-1" {
 		t.Fatalf("rule:write 应更新启用状态，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/rules/temperature-high", nil)
+	req.Header.Set("Authorization", "Bearer scoped")
+	rec = httptest.NewRecorder()
+	svc.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || len(store.rules) != 0 || store.actor != "user-1" {
+		t.Fatalf("rule:write 应删除规则，得到 %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

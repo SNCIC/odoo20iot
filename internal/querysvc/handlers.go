@@ -239,13 +239,38 @@ func (s *Service) handleRules(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rules": out})
 		return
 	}
-	if r.Method != http.MethodPut || pathKey == "" || strings.Contains(pathKey, "/") {
-		if r.Method == http.MethodPost && pathKey == "" {
-			s.handleRuleUpsert(w, r, "")
+	if r.Method == http.MethodPost && pathKey == "" {
+		s.handleRuleUpsert(w, r, "")
+		return
+	}
+	if r.Method == http.MethodDelete && pathKey != "" && !strings.Contains(pathKey, "/") {
+		if !id.Dev && !id.HasScope("rule:write") {
+			writeError(w, http.StatusForbidden, CodeForbidden, "缺少 rule:write 权限")
 			return
 		}
-		w.Header().Set("Allow", "GET, PUT")
-		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "规则接口仅支持 GET 或 PUT")
+		ruleID, err := url.PathUnescape(pathKey)
+		if err != nil || strings.TrimSpace(ruleID) == "" {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "rule_id 非法")
+			return
+		}
+		if err := s.deps.Rules.Delete(r.Context(), strconv.FormatInt(id.ProjectID, 10), ruleID, id.ActorID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusNotFound, CodeNotFound, "规则不存在或不属于本租户")
+				return
+			}
+			s.fail(w, "删除规则", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if r.Method != http.MethodPut || pathKey == "" || strings.Contains(pathKey, "/") {
+		allow := "GET, POST"
+		if pathKey != "" {
+			allow = "PUT, DELETE"
+		}
+		w.Header().Set("Allow", allow)
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "规则接口方法不允许")
 		return
 	}
 	if !id.Dev && !id.HasScope("rule:write") {

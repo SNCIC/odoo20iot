@@ -61,6 +61,7 @@ type RuleStore interface {
 	List(context.Context, string) ([]ruleconfig.Rule, error)
 	SetEnabled(context.Context, string, string, bool, string) (ruleconfig.Rule, error)
 	Upsert(context.Context, string, ruleconfig.Draft, string) (ruleconfig.Rule, error)
+	Delete(context.Context, string, string, string) error
 }
 
 type QuotaPolicyStore interface {

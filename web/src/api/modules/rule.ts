@@ -25,6 +25,12 @@ export async function setRuleEnabled(ruleId: string, enabled: boolean) {
   localStorage.setItem(mockKey, JSON.stringify(rules))
   return { ok: true as const, rule: rules.find((rule) => rule.rule_id === ruleId) }
 }
+export async function deleteRule(ruleId: string) {
+  if (!rulesUseMock()) return request<{ ok: true }>({ method: 'DELETE', url: `/rules/${encodeURIComponent(ruleId)}` })
+  const rules = readRules().filter((rule) => rule.rule_id !== ruleId)
+  localStorage.setItem(mockKey, JSON.stringify(rules))
+  return { ok: true as const }
+}
 export interface RuleDraft {
   rule_id: string
   rule_name: string
