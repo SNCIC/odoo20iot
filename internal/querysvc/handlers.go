@@ -23,6 +23,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/command"
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/modbusgw"
+	"github.com/SNCIC/odoo20iot/internal/odoo"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/ruleconfig"
@@ -92,8 +93,68 @@ func (s *Service) routes() http.Handler {
 		mux.Handle("/api/v1/modbus/configs", auth(http.HandlerFunc(s.handleModbusConfigs)))
 		mux.Handle("/api/v1/modbus/configs/", auth(http.HandlerFunc(s.handleModbusConfigs)))
 	}
+	if s.deps.Odoo != nil {
+		mux.Handle("/api/v1/odoo/workorders", requireScope(auth, "odoo:read", http.HandlerFunc(s.handleOdooMaintenance), s.deps.Meter))
+		mux.Handle("/api/v1/odoo/maintenance-requests", requireScope(auth, "odoo:read", http.HandlerFunc(s.handleOdooMaintenance), s.deps.Meter))
+		mux.Handle("/api/v1/odoo/maintenance-requests/", requireScope(auth, "odoo:read", http.HandlerFunc(s.handleOdooMaintenance), s.deps.Meter))
+	}
 
 	return securityHeaders(mux)
+}
+
+func (s *Service) handleOdooMaintenance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "仅支持 GET")
+		return
+	}
+	pathKey := ""
+	if strings.HasPrefix(r.URL.Path, "/api/v1/odoo/maintenance-requests/") {
+		pathKey = strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/odoo/maintenance-requests/"), "/")
+	}
+	if pathKey != "" {
+		id, err := strconv.ParseInt(pathKey, 10, 64)
+		if err != nil || id <= 0 {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "维修单 ID 非法")
+			return
+		}
+		item, err := s.deps.Odoo.GetMaintenanceRequest(r.Context(), id)
+		if err != nil {
+			s.fail(w, "读取 Odoo 维修单", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "workorder": item, "maintenance_request": item})
+		return
+	}
+	q := odoo.MaintenanceRequestQuery{
+		DeviceKey: strings.TrimSpace(r.URL.Query().Get("device_key")),
+		AlarmID:   strings.TrimSpace(r.URL.Query().Get("alarm_id")),
+		State:     strings.TrimSpace(r.URL.Query().Get("state")),
+		Since:     strings.TrimSpace(r.URL.Query().Get("since")),
+		Limit:     100,
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 500 {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "limit 必须在 1 到 500 之间")
+			return
+		}
+		q.Limit = value
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 0 {
+			writeError(w, http.StatusBadRequest, CodeInvalidArgument, "offset 必须是非负整数")
+			return
+		}
+		q.Offset = value
+	}
+	items, err := s.deps.Odoo.ListMaintenanceRequests(r.Context(), q)
+	if err != nil {
+		s.fail(w, "读取 Odoo 维修单列表", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "workorders": items, "maintenance_requests": items})
 }
 
 type ruleDTO struct {

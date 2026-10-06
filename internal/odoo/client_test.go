@@ -70,6 +70,28 @@ func TestClient_CallSendsRequiredHeaders(t *testing.T) {
 	}
 }
 
+func TestMaintenanceRequestListUsesScopedGet(t *testing.T) {
+	var gotPath, gotAuth, gotDB string
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth, gotDB = r.URL.RequestURI(), r.Header.Get("Authorization"), r.Header.Get("X-Odoo-Database")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"data":{"items":[{"id":9,"name":"维修泵","state":"done","iot_device_key":"pump-1"}],"count":1}}`))
+	})
+	items, err := c.ListMaintenanceRequests(context.Background(), MaintenanceRequestQuery{DeviceKey: "pump-1", State: "done", Limit: 20, Offset: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/api/iot/v1/maintenance/requests?device_key=pump-1&limit=20&offset=5&state=done" {
+		t.Fatalf("查询路径不符: %s", gotPath)
+	}
+	if gotAuth != "Bearer test-key" || gotDB != "odoo20" {
+		t.Fatalf("认证/数据库路由头缺失: auth=%q db=%q", gotAuth, gotDB)
+	}
+	if len(items) != 1 || items[0].ID != 9 || items[0].IoTDeviceKey != "pump-1" {
+		t.Fatalf("维修单响应未正确解析: %+v", items)
+	}
+}
+
 // TestClient_ErrorMapping 验证状态码 → 哨兵错误 → 可重试判定（07 §4.3）。
 func TestClient_ErrorMapping(t *testing.T) {
 	cases := []struct {

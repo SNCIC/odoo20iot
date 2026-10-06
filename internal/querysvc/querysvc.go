@@ -17,6 +17,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/latest"
 	"github.com/SNCIC/odoo20iot/internal/modbusgw"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
+	"github.com/SNCIC/odoo20iot/internal/odoo"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/quota"
 	"github.com/SNCIC/odoo20iot/internal/ruleconfig"
@@ -110,6 +111,11 @@ type OTAArtifactStore interface {
 	Open(int64, string) (*os.File, error)
 }
 
+type OdooWorkorderReader interface {
+	ListMaintenanceRequests(context.Context, odoo.MaintenanceRequestQuery) ([]odoo.MaintenanceRequest, error)
+	GetMaintenanceRequest(context.Context, int64) (odoo.MaintenanceRequest, error)
+}
+
 type OTASigner interface {
 	SignManifest(ota.Manifest, time.Time, time.Duration) (ota.Manifest, error)
 }
@@ -166,6 +172,7 @@ type Deps struct {
 	OTASigner          OTASigner
 	OTADownloadSecret  string
 	OTADownloadBaseURL string
+	Odoo               OdooWorkorderReader
 	Meter              Meter
 	Catalog            catalog.Store
 	Verifier           apiauth.Verifier

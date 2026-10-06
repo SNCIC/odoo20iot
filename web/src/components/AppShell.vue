@@ -19,6 +19,7 @@ const menuItems = [
   { name: 'modbus', label: 'Modbus 采集', icon: '▣' },
   { name: 'notify', label: '通知端点', icon: '✉' },
   { name: 'quota', label: '配额策略', icon: '◫' },
+  { name: 'loop', label: '业务闭环', icon: '↻' },
 ] as const
 
 const activeMenu = computed(() => {

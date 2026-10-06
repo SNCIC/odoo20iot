@@ -6,6 +6,7 @@ import DashboardView from '@/views/DashboardView.vue'
 import DeviceDetailView from '@/views/DeviceDetailView.vue'
 import DevicesView from '@/views/DevicesView.vue'
 import LoginView from '@/views/LoginView.vue'
+import LoopView from '@/views/LoopView.vue'
 import ModbusView from '@/views/ModbusView.vue'
 import NotifyView from '@/views/NotifyView.vue'
 import OverviewView from '@/views/OverviewView.vue'
@@ -36,6 +37,7 @@ const router = createRouter({
         { path: 'modbus', name: 'modbus', component: ModbusView, meta: { title: 'Modbus 采集' } },
         { path: 'notify', name: 'notify', component: NotifyView, meta: { title: '通知端点' } },
         { path: 'quota', name: 'quota', component: QuotaView, meta: { title: '配额策略' } },
+        { path: 'loop', name: 'loop', component: LoopView, meta: { title: '业务闭环' } },
       ],
     },
     { path: '/:pathMatch(.*)*', redirect: '/overview' },

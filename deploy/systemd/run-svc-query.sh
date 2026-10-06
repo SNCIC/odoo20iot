@@ -18,4 +18,6 @@ exec /home/xfusion/projects/odoo20iot/bin/svc-query \
   -nats-url "${IOT_NATS_URL:-nats://100.64.0.3:28222}" \
   -command-origin-id "${IOT_COMMAND_ORIGIN_ID:-}" \
   -shadow-origin-id "${IOT_SHADOW_ORIGIN_ID:-svc-query-shadow}" \
+  -odoo-url "${ODOO_URL:-}" \
+  -odoo-db "${ODOO_DB:-}" \
   -log-format "${IOT_LOG_FORMAT:-json}"

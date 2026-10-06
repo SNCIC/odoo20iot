@@ -132,6 +132,42 @@ func (c *Client) PostJSON(ctx context.Context, path string, payload any, out any
 	return c.postJSON(ctx, endpoint, body, path, out)
 }
 
+// GetJSON 调用自定义 GET JSON 路由，复用 Odoo 的认证和多库路由头。
+func (c *Client) GetJSON(ctx context.Context, path string, query url.Values, out any) error {
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("odoo: 自定义路由必须以 / 开头")
+	}
+	endpoint := *c.base
+	endpoint.Path = path
+	endpoint.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return fmt.Errorf("odoo: 构造 %s 请求: %w", path, err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	req.Header.Set("X-Odoo-Database", c.cfg.Database)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("odoo: 请求 %s: %w", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return fmt.Errorf("odoo: 读取 %s 响应: %w", path, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return newAPIError(resp.StatusCode, path, "GET", body)
+	}
+	if out == nil || len(body) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("odoo: 解析 %s 响应: %w", path, err)
+	}
+	return nil
+}
+
 func (c *Client) postJSON(ctx context.Context, endpoint url.URL, payload []byte, operation string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(payload))
 	if err != nil {

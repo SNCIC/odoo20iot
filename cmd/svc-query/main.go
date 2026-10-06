@@ -46,6 +46,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/modbusgw"
 	"github.com/SNCIC/odoo20iot/internal/notifyconfig"
+	"github.com/SNCIC/odoo20iot/internal/odoo"
 	"github.com/SNCIC/odoo20iot/internal/ota"
 	"github.com/SNCIC/odoo20iot/internal/pg"
 	"github.com/SNCIC/odoo20iot/internal/querysvc"
@@ -98,6 +99,9 @@ type config struct {
 	ensureTSDBSchema    bool
 	commandOriginID     string
 	shadowOriginID      string
+	odooURL             string
+	odooDatabase        string
+	odooAPIKey          string
 }
 
 func main() {
@@ -145,6 +149,9 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.ensureTSDBSchema, "ensure-tsdb-schema", true, "启动时幂等创建遥测与预聚合表")
 	flag.StringVar(&cfg.commandOriginID, "command-origin-id", "", "启用命令 API 的路由源 ID")
 	flag.StringVar(&cfg.shadowOriginID, "shadow-origin-id", "svc-query-shadow", "设备影子下行路由源 ID")
+	flag.StringVar(&cfg.odooURL, "odoo-url", os.Getenv("ODOO_URL"), "Odoo 服务地址；空则禁用 Odoo 单据 API")
+	flag.StringVar(&cfg.odooDatabase, "odoo-db", os.Getenv("ODOO_DB"), "Odoo 数据库名")
+	flag.StringVar(&cfg.odooAPIKey, "odoo-api-key", os.Getenv("ODOO_API_KEY"), "Odoo API Key；建议通过环境变量注入")
 	flag.Parse()
 	return cfg
 }
@@ -275,6 +282,14 @@ func run(cfg config) error {
 		return fmt.Errorf("连接最新值 Redis: %w", err)
 	}
 	var commandService *command.Service
+	var odooReader querysvc.OdooWorkorderReader
+	if strings.TrimSpace(cfg.odooURL) != "" || strings.TrimSpace(cfg.odooDatabase) != "" || strings.TrimSpace(cfg.odooAPIKey) != "" {
+		client, clientErr := odoo.New(odoo.Config{BaseURL: cfg.odooURL, Database: cfg.odooDatabase, APIKey: cfg.odooAPIKey})
+		if clientErr != nil {
+			return fmt.Errorf("配置 Odoo 单据 API: %w", clientErr)
+		}
+		odooReader = client
+	}
 	var otaRouter *cluster.Node
 	var shadowService *shadow.Service
 	shadowStore, err := shadow.NewPGStore(pool)
@@ -374,6 +389,7 @@ func run(cfg config) error {
 		OTASigner:          otaSigner,
 		OTADownloadSecret:  otaDownloadSecret,
 		OTADownloadBaseURL: otaDownloadBaseURL,
+		Odoo:               odooReader,
 		Meter:              meterAcc,
 		Catalog:            store,
 		Verifier:           verifier,
