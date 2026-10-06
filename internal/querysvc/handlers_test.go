@@ -98,6 +98,25 @@ func (f *fakeRuleStore) SetEnabled(_ context.Context, projectID, ruleID string, 
 	return ruleconfig.Rule{}, pgx.ErrNoRows
 }
 
+func (f *fakeRuleStore) Upsert(_ context.Context, projectID string, draft ruleconfig.Draft, actor string) (ruleconfig.Rule, error) {
+	for index := range f.rules {
+		if f.rules[index].RuleID == draft.RuleID {
+			f.rules[index].ProjectID = projectID
+			f.rules[index].Name = draft.Name
+			f.rules[index].Level = draft.Level
+			f.rules[index].Enabled = draft.Enabled
+			f.rules[index].Priority = draft.Priority
+			f.rules[index].Version++
+			f.actor = actor
+			return f.rules[index], nil
+		}
+	}
+	item := ruleconfig.Rule{ProjectID: projectID, RuleID: draft.RuleID, Name: draft.Name, Level: draft.Level, Enabled: draft.Enabled, Priority: draft.Priority, Version: 1}
+	f.rules = append(f.rules, item)
+	f.actor = actor
+	return item, nil
+}
+
 type meterRecorder struct {
 	counts map[string]int64
 }

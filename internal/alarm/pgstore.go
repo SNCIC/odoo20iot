@@ -233,21 +233,22 @@ type scanRow interface {
 
 func scanAlarm(row scanRow) (*Alarm, error) {
 	var (
-		a           Alarm
-		parentID    *string
-		timingRaw   []byte
-		triggerRaw  []byte
-		publishedTS *time.Time
-		confirmedTS *time.Time
-		notifiedTS  *time.Time
-		resolvedTS  *time.Time
-		closedTS    *time.Time
+		a              Alarm
+		parentID       *string
+		timingRaw      []byte
+		triggerRaw     []byte
+		publishedTS    *time.Time
+		confirmedTS    *time.Time
+		notifiedTS     *time.Time
+		resolvedTS     *time.Time
+		closedTS       *time.Time
+		acknowledgedAt *time.Time
 	)
 	if err := row.Scan(
 		&a.DedupKey, &a.ID, &a.ProjectID, &a.DeviceID, &a.DeviceTypeID,
 		&a.RuleID, &a.RuleName, &a.Level, &a.State, &parentID, &timingRaw,
 		&a.FirstTS, &a.LastTS, &a.StateTS, &confirmedTS, &notifiedTS, &resolvedTS, &closedTS,
-		&a.NotifyCount, &a.EscalationStage, &a.ConfirmedBy, &a.AcknowledgedAt, &a.FlapCount, &a.Suppressed, &a.SuppressReason, &a.BatchID,
+		&a.NotifyCount, &a.EscalationStage, &a.ConfirmedBy, &acknowledgedAt, &a.FlapCount, &a.Suppressed, &a.SuppressReason, &a.BatchID,
 		&triggerRaw, &publishedTS,
 	); err != nil {
 		return nil, err
@@ -259,6 +260,7 @@ func scanAlarm(row scanRow) (*Alarm, error) {
 	a.NotifiedTS = derefTime(notifiedTS)
 	a.ResolvedTS = derefTime(resolvedTS)
 	a.ClosedTS = derefTime(closedTS)
+	a.AcknowledgedAt = derefTime(acknowledgedAt)
 	a.Timing = decodeTiming(timingRaw)
 	a.TriggerValue = normalizeValue(triggerRaw)
 	a.PublishedAt = derefTime(publishedTS)

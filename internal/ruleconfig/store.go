@@ -39,6 +39,18 @@ type Rule struct {
 
 type Store struct{ pool *pgxpool.Pool }
 
+type Draft struct {
+	RuleID       string
+	Name         string
+	Level        string
+	Enabled      bool
+	Priority     int
+	DeviceTypeID int64
+	Expr         string
+	Action       string
+	ActionParams map[string]any
+}
+
 func (s *Store) DeviceSchema(ctx context.Context, projectID string, deviceTypeID int64) (*rules.DeviceSchema, error) {
 	sch := &rules.DeviceSchema{Metrics: map[string]rules.Kind{}}
 	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
@@ -163,7 +175,7 @@ func (s *Store) List(ctx context.Context, projectID string) ([]Rule, error) {
 	var out []Rule
 	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-SELECT rule_id, rule_name, level, enabled, priority, version
+SELECT rule_id, rule_name, level, enabled, priority, version, "match", dag
 FROM t_alarm_rule
 WHERE project_id=$1
 ORDER BY priority, rule_id, version DESC`, projectID)
@@ -173,8 +185,15 @@ ORDER BY priority, rule_id, version DESC`, projectID)
 		defer rows.Close()
 		for rows.Next() {
 			var rule Rule
-			if err := rows.Scan(&rule.RuleID, &rule.Name, &rule.Level, &rule.Enabled, &rule.Priority, &rule.Version); err != nil {
+			var matchRaw, dagRaw []byte
+			if err := rows.Scan(&rule.RuleID, &rule.Name, &rule.Level, &rule.Enabled, &rule.Priority, &rule.Version, &matchRaw, &dagRaw); err != nil {
 				return err
+			}
+			if err := json.Unmarshal(matchRaw, &rule.Match); err != nil {
+				return fmt.Errorf("规则 %s match: %w", rule.RuleID, err)
+			}
+			if err := json.Unmarshal(dagRaw, &rule.DAG); err != nil {
+				return fmt.Errorf("规则 %s dag: %w", rule.RuleID, err)
 			}
 			rule.ProjectID = projectID
 			out = append(out, rule)
@@ -200,10 +219,36 @@ RETURNING rule_id, rule_name, level, enabled, priority, version`, projectID, rul
 		}
 		rule.ProjectID = projectID
 		_, err = tx.Exec(ctx, `
+
 INSERT INTO t_audit_log(project_id, action, actor_id, resource_type, resource_id, details)
-VALUES($1::BIGINT, 'rule.enabled.update', $2, 'alarm_rule', $3, jsonb_build_object('enabled', $4, 'version', $5))`,
+VALUES($1::BIGINT, 'rule.enabled.update', $2, 'alarm_rule', $3, jsonb_build_object('enabled', $4::BOOLEAN, 'version', $5::BIGINT))`,
 			projectID, actor, ruleID, enabled, rule.Version)
 		return err
 	})
 	return rule, err
+}
+
+func (s *Store) Upsert(ctx context.Context, projectID string, draft Draft, actor string) (Rule, error) {
+	var rule Rule
+	matchRaw, _ := json.Marshal(Match{DeviceTypeID: draft.DeviceTypeID, Expr: draft.Expr})
+	dagRaw, _ := json.Marshal(dag.Definition{Entry: "action", Nodes: []dag.Node{
+		{ID: "action", Type: dag.NodeAction, Action: draft.Action, Params: draft.ActionParams},
+	}})
+	err := pg.WithProjectValueTx(ctx, s.pool, projectID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+INSERT INTO t_alarm_rule(project_id, rule_id, rule_name, level, enabled, priority, "match", "window", dag, capabilities, error_policy, version, updated_at)
+VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,'{}'::jsonb,$8::jsonb,'[]'::jsonb,'drop',1,now())
+ON CONFLICT(project_id, rule_id) DO UPDATE SET
+ rule_name=EXCLUDED.rule_name, level=EXCLUDED.level, enabled=EXCLUDED.enabled,
+ priority=EXCLUDED.priority, "match"=EXCLUDED."match", dag=EXCLUDED.dag,
+ version=t_alarm_rule.version+1, updated_at=now()
+RETURNING rule_id, rule_name, level, enabled, priority, version`,
+			projectID, draft.RuleID, draft.Name, draft.Level, draft.Enabled, draft.Priority, matchRaw, dagRaw).
+			Scan(&rule.RuleID, &rule.Name, &rule.Level, &rule.Enabled, &rule.Priority, &rule.Version)
+	})
+	if err != nil {
+		return Rule{}, err
+	}
+	rule.ProjectID = projectID
+	return rule, nil
 }

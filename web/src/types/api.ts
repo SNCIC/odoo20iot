@@ -199,6 +199,10 @@ export interface RuleItem {
   enabled: boolean
   priority: number
   version: number
+  device_type_id?: number
+  expr?: string
+  action?: string
+  action_params?: Record<string, unknown>
 }
 
 export interface ModbusPoint {

@@ -21,6 +21,7 @@ import (
 	"github.com/SNCIC/odoo20iot/internal/apiauth"
 	"github.com/SNCIC/odoo20iot/internal/catalog"
 	"github.com/SNCIC/odoo20iot/internal/command"
+	"github.com/SNCIC/odoo20iot/internal/dag"
 	"github.com/SNCIC/odoo20iot/internal/metering"
 	"github.com/SNCIC/odoo20iot/internal/modbusgw"
 	"github.com/SNCIC/odoo20iot/internal/odoo"
@@ -158,19 +159,56 @@ func (s *Service) handleOdooMaintenance(w http.ResponseWriter, r *http.Request) 
 }
 
 type ruleDTO struct {
-	RuleID   string `json:"rule_id"`
-	RuleName string `json:"rule_name"`
-	Level    string `json:"level"`
-	Enabled  bool   `json:"enabled"`
-	Priority int    `json:"priority"`
-	Version  int64  `json:"version"`
+	RuleID       string         `json:"rule_id"`
+	RuleName     string         `json:"rule_name"`
+	Level        string         `json:"level"`
+	Enabled      bool           `json:"enabled"`
+	Priority     int            `json:"priority"`
+	Version      int64          `json:"version"`
+	DeviceTypeID int64          `json:"device_type_id,omitempty"`
+	Expr         string         `json:"expr,omitempty"`
+	Action       string         `json:"action,omitempty"`
+	ActionParams map[string]any `json:"action_params,omitempty"`
 }
 
 func toRuleDTO(rule ruleconfig.Rule) ruleDTO {
 	return ruleDTO{
-		RuleID: rule.RuleID, RuleName: rule.Name, Level: rule.Level,
+		RuleID: rule.RuleID, RuleName: rule.Name, Level: displayRuleLevel(rule.Level),
 		Enabled: rule.Enabled, Priority: rule.Priority, Version: rule.Version,
+		DeviceTypeID: rule.Match.DeviceTypeID, Expr: rule.Match.Expr,
+		Action: firstRuleAction(rule), ActionParams: firstRuleActionParams(rule),
 	}
+}
+
+func displayRuleLevel(level string) string {
+	switch level {
+	case "critical":
+		return "P1"
+	case "warn":
+		return "P2"
+	case "info":
+		return "P3"
+	default:
+		return level
+	}
+}
+
+func firstRuleAction(rule ruleconfig.Rule) string {
+	for _, node := range rule.DAG.Nodes {
+		if node.Type == dag.NodeAction {
+			return node.Action
+		}
+	}
+	return ""
+}
+
+func firstRuleActionParams(rule ruleconfig.Rule) map[string]any {
+	for _, node := range rule.DAG.Nodes {
+		if node.Type == dag.NodeAction {
+			return node.Params
+		}
+	}
+	return nil
 }
 
 func (s *Service) handleRules(w http.ResponseWriter, r *http.Request) {
@@ -202,6 +240,10 @@ func (s *Service) handleRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodPut || pathKey == "" || strings.Contains(pathKey, "/") {
+		if r.Method == http.MethodPost && pathKey == "" {
+			s.handleRuleUpsert(w, r, "")
+			return
+		}
 		w.Header().Set("Allow", "GET, PUT")
 		writeError(w, http.StatusMethodNotAllowed, CodeInvalidArgument, "规则接口仅支持 GET 或 PUT")
 		return
@@ -229,6 +271,57 @@ func (s *Service) handleRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.fail(w, "更新规则状态", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rule": toRuleDTO(item)})
+}
+
+func (s *Service) handleRuleUpsert(w http.ResponseWriter, r *http.Request, pathKey string) {
+	id, ok := apiauth.IdentityFrom(r.Context())
+	if !ok || (!id.Dev && !id.HasScope("rule:write")) {
+		writeError(w, http.StatusForbidden, CodeForbidden, "缺少 rule:write 权限")
+		return
+	}
+	var req struct {
+		RuleID       string         `json:"rule_id"`
+		Name         string         `json:"rule_name"`
+		Level        string         `json:"level"`
+		Enabled      bool           `json:"enabled"`
+		Priority     int            `json:"priority"`
+		DeviceTypeID int64          `json:"device_type_id"`
+		Expr         string         `json:"expr"`
+		Action       string         `json:"action"`
+		ActionParams map[string]any `json:"action_params"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "规则 JSON 非法")
+		return
+	}
+	if pathKey != "" {
+		req.RuleID = pathKey
+	}
+	req.RuleID = strings.TrimSpace(req.RuleID)
+	req.Name = strings.TrimSpace(req.Name)
+	req.Expr = strings.TrimSpace(req.Expr)
+	if req.RuleID == "" || req.Name == "" || req.Expr == "" || req.Action == "" || req.Priority < 0 {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "规则 ID、名称、表达式、动作和非负优先级必填")
+		return
+	}
+	levelMap := map[string]string{"P1": "critical", "P2": "warn", "P3": "info", "info": "info", "warn": "warn", "critical": "critical"}
+	allowedActions := map[string]bool{"alarm.raise": true, "command.send": true}
+	level, levelOK := levelMap[req.Level]
+	if !levelOK || !allowedActions[req.Action] {
+		writeError(w, http.StatusBadRequest, CodeInvalidArgument, "级别或动作不在允许范围")
+		return
+	}
+	if req.Action == "alarm.raise" {
+		if title, ok := req.ActionParams["title"].(string); ok && strings.TrimSpace(title) != "" {
+			req.Name = strings.TrimSpace(title)
+		}
+	}
+	item, err := s.deps.Rules.Upsert(r.Context(), strconv.FormatInt(id.ProjectID, 10), ruleconfig.Draft{RuleID: req.RuleID, Name: req.Name, Level: level, Enabled: req.Enabled, Priority: req.Priority, DeviceTypeID: req.DeviceTypeID, Expr: req.Expr, Action: req.Action, ActionParams: req.ActionParams}, id.ActorID)
+	if err != nil {
+		s.fail(w, "保存规则", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rule": toRuleDTO(item)})

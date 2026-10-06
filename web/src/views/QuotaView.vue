@@ -66,7 +66,7 @@ onMounted(() => void load())
 <template>
   <div class="page">
     <div class="page-head"><div><h1 class="page-title">配额策略</h1><p class="page-description">配置 80% / 90% / 100% 三档预警和超配额执行策略。</p></div><el-button :loading="loading" @click="load">刷新</el-button></div>
-    <el-alert title="Phase 1 以阈值告警为主；throttle / reject 执行策略由配额二期业务路径接管。" type="info" show-icon :closable="false" />
+    <el-alert title="配额二期已上线：80% / 90% / 100% 三档告警，并按租户策略执行 throttle / reject。" type="success" show-icon :closable="false" />
     <section class="panel quota-list">
       <div v-for="item in metrics" :key="item.key" class="quota-row">
         <div class="quota-name"><strong>{{ item.label }}</strong><span>{{ item.key }} · {{ item.unit }}</span></div>

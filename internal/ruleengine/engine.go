@@ -3,10 +3,14 @@ package ruleengine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/SNCIC/odoo20iot/internal/alarm"
 	"github.com/SNCIC/odoo20iot/internal/command"
@@ -120,8 +124,12 @@ func (e *Engine) Process(ctx context.Context, env envelope.Envelope) error {
 			prev, err = prevResolver.ResolvePrevWithSeq(ctx, env.DeviceKey, at, seq)
 		}
 		if err != nil {
-			e.logger.Warn("读取 prev 快照失败，按空快照求值", "device_key", env.DeviceKey, "error", err)
-			prev = nil
+			if errors.Is(err, redis.Nil) || errors.Is(err, pgx.ErrNoRows) {
+				prev = nil
+			} else {
+				e.logger.Warn("读取 prev 快照失败，按空快照求值", "device_key", env.DeviceKey, "error", err)
+				prev = nil
+			}
 		}
 	}
 	for _, rule := range ruleset {
