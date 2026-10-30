@@ -64,7 +64,7 @@ if old_ts and (tonumber(old_ts) > tonumber(ARGV[1]) or (tonumber(old_ts) == tonu
 local merged = {}
 local old_values = redis.call("HGET", KEYS[1], "values")
 if old_values then merged = cjson.decode(old_values) end
-local new_values = cjson.decode(ARGV[3])
+local new_values = cjson.decode(ARGV[4])
 for k, v in pairs(new_values) do merged[k] = v end
 redis.call("HSET", KEYS[1], "ts_unix_nano", ARGV[1], "seq", ARGV[2], "ts", ARGV[3], "values", cjson.encode(merged))
 redis.call("EXPIRE", KEYS[1], ARGV[5])
