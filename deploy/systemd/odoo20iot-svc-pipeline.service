@@ -1,0 +1,17 @@
+[Unit]
+Description=Odoo20IoT telemetry pipeline (NATS -> GreptimeDB)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/xfusion/projects/odoo20iot/deploy/systemd/run-svc-pipeline.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+NoNewPrivileges=true
+MemoryMax=1G
+Environment=GOMEMLIMIT=768MiB
+
+[Install]
+WantedBy=default.target
